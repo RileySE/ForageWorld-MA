@@ -150,6 +150,7 @@ class EnvParams:
     # Game Mode Parameters
     god_mode: bool = False
     shared_reward: bool = True
+    reward_func: str = 'vanilla'  # 'vanilla' or 'foraging'
     friendly_fire: bool = True
 
 @struct.dataclass
