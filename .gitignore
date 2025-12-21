@@ -1,0 +1,4 @@
+.venv
+baselines/wandb
+craftax/__pycache__/
+__pycache__/
