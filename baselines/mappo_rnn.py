@@ -204,7 +204,9 @@ def make_train(config, env):
         return config["LR"] * frac
 
     def train(rng):
+        print("[MAPPO] Starting training...")
         # INIT NETWORK
+        print("[MAPPO] Initializing networks...")
         actor_network = ActorRNN(env.action_space(env.agents[0]).n, config=config)
         critic_network = CriticRNN(config=config)
         rng, _rng_actor, _rng_critic = jax.random.split(rng, 3)
@@ -252,6 +254,8 @@ def make_train(config, env):
         )
 
         # INIT ENV
+        print(f"[MAPPO] Networks initialized. GRU_DIM={config['GRU_HIDDEN_DIM']}, FC_DIM={config['FC_DIM_SIZE']}")
+        print(f"[MAPPO] Initializing {config['NUM_ENVS']} environments...")
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
@@ -259,12 +263,14 @@ def make_train(config, env):
         cr_init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # TRAIN LOOP
+        print(f"[MAPPO] Starting training loop: {config['NUM_UPDATES']} updates, {config['TOTAL_TIMESTEPS']} total timesteps")
+        print(f"[MAPPO] Config: NUM_ENVS={config['NUM_ENVS']}, NUM_STEPS={config['NUM_STEPS']}, UPDATE_EPOCHS={config['UPDATE_EPOCHS']}")
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
 
-            def _env_step(runner_state, unused):
-                train_states, env_state, last_obs, last_done, hstates, rng = runner_state
+            def _env_step(runner_state, step_idx):
+                train_states, env_state, last_obs, last_done, hstates, rng, update_steps = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -296,6 +302,40 @@ def make_train(config, env):
                 )(rng_step, env_state, env_act)
                 info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
+                
+                # LOG EVERY STEP
+                def step_callback(info_data, step_count, upd_steps, rew):
+                    env_step = upd_steps * config["NUM_ENVS"] * config["NUM_STEPS"] + step_count * config["NUM_ENVS"]
+                    mean_reward = rew.mean()
+                    to_log = {
+                        "env_step": env_step,
+                        "step_mean_reward": mean_reward
+                    }
+                    
+                    # Episode Ende: Zeige vollständige Episode-Stats
+                    if info_data["returned_episode"].any():
+                        num_episodes = info_data["returned_episode"].sum()
+                        ep_return = info_data["returned_episode_returns"][info_data["returned_episode"]].mean()
+                        ep_length = info_data["returned_episode_lengths"][info_data["returned_episode"]].mean()
+                        
+                        to_log.update(jax.tree.map(
+                            lambda x: x[info_data["returned_episode"]].mean(),
+                            info_data["user_info"]
+                        ))
+                        to_log["episode_lengths"] = ep_length
+                        to_log["episode_returns"] = ep_return
+                        to_log["num_episodes_ended"] = num_episodes
+                        
+                        print(f"  ✓ [EPISODE END] {int(num_episodes)} episode(s) | Return: {ep_return:+.2f} | Length: {ep_length:.0f} | Reward/Step: {mean_reward:+.4f}")
+                        wandb.log(to_log)
+                    
+                    # Alle 10 Steps: Zeige aktuellen Reward
+                    elif step_count % 10 == 0:
+                        print(f"    [Step {step_count:2d}] Reward: {mean_reward:+.4f}")
+                        wandb.log(to_log)
+                
+                jax.experimental.io_callback(step_callback, None, info, step_idx, update_steps, batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze())
+                
                 transition = Transition(
                     jnp.tile(done["__all__"], env.num_agents),
                     last_done,
@@ -307,16 +347,16 @@ def make_train(config, env):
                     world_state,
                     info,
                 )
-                runner_state = (train_states, env_state, obsv, done_batch, (ac_hstate, cr_hstate), rng)
+                runner_state = (train_states, env_state, obsv, done_batch, (ac_hstate, cr_hstate), rng, update_steps)
                 return runner_state, transition
 
-            initial_hstates = runner_state[-2]
+            initial_hstates = runner_state[-3]
             runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
+                _env_step, runner_state, jnp.arange(config["NUM_STEPS"]), config["NUM_STEPS"]
             )
 
             # CALCULATE ADVANTAGE
-            train_states, env_state, last_obs, last_done, hstates, rng = runner_state
+            train_states, env_state, last_obs, last_done, hstates, rng, _ = runner_state
 
             last_world_state = last_obs["world_state"].swapaxes(0,1)
             last_world_state = last_world_state.reshape((config["NUM_ACTORS"],-1))
@@ -515,24 +555,29 @@ def make_train(config, env):
                     * config["NUM_ENVS"]
                     * config["NUM_STEPS"]
                 )
+                
                 to_log = {
                     "env_step": env_step,
                     **metric["loss"],
                 }
 
                 if metric["returned_episode"].any():
+                    ep_return = metric["returned_episode_returns"][metric["returned_episode"]].mean()
                     to_log.update(jax.tree.map(
                         lambda x: x[metric["returned_episode"]].mean(),
                         metric["user_info"]
                     ))
                     to_log["episode_lengths"] = metric["returned_episode_lengths"][metric["returned_episode"]].mean()
-                    to_log["episode_returns"] = metric["returned_episode_returns"][metric["returned_episode"]].mean()
-                print(to_log)
+                    to_log["episode_returns"] = ep_return
+                    print(f"\n[UPDATE {metric['update_steps']:5d}/{config['NUM_UPDATES']}] Step: {env_step:9,} | Loss: {metric['loss']['total_loss']:+.4f} | Ep.Return: {ep_return:+.2f}")
+                else:
+                    print(f"\n[UPDATE {metric['update_steps']:5d}/{config['NUM_UPDATES']}] Step: {env_step:9,} | Loss: {metric['loss']['total_loss']:+.4f}")
+                    
                 wandb.log(to_log)
 
             jax.experimental.io_callback(callback, None, metric)
             update_steps = update_steps + 1
-            runner_state = (train_states, env_state, last_obs, last_done, hstates, rng)
+            runner_state = (train_states, env_state, last_obs, last_done, hstates, rng, update_steps)
             return (runner_state, update_steps), metric
 
         rng, _rng = jax.random.split(rng)
@@ -543,10 +588,13 @@ def make_train(config, env):
             jnp.zeros((config["NUM_ACTORS"]), dtype=bool),
             (ac_init_hstate, cr_init_hstate),
             _rng,
+            0,
         )
+        print("[MAPPO] Compiling and starting JIT scan...")
         runner_state, metric = jax.lax.scan(
             _update_step, (runner_state, 0), None, config["NUM_UPDATES"]
         )
+        print("[MAPPO] Training completed!")
         return {"runner_state": runner_state}
 
     return train
@@ -555,8 +603,12 @@ def make_train(config, env):
 # Main Run Function
 # ===========================
 def single_run(config):
+    print("="*60)
+    print("[MAPPO] Starting MAPPO RNN Training Run")
+    print("="*60)
     alg_name = config.get("ALG_NAME", "mappo-rnn")
     env_name = config.get("ENV_NAME", "Craftax-Coop-Symbolic")
+    print(f"[MAPPO] Environment: {env_name}")
     env = make_craftax_env_from_name(env_name)
 
     wandb.init(
@@ -571,6 +623,8 @@ def single_run(config):
         config=config,
         mode=config["WANDB_MODE"],
     )
+    print(f"[MAPPO] WandB initialized: {config['RUN_NAME']}")
+    print(f"[MAPPO] Running {config['NUM_SEEDS']} seed(s)...")
 
     rng = jax.random.PRNGKey(config["SEED"])
 

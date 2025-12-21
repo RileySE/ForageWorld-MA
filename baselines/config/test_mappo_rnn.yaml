@@ -1,0 +1,36 @@
+# Weights & Biases configuration
+WANDB_MODE: "online" # Change to "online" for logging and include appropriate ENTITY and PROJECT arguments
+ENTITY: ""
+PROJECT: ""
+RUN_NAME: "MAPPO - Base"
+
+# Environment configuration
+ENV_NAME: "Craftax-Coop-Symbolic" # Can be changed to "Craftax-Coop-Symbolic", "Craftax-Coop-Pixels", "Craftax-MA-Symbolic", "Craftax-MA-Pixels"
+
+# Model parameters
+ALG_NAME: "mappo-rnn"
+GRU_HIDDEN_DIM: 128
+FC_DIM_SIZE: 64
+ACTIVATION: "tanh"
+
+# Training parameters
+TOTAL_TIMESTEPS: 100000000
+NUM_ENVS: 128
+NUM_STEPS: 32
+NUM_MINIBATCHES: 4
+UPDATE_EPOCHS: 2
+GAE_LAMBDA: 0.8
+GAMMA: 0.99
+CLIP_EPS: 0.2
+SCALE_CLIP_EPS: false
+ENT_COEF: 0.01
+VF_COEF: 0.5
+ANNEAL_LR: true
+LR: 0.0003
+MAX_GRAD_NORM: 1.0
+LR_WARMUP: 0.0
+REW_SHAPING_HORIZON: 1000000
+
+# Seed configuration
+NUM_SEEDS: 1
+SEED: 0
