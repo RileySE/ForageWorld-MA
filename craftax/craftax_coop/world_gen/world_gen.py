@@ -506,6 +506,10 @@ def generate_world(rng, params, static_params):
     player_specialization_order = jnp.array([Specialization.WARRIOR.value, Specialization.FORAGER.value, Specialization.MINER.value])
     player_specializations = player_specialization_order[jnp.arange(static_params.player_count) % 3]
 
+    # Fix player subclasses
+    player_sc_order = jnp.array([Sublass.A.value, Sublass.B.value])
+    player_sc = player_sc_order[jnp.arange(static_params.player_count) % 2]
+
     # Generate smoothgens (overworld, caves, elemental levels, boss level)
     rngs = jax.random.split(rng, 7)
     rng, _rng = rngs[0], rngs[1:]
