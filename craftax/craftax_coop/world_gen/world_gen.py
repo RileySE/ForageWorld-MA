@@ -525,7 +525,7 @@ def generate_world(rng, params, static_params):
     # Splice smoothgens and dungeons in order of levels
     map, item_map, light_map, ladders_down, ladders_up = jax.tree_util.tree_map(
         lambda x, y: jnp.stack(
-            (x[0], y[0], x[1], y[1], y[2], x[2], x[3], x[4], x[5]), axis=0
+            (x[0], x[1], y[0], y[1], y[2], x[2], x[3], x[4], x[5]), axis=0
         ),
         smoothgens,
         dungeons,
