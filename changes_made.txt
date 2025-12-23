@@ -1,5 +1,19 @@
-## changes made to run only in level 2 dungeon
-# 1. craftax/craftax_coop/game_logic.py 3551: # disable floor change
-# 2. craftax/craftax_coop/world_gen/world_gen.py 616 player_level=jnp.asarray(2, dtype=jnp.int32),
-# 3. craftax/craftax_coop/world_gen/world_gen.py 528 ... (x[0], x[1], y[0], y[1], y[2], x[2], x[3], x[4], x[5]), axis=0 ... # swap the level 1 and 2 so that level 2 is vanilla dungeon
-#
+# changes made to run only in level 2 dungeon
+1. craftax/craftax_coop/game_logic.py 3551
+# disable floor change
+2. craftax/craftax_coop/world_gen/world_gen.py 616 
+player_level=jnp.asarray(2, dtype=jnp.int32),
+3. craftax/craftax_coop/world_gen/world_gen.py 528 
+... (x[0], x[1], y[0], y[1], y[2], x[2], x[3], x[4], x[5]), axis=0 ... # swap the level 1 and 2 so that level 2 is vanilla dungeon
+
+# changes made to form subclasses containing 1 each of the specializations (miner, warrior, forager) 
+1.craftax/craftax_coop/constants.py 216-218 
+class Subclass(Enum):
+    A = 0
+    B = 1
+2. craftax/craftax_coop/craftax_state.py 159
+    player_count: int = 6
+3. craftax/craftax_coop/world_gen/world_gen.py 509-511
+    # Fix player subclasses
+    player_sc_order = jnp.array([Subclass.A.value, Subclass.B.value])
+    player_sc = player_sc_order[jnp.arange(static_params.player_count) % 2]
