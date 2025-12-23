@@ -613,7 +613,7 @@ def generate_world(rng, params, static_params):
         player_direction=jnp.full(
             (static_params.player_count,), Action.UP.value, dtype=jnp.int32
         ),
-        player_level=jnp.asarray(0, dtype=jnp.int32),
+        player_level=jnp.asarray(2, dtype=jnp.int32),
         player_health=jnp.full((static_params.player_count,), 9.0, dtype=jnp.float32),
         player_alive=jnp.full((static_params.player_count,), True, dtype=bool),
         player_food=jnp.full((static_params.player_count,), 9, dtype=jnp.int32),
