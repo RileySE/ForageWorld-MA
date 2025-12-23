@@ -213,7 +213,7 @@ class ProjectileType(Enum):
     FIREBALL2 = 6
     ICEBALL2 = 7
 
-class Sublass (Enum): 
+class Subclass(Enum): 
     A = 0
     B = 1
 
