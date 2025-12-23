@@ -507,7 +507,7 @@ def generate_world(rng, params, static_params):
     player_specializations = player_specialization_order[jnp.arange(static_params.player_count) % 3]
 
     # Fix player subclasses
-    player_sc_order = jnp.array([Sublass.A.value, Sublass.B.value])
+    player_sc_order = jnp.array([Subclass.A.value, Subclass.B.value])
     player_sc = player_sc_order[jnp.arange(static_params.player_count) % 2]
 
     # Generate smoothgens (overworld, caves, elemental levels, boss level)
