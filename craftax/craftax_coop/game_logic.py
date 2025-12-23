@@ -3547,8 +3547,8 @@ def craftax_step(
         actions
     )
 
-    # Change floor
-    state = change_floor(state, actions, params, static_params)
+    # Change floor (disabled for level 2 dungeon-only task)
+    # state = change_floor(state, actions, params, static_params)
 
     # Crafting
     state = do_crafting(state, actions, static_params)
