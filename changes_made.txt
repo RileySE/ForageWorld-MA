@@ -1,1 +1,4 @@
-
+## changes made to run only in level 2 dungeon
+# 1. craftax/craftax_coop/game_logic.py 3551: #-disable floor change
+# 2. craftax/craftax_coop/world_gen/world_gen.py 616 player_level=jnp.asarray(2, dtype=jnp.int32),
+# 3. craftax/craftax_coop/craftax_state.py 158 num_levels: int = 1
