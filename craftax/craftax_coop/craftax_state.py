@@ -71,7 +71,7 @@ class EnvState:
     player_hunger: jnp.ndarray
     player_thirst: jnp.ndarray
     player_fatigue: jnp.ndarray
-    player_recover_mana: jnp.ndarray
+    player_recover_mana: jnp.ndarray 
 
     # Attributes
     player_xp: jnp.ndarray
@@ -79,6 +79,7 @@ class EnvState:
     player_strength: jnp.ndarray
     player_intelligence: jnp.ndarray
     player_specialization: jnp.ndarray
+    player_sc: jnp.ndarray # subclasses
 
     # Request Info
     request_duration: jnp.ndarray
