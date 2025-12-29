@@ -2,30 +2,46 @@ from craftax_coop.util.game_logic_utils import *
 from craftax_coop.util.maths_utils import *
 import jax
 
+same_sc = state.player_sc == Specialization.MINER.value
+    is_warrior = state.player_specialization == Specialization.WARRIOR.value
 
 def interplayer_interaction(state, block_position, is_doing_action, env_params, static_params):
     # If other player is down revive them, otherwise damage (if friendly fire is enabled)
-    in_other_player = (jnp.expand_dims(state.player_position, axis=1) == jnp.expand_dims(block_position, axis=0)).all(axis=2).T
-    player_interacting_with = jnp.argmax(in_other_player, axis=-1)
+    # Only revive players in the same subclass, damage players in other subclasses   
 
-    is_interacting_with_other_player = jnp.logical_and(
-        in_other_player.any(axis=-1),
+    in_same_sc = (jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)).squeeze(axis=2).T
+    in_diff_sc = jnp.logical_not(in_same_sc)
+
+    in_other_player = (jnp.expand_dims(state.player_position, axis=1) == jnp.expand_dims(block_position, axis=0)).all(axis=2).T
+    in_same_sc_player = in_other_player & in_same_sc
+    in_diff_sc_player = in_other_player & in_diff_sc
+    same_player_interacting_with = jnp.argmax(in_same_sc_player, axis=-1)
+    diff_player_interacting_with = jnp.argmax(in_diff_sc_player, axis=-1)
+
+    is_interacting_with_same_sc_player = jnp.logical_and(
+        in_same_sc_player.any(axis=-1),
         is_doing_action,
     )
-    is_player_being_interacted_with = jnp.any(
+    is_interacting_with_diff_sc_player = jnp.logical_and(
+        in_diff_sc_player.any(axis=-1),
+        is_doing_action,
+    )
+    
+    is_player_being_interacted_with_same_sc = jnp.any(
         jnp.logical_and(
-            jnp.arange(static_params.player_count)[:, None] == player_interacting_with,
-            is_interacting_with_other_player[None, :]
+            jnp.arange(static_params.player_count)[:, None] == same_player_interacting_with,
+            is_interacting_with_same_sc_player[None, :]
         ),
         axis=-1
     )
+
     is_player_being_revived = jnp.logical_and(
-        is_player_being_interacted_with,
+        is_player_being_interacted_with_same_sc,
         jnp.logical_not(state.player_alive),
     )
 
-    damage_taken = jnp.zeros(static_params.player_count).at[player_interacting_with].add(
-        is_interacting_with_other_player * get_damage_between_players(state, player_interacting_with)
+    damage_taken = jnp.zeros(static_params.player_count).at[diff_player_interacting_with].add(
+        is_interacting_with_diff_sc_player * get_damage_between_players(state, diff_player_interacting_with)
     )
     damage_taken *= env_params.friendly_fire
 
