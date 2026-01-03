@@ -2,8 +2,6 @@ from craftax_coop.util.game_logic_utils import *
 from craftax_coop.util.maths_utils import *
 import jax
 
-same_sc = state.player_sc == Specialization.MINER.value
-    is_warrior = state.player_specialization == Specialization.WARRIOR.value
 
 def interplayer_interaction(state, block_position, is_doing_action, env_params, static_params):
     # If other player is down revive them, otherwise damage (if friendly fire is enabled)
@@ -3377,21 +3375,27 @@ def calculate_inventory_achievements(state):
     return state.replace(achievements=achievements)
 
 
-def trade_materials(state, action, static_params):
+def trade_materials(state, action, static_params): # only trade with agents in the same subclass 
     new_achievements = state.achievements
     new_trade_count = state.trade_count
     new_food_trade_count = state.food_trade_count
     new_drink_trade_count = state.drink_trade_count
 
+    in_same_sc = (jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)).squeeze(axis=2).T
+
     player_trading_to = action - Action.GIVE.value
     player_trading_to += 1 * (player_trading_to >= jnp.arange(static_params.player_count))
+    
     is_giving = jnp.logical_and(
-        action >= Action.GIVE.value, 
-        action < (Action.GIVE.value + static_params.player_count - 1)
+        jnp.logical_and(
+            action >= Action.GIVE.value, 
+            action < (Action.GIVE.value + static_params.player_count - 1)
+        ),
+        in_same_sc[jnp.arange(static_params.player_count), player_trading_to]
     )
     other_player_is_requesting = jnp.logical_and(
         state.request_duration[player_trading_to] > 0,
-        state.player_alive[player_trading_to]
+        state.player_alive[player_trading_to]        
     )
 
     def _new_material_value(material_type, current_material_stock, material_max_value, old_trade_count):
