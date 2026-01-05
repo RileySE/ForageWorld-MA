@@ -3381,7 +3381,7 @@ def trade_materials(state, action, static_params): # only trade with agents in t
     new_food_trade_count = state.food_trade_count
     new_drink_trade_count = state.drink_trade_count
 
-    in_same_sc = (jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)).squeeze(axis=2).T
+    in_same_sc = (jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)).T
 
     player_trading_to = action - Action.GIVE.value
     player_trading_to += 1 * (player_trading_to >= jnp.arange(static_params.player_count))
