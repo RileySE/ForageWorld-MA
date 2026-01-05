@@ -209,7 +209,7 @@ def make_train(config, env):
         critic_network = CriticRNN(config=config)
         rng, _rng_actor, _rng_critic = jax.random.split(rng, 3)
         ac_init_x = (
-            jnp.zeros((1, config["NUM_ENVS"], env.observation_space(env.agents[0]).shape[0])),
+            jnp.zeros((1, config["NUM_ENVS"], env.observation_space(env.agents[0]).shape[0])*len(env.agents)),
             jnp.zeros((1, config["NUM_ENVS"])),
         )
         ac_init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
