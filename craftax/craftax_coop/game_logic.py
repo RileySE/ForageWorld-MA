@@ -2054,7 +2054,7 @@ def update_mobs(rng, state, params, env_params, static_params):
 
         player_defense_vector = get_player_defense_vector(state)[player_attack_index]
         player_damage_dealt = get_damage(projectile_damage_vector, player_defense_vector) * did_attack_player * env_params.friendly_fire
-        new_player_health = state.player_health.at[player_attack_index].subtract(player_damage_dealt)
+        new_player_health = state.player_health.at[player_attack_index].add(-player_damage_dealt)
         
         state, did_attack_mob0, did_kill_mob0 = attack_mob(
             state,
