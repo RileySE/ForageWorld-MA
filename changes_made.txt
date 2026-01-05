@@ -19,6 +19,8 @@ class Subclass(Enum):
     player_sc = player_sc_order[jnp.arange(static_params.player_count) % 2]
 4. craftax/craftax_coop/craftax_state.py 82
     player_sc: jnp.ndarray # subclasses
+5. craftax/craftax_coop/world_gen/world_gen.py 641
+        player_sc = player_sc,
 
 # changes made to ensure only revive players in the same subclass, damage players in other subclasses
 1. craftax/craftax_coop/game_logic.py 10-11
