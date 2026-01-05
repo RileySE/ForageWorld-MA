@@ -34,3 +34,7 @@ REW_SHAPING_HORIZON: 1000000
 # Seed configuration
 NUM_SEEDS: 1
 SEED: 0
+
+# Rendering configuration
+RENDER_FIRST_EPISODE: true
+MAX_EPISODE_STEPS: 1000
