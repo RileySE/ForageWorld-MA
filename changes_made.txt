@@ -21,17 +21,19 @@ class Subclass(Enum):
     player_sc: jnp.ndarray # subclasses
 5. craftax/craftax_coop/world_gen/world_gen.py 641
         player_sc = player_sc,
+6. craftax/craftax_coop/env/craftax_symbolic_env.py 26
+    def __init__(self, num_agents: int = 6):
 
 # changes made to ensure only revive players in the same subclass, damage players in other subclasses
 1. craftax/craftax_coop/game_logic.py 10-11
-    in_same_sc = (jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)).squeeze(axis=2).T
+    in_same_sc = (jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)).T
     in_diff_sc = jnp.logical_not(in_same_sc)
 2. craftax/craftax_coop/game_logic.py 13-44
 ... # differentiate same/diff_sc interaction and being interacted with ...
 
 # changes made so that trades only occur among agents in the same subclass
 1. craftax/craftax_coop/game_logic.py 3384
-    in_same_sc = (jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)).squeeze(axis=2).T
+    in_same_sc = (jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)).T
 2. craftax/craftax_coop/game_logic.py 3394
         in_same_sc[jnp.arange(static_params.player_count), player_trading_to] # same-sc check in giving condition
 
