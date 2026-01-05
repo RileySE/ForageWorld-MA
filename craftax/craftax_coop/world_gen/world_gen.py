@@ -638,6 +638,7 @@ def generate_world(rng, params, static_params):
         player_strength=jnp.full((static_params.player_count,), 1, dtype=jnp.int32),
         player_intelligence=jnp.full((static_params.player_count,), 1, dtype=jnp.int32),
         player_specialization=player_specializations,
+        player_sc = player_sc,
         request_duration=jnp.full((static_params.player_count,), 0, dtype=jnp.int32),
         request_type=jnp.full((static_params.player_count,), 0, dtype=jnp.int32),
         inventory=inventory,
