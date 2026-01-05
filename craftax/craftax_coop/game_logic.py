@@ -7,7 +7,7 @@ def interplayer_interaction(state, block_position, is_doing_action, env_params, 
     # If other player is down revive them, otherwise damage (if friendly fire is enabled)
     # Only revive players in the same subclass, damage players in other subclasses   
 
-    in_same_sc = (jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)).squeeze(axis=2).T
+    in_same_sc = (jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)).T
     in_diff_sc = jnp.logical_not(in_same_sc)
 
     in_other_player = (jnp.expand_dims(state.player_position, axis=1) == jnp.expand_dims(block_position, axis=0)).all(axis=2).T
