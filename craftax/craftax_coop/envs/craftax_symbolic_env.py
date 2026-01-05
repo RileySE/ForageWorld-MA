@@ -23,7 +23,7 @@ from craftax_coop.world_gen.world_gen import generate_world
 
 
 class CraftaxCoopSymbolicEnv(MultiAgentEnv):
-    def __init__(self, num_agents: int = 3):
+    def __init__(self, num_agents: int = 6):
         self.num_agents = num_agents
         self.static_env_params = CraftaxCoopSymbolicEnv.default_static_params()
 
