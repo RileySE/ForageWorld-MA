@@ -679,4 +679,14 @@ def generate_world(rng, params, static_params):
         timestep=jnp.asarray(0, dtype=jnp.int32),
     )
 
+    def print_agent_stats(i, spec, sc):
+        jax.debug.print("AGENT {i} INITIALIZED: Spec={s}, Subclass={c}", 
+                        i=i, s=spec, c=sc)
+        
+    jax.vmap(_print_agent_stats)(
+        jnp.arange(static_params.player_count), 
+        player_specializations, 
+        player_sc
+    )
+
     return state
