@@ -28,7 +28,6 @@ import optax
 import distrax
 
 import wandb
-import imageio
 
 from jaxmarl.wrappers.baselines import LogWrapper
 from jaxmarl.wrappers.baselines import JaxMARLWrapper
@@ -183,7 +182,7 @@ def unbatchify_actions(x: jnp.ndarray, agent_list, num_envs, num_actors):
 # ===========================
 # Training Function
 # ===========================
-def make_train(config, env):
+def make_train(config, env, base_env):
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
@@ -192,9 +191,12 @@ def make_train(config, env):
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
     config["CLIP_EPS"] = config["CLIP_EPS"] / env.num_agents if config["SCALE_CLIP_EPS"] else config["CLIP_EPS"]
-
-    env = WorldStateWrapper(env)
-    env = LogWrapper(env)
+    
+    # Calculate block size for training loop
+    config["UPDATES_PER_BLOCK"] = config.get("UPDATES_PER_BLOCK", 100)
+    config["NUM_BLOCKS"] = config["NUM_UPDATES"] // config["UPDATES_PER_BLOCK"]
+    if config["NUM_UPDATES"] % config["UPDATES_PER_BLOCK"] != 0:
+        config["NUM_BLOCKS"] += 1  # Add one more block for remaining updates
 
     def linear_schedule(count):
         frac = (
@@ -204,65 +206,16 @@ def make_train(config, env):
         )
         return config["LR"] * frac
 
-    def train(rng):
-        # INIT NETWORK
-        actor_network = ActorRNN(env.action_space(env.agents[0]).n, config=config)
-        critic_network = CriticRNN(config=config)
-        rng, _rng_actor, _rng_critic = jax.random.split(rng, 3)
-        ac_init_x = (
-            jnp.zeros((1, config["NUM_ENVS"], env.observation_space(env.agents[0]).shape[0])),
-            jnp.zeros((1, config["NUM_ENVS"])),
-        )
-        ac_init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
-        actor_network_params = actor_network.init(_rng_actor, ac_init_hstate, ac_init_x)
+    # Initialize networks once (outside train_block)
+    actor_network = ActorRNN(env.action_space(env.agents[0]).n, config=config)
+    critic_network = CriticRNN(config=config)
 
-        cr_init_x = (
-            jnp.zeros((1, config["NUM_ENVS"], env.world_state_size(),)),
-            jnp.zeros((1, config["NUM_ENVS"])),
-        )
-        cr_init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
-        critic_network_params = critic_network.init(_rng_critic, cr_init_hstate, cr_init_x)
-
-        if config["ANNEAL_LR"]:
-            actor_tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=linear_schedule, eps=1e-5),
-            )
-            critic_tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=linear_schedule, eps=1e-5),
-            )
-        else:
-            actor_tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(config["LR"], eps=1e-5),
-            )
-            critic_tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(config["LR"], eps=1e-5),
-            )
-        actor_train_state = TrainState.create(
-            apply_fn=actor_network.apply,
-            params=actor_network_params,
-            tx=actor_tx,
-        )
-        critic_train_state = TrainState.create(
-            apply_fn=critic_network.apply,
-            params=critic_network_params,
-            tx=critic_tx,
-        )
-
-        # INIT ENV
-        rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
-        ac_init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
-        cr_init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
-
-        # TRAIN LOOP
+    def train_block(runner_state, start_update, num_updates):
+        # TRAIN LOOP (single update step)
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
+            absolute_update_steps = start_update + update_steps  # Track absolute progress
 
             def _env_step(runner_state, unused):
                 train_states, env_state, last_obs, last_done, hstates, rng = runner_state
@@ -503,16 +456,15 @@ def make_train(config, env):
             )
             loss_info["ratio_0"] = loss_info["ratio"].at[0,0].get()
             loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
-
             train_states = update_state[0]
             metric = traj_batch.info
             metric["loss"] = loss_info
-            metric["update_steps"] = update_steps
+            metric["absolute_update_steps"] = absolute_update_steps
             rng = update_state[-1]
 
             def callback(metric):
                 env_step = (
-                    metric["update_steps"]
+                    metric["absolute_update_steps"]
                     * config["NUM_ENVS"]
                     * config["NUM_STEPS"]
                 )
@@ -532,9 +484,70 @@ def make_train(config, env):
                 wandb.log(to_log)
 
             jax.experimental.io_callback(callback, None, metric)
+            
             update_steps = update_steps + 1
             runner_state = (train_states, env_state, last_obs, last_done, hstates, rng)
             return (runner_state, update_steps), metric
+
+        # Run block of updates
+        runner_state_with_steps, metrics = jax.lax.scan(
+            _update_step, (runner_state, 0), None, num_updates
+        )
+        runner_state = runner_state_with_steps[0]
+        return runner_state, metrics
+
+    def train(rng):
+        # INIT NETWORK (use networks from outer scope to avoid duplication)
+        rng, _rng_actor, _rng_critic = jax.random.split(rng, 3)
+        ac_init_x = (
+            jnp.zeros((1, config["NUM_ENVS"], env.observation_space(env.agents[0]).shape[0])),
+            jnp.zeros((1, config["NUM_ENVS"])),
+        )
+        ac_init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
+        actor_network_params = actor_network.init(_rng_actor, ac_init_hstate, ac_init_x)
+
+        cr_init_x = (
+            jnp.zeros((1, config["NUM_ENVS"], env.world_state_size(),)),
+            jnp.zeros((1, config["NUM_ENVS"])),
+        )
+        cr_init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
+        critic_network_params = critic_network.init(_rng_critic, cr_init_hstate, cr_init_x)
+
+        if config["ANNEAL_LR"]:
+            actor_tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(learning_rate=linear_schedule, eps=1e-5),
+            )
+            critic_tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(learning_rate=linear_schedule, eps=1e-5),
+            )
+        else:
+            actor_tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(config["LR"], eps=1e-5),
+            )
+            critic_tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(config["LR"], eps=1e-5),
+            )
+        actor_train_state = TrainState.create(
+            apply_fn=actor_network.apply,
+            params=actor_network_params,
+            tx=actor_tx,
+        )
+        critic_train_state = TrainState.create(
+            apply_fn=critic_network.apply,
+            params=critic_network_params,
+            tx=critic_tx,
+        )
+
+        # INIT ENV
+        rng, _rng = jax.random.split(rng)
+        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+        ac_init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
+        cr_init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
@@ -545,478 +558,100 @@ def make_train(config, env):
             (ac_init_hstate, cr_init_hstate),
             _rng,
         )
-        runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, 0), None, config["NUM_UPDATES"]
-        )
-        return {"runner_state": runner_state}
+        
+        # JIT compile the train_block function
+        # Only num_updates is static to avoid recompilation on every block
+        train_block_jit = jax.jit(train_block, static_argnums=(2,))
+        
+        # Setup rendering if enabled (host-side, outside JIT)
+        should_render = config.get("RENDER_DURING_TRAINING", False)
+        if should_render:
+            print(f"\n🎥 Rendering enabled: Every {config.get('RENDER_INTERVAL', 1)} blocks\n")
+        
+        # Python loop over blocks - training + optional rendering
+        all_metrics = []
+        for block_idx in range(config["NUM_BLOCKS"]):
+            start_update = block_idx * config["UPDATES_PER_BLOCK"]
+            # Handle last block (might have fewer updates)
+            remaining_updates = config["NUM_UPDATES"] - start_update
+            num_updates_in_block = min(config["UPDATES_PER_BLOCK"], remaining_updates)
+            
+            if num_updates_in_block <= 0:
+                break
+            
+            # Run training block (JIT-compiled)
+            runner_state, block_metrics = train_block_jit(runner_state, start_update, num_updates_in_block)
+            all_metrics.append(block_metrics)
+            
+            # Render between blocks (host-side, no JIT)
+            if should_render:
+                render_interval = config.get("RENDER_INTERVAL", 1)
+                current_update = start_update + num_updates_in_block
+                
+                if (block_idx + 1) % render_interval == 0 or block_idx == config["NUM_BLOCKS"] - 1:
+                    print(f"\n{'='*60}")
+                    print(f"Block {block_idx + 1}/{config['NUM_BLOCKS']} complete - Rendering checkpoint...")
+                    print(f"{'='*60}")
+                    
+                    # Import generic rendering function
+                    from craftax.custom_rendering import render_policy_episode
+                    
+                    # Create MAPPO policy wrapper
+                    policy_fn = create_mappo_policy(
+                        actor_network=actor_network,
+                        train_state=runner_state[0][0],  # actor train state
+                        env=base_env,
+                        config=config
+                    )
+                    
+                    # Render using generic interface
+                    render_policy_episode(
+                        env=base_env,
+                        policy_fn=policy_fn,
+                        config=config,
+                        update_num=current_update,
+                        verbose=True
+                    )
+        
+        return {"runner_state": runner_state, "metrics": all_metrics, "actor_network": actor_network, "critic_network": critic_network}
 
     return train
 
 # ===========================
-# Full Map Rendering Function
+# Policy Wrapper for MAPPO RNN
 # ===========================
-def render_full_map(state, block_pixel_size, static_params, textures, player_specific_textures):
-    """
-    Renders the complete map (48x48) for the current floor without HUD/inventory.
-    Shows all players, mobs, items, and terrain.
-    """
-    from craftax.craftax_coop.constants import (
-        BlockType, ItemType, OBS_DIM, MAX_OBS_DIM, 
-        MONSTERS_KILLED_TO_CLEAR_LEVEL, TEXTURES
-    )
-    from craftax.craftax_coop.util.game_logic_utils import is_boss_vulnerable
+def create_mappo_policy(actor_network, train_state, env, config):
+    # Store initial hidden state for episode resets
+    initial_hstate = ScannedRNN.initialize_carry(env.num_agents, config["GRU_HIDDEN_DIM"])
+    ac_hstate = initial_hstate
     
-    # Get the full map for current floor (no viewport slicing)
-    map_full = state.map[state.player_level]  # Shape: (48, 48)
-    map_size = map_full.shape
-    
-    # Boss block handling
-    boss_block = jax.lax.select(
-        is_boss_vulnerable(state),
-        BlockType.NECROMANCER_VULNERABLE.value,
-        BlockType.NECROMANCER.value,
-    )
-    map_view_boss = map_full == BlockType.NECROMANCER.value
-    map_full = map_view_boss * boss_block + (1 - map_view_boss) * map_full
-    
-    # Initialize pixel array
-    map_pixels = jnp.zeros(
-        (map_size[0] * block_pixel_size, map_size[1] * block_pixel_size, 3),
-        dtype=jnp.float32
-    )
-    
-    # Render each block type by tiling individual block textures
-    def _add_block_type_to_pixels(pixels, block_index):
-        # Get positions where this block type appears
-        block_mask = map_full == block_index  # Shape: (48, 48)
+    def policy_fn(rng, obs, state, done):
+        nonlocal ac_hstate  # RNN needs to maintain state across calls
         
-        # Get the texture for this block type
-        block_texture = textures["block_textures"][block_index]  # Shape: (16, 16, 3)
+        # Reset hidden state when episode ends
+        if done.get("__all__", False):
+            ac_hstate = initial_hstate
         
-        # Create full-size texture by repeating for each block position
-        # We'll scan through each tile position
-        def render_tile(y_tile, x_tile):
-            # Calculate pixel position for this tile
-            y_start = y_tile * block_pixel_size
-            x_start = x_tile * block_pixel_size
-            
-            # Return texture if this position has the block, else zeros
-            return jax.lax.select(
-                block_mask[y_tile, x_tile],
-                block_texture,
-                jnp.zeros_like(block_texture)
-            )
+        # Prepare inputs
+        obs_batch = batchify(obs, env.agents, env.num_agents)
+        done_batch = jnp.array([done[agent] for agent in env.agents], dtype=bool)
         
-        # Vectorize over all tile positions
-        y_indices = jnp.arange(map_size[0])
-        x_indices = jnp.arange(map_size[1])
+        # Apply RNN policy
+        ac_in = (obs_batch[np.newaxis, :], done_batch[np.newaxis, :])
+        ac_hstate, pi = actor_network.apply(train_state.params, ac_hstate, ac_in)
         
-        # Use vmap to efficiently render all tiles
-        render_row = jax.vmap(render_tile, in_axes=(None, 0))
-        render_all = jax.vmap(render_row, in_axes=(0, None))
+        # Sample actions
+        actions = pi.sample(seed=rng)
         
-        tiled_textures = render_all(y_indices, x_indices)  # Shape: (48, 48, 16, 16, 3)
-        
-        # Reshape to full map: (48, 48, 16, 16, 3) -> (48*16, 48*16, 3)
-        full_texture = tiled_textures.transpose(0, 2, 1, 3, 4).reshape(
-            map_size[0] * block_pixel_size,
-            map_size[1] * block_pixel_size,
-            3
-        )
-        
-        return pixels + full_texture, None
-    
-    map_pixels, _ = jax.lax.scan(
-        _add_block_type_to_pixels, map_pixels, jnp.arange(len(BlockType))
-    )
-    
-    # Add items
-    item_map_full = state.item_map[state.player_level]
-    
-    # Insert blocked/open ladders
-    is_ladder_down_open = (
-        state.monsters_killed[state.player_level] >= MONSTERS_KILLED_TO_CLEAR_LEVEL
-    )
-    ladder_down_item = jax.lax.select(
-        is_ladder_down_open,
-        ItemType.LADDER_DOWN.value,
-        ItemType.LADDER_DOWN_BLOCKED.value,
-    )
-    item_map_view_is_ladder_down = item_map_full == ItemType.LADDER_DOWN.value
-    item_map_full = (
-        item_map_view_is_ladder_down * ladder_down_item
-        + (1 - item_map_view_is_ladder_down) * item_map_full
-    )
-    
-    # Add items with tiled textures
-    def _add_item_type_to_pixels(pixels, item_index):
-        # Get positions where this item type appears
-        item_mask = item_map_full == item_index
-        
-        # Extract single item texture from full_map_item_textures (which is tiled for ego-view)
-        # full_map_item_textures has shape (num_items, 9*16, 11*16, 4) for block_pixel_size=16
-        # We need just one tile (16x16x4)
-        full_item_tex = textures["full_map_item_textures"][item_index]
-        item_texture = full_item_tex[:block_pixel_size, :block_pixel_size, :]  # Extract first tile
-        
-        # Render all tiles with this item
-        def render_item_tile(y_tile, x_tile):
-            return jax.lax.select(
-                item_mask[y_tile, x_tile],
-                item_texture,
-                jnp.zeros_like(item_texture)
-            )
-        
-        y_indices = jnp.arange(map_size[0])
-        x_indices = jnp.arange(map_size[1])
-        
-        render_row = jax.vmap(render_item_tile, in_axes=(None, 0))
-        render_all = jax.vmap(render_row, in_axes=(0, None))
-        
-        tiled_items = render_all(y_indices, x_indices)  # Shape: (48, 48, 16, 16, 4)
-        
-        # Reshape to full map
-        full_item_texture = tiled_items.transpose(0, 2, 1, 3, 4).reshape(
-            map_size[0] * block_pixel_size,
-            map_size[1] * block_pixel_size,
-            4
-        )
-        
-        # Alpha blend: remove background and add item
-        alpha = full_item_texture[:, :, 3:4]
-        rgb = full_item_texture[:, :, :3]
-        pixels = pixels * (1 - alpha) + rgb * alpha
-        
-        return pixels, None
-    
-    map_pixels, _ = jax.lax.scan(
-        _add_item_type_to_pixels, map_pixels, jnp.arange(1, len(ItemType))
-    )
-    
-    # Render all players on the map
-    def _slice_pixel_map(player_pixels, position):
-        return jax.lax.dynamic_slice(
-            player_pixels,
-            (
-                position[0] * block_pixel_size,
-                position[1] * block_pixel_size,
-                0,
-            ),
-            (block_pixel_size, block_pixel_size, 3),
-        )
-    
-    def _update_slice_pixel_map(player_pixels, texture_with_background, position):
-        return jax.lax.dynamic_update_slice(
-            player_pixels,
-            texture_with_background,
-            (
-                position[0] * block_pixel_size,
-                position[1] * block_pixel_size,
-                0,
-            ),
-        )
-    
-    def _render_player(pixels, player_index):
-        position = state.player_position[player_index]
-        
-        # Get player texture based on state
-        player_texture_index = jax.lax.select(
-            state.is_sleeping[player_index], 4, state.player_direction[player_index] - 1
-        )
-        player_texture_index = jax.lax.select(
-            state.player_alive[player_index], player_texture_index, 5
-        )
-        player_texture = player_specific_textures.player_textures[player_index, player_texture_index]
-        player_texture, player_texture_alpha = (
-            player_texture[:, :, :3],
-            player_texture[:, :, 3:],
-        )
-        
-        # Blend with background
-        background = _slice_pixel_map(pixels, position)
-        player_texture_with_background = (1 - player_texture_alpha) * background
-        player_texture_with_background = (
-            player_texture_with_background + player_texture * player_texture_alpha
-        )
-        
-        pixels = _update_slice_pixel_map(pixels, player_texture_with_background, position)
-        return pixels, None
-    
-    map_pixels, _ = jax.lax.scan(
-        _render_player, map_pixels, jnp.arange(static_params.player_count)
-    )
-    
-    # Render mobs (melee, ranged, passive)
-    def _add_mob_to_pixels(carry, mob_index):
-        pixels, mobs, texture_name, alpha_texture_name = carry
-        position = mobs.position[state.player_level, mob_index]
-        is_on_map = mobs.mask[state.player_level, mob_index]
-        
-        mob_texture = texture_name[mobs.type_id[state.player_level, mob_index]]
-        mob_texture_alpha = alpha_texture_name[mobs.type_id[state.player_level, mob_index]]
-        
-        # Only render if mob is active
-        background = _slice_pixel_map(pixels, position)
-        mob_texture_with_background = (1 - mob_texture_alpha * is_on_map) * background
-        mob_texture_with_background = (
-            mob_texture_with_background + mob_texture * mob_texture_alpha * is_on_map
-        )
-        
-        pixels = jax.lax.cond(
-            is_on_map,
-            lambda p: _update_slice_pixel_map(p, mob_texture_with_background, position),
-            lambda p: p,
-            pixels
-        )
-        
-        return (pixels, mobs, texture_name, alpha_texture_name), None
-    
-    # Melee mobs
-    (map_pixels, _, _, _), _ = jax.lax.scan(
-        _add_mob_to_pixels,
-        (map_pixels, state.melee_mobs, textures["melee_mob_textures"], textures["melee_mob_texture_alphas"]),
-        jnp.arange(state.melee_mobs.mask.shape[1]),
-    )
-    
-    # Passive mobs
-    (map_pixels, _, _, _), _ = jax.lax.scan(
-        _add_mob_to_pixels,
-        (map_pixels, state.passive_mobs, textures["passive_mob_textures"], textures["passive_mob_texture_alphas"]),
-        jnp.arange(state.passive_mobs.mask.shape[1]),
-    )
-    
-    # Ranged mobs
-    (map_pixels, _, _, _), _ = jax.lax.scan(
-        _add_mob_to_pixels,
-        (map_pixels, state.ranged_mobs, textures["ranged_mob_textures"], textures["ranged_mob_texture_alphas"]),
-        jnp.arange(state.ranged_mobs.mask.shape[1]),
-    )
-    
-    # Apply lighting (underground darkness)
-    light_map = state.light_map[state.player_level]
-    light_map_pixels = light_map.repeat(block_pixel_size, axis=0).repeat(
-        block_pixel_size, axis=1
-    )
-    map_pixels = light_map_pixels[:, :, None] * map_pixels
-    
-    # Apply day/night cycle (only on floor 0 - surface)
-    daylight = state.light_level
-    daylight = jax.lax.select(state.player_level == 0, daylight, 1.0)
-    
-    # Simple night darkening without noise for full map view
-    night_intensity = 2 * (0.5 - daylight)
-    night_intensity = jnp.maximum(night_intensity, 0.0)
-    night_darkening = 1.0 - (night_intensity * 0.5)
-    map_pixels = night_darkening * map_pixels
-    
-    return map_pixels
-
-
-# ===========================
-# Episode Rendering Function
-# ===========================
-def render_first_episode(base_env, config):
-    """
-    Renders the first episode with random actions.
-    Saves videos for each agent's ego-perspective AND/OR a full map view.
-    """
-    print("\n=== Rendering First Episode ===")
-    
-    # Get rendering config
-    render_ego = config.get("RENDER_EGO_PERSPECTIVE", True)
-    render_fullmap = config.get("RENDER_FULL_MAP", True)
-    
-    if not render_ego and not render_fullmap:
-        print("Warning: Both RENDER_EGO_PERSPECTIVE and RENDER_FULL_MAP are False. Skipping rendering.")
-        return
-    
-    print(f"Render ego-perspective: {render_ego}")
-    print(f"Render full map: {render_fullmap}")
-    
-    # Create output directory
-    os.makedirs("videos", exist_ok=True)
-    
-    # Import pixel renderer based on environment type
-    env_name = config.get("ENV_NAME", "")
-    if "Coop" in env_name:
-        from craftax.craftax_coop.renderer.renderer_pixels import render_craftax_pixels as _render_fn
-        from craftax.craftax_coop.constants import TEXTURES, load_player_specific_textures
-    else:
-        from craftax.craftax_ma.renderer.renderer_pixels import render_craftax_pixels as _render_fn
-        from craftax.craftax_ma.constants import TEXTURES, load_player_specific_textures
-    
-    # Create wrapper that fixes state_rng to prevent flickering
-    def render_craftax_pixels_no_flicker(state, pixel_size, static_params, player_textures):
-        """Wrapper that fixes RNG to prevent night noise flickering"""
-        import hashlib
-        key_val = int(hashlib.md5(b"fixed_render_key").hexdigest()[:8], 16)
-        state_fixed = state.replace(state_rng=jax.random.PRNGKey(key_val))
-        return _render_fn(state_fixed, pixel_size, static_params, player_textures)
-    
-    # Use available pixel size from TEXTURES (prefer 16 or 64 for decent quality)
-    available_sizes = list(TEXTURES.keys())
-    if 16 in available_sizes:
-        pixel_size = 16
-    elif 64 in available_sizes:
-        pixel_size = 64
-    else:
-        pixel_size = available_sizes[0]  # Use first available
-    
-    print(f"Using pixel size: {pixel_size} (available: {available_sizes})")
-    
-    # DEBUG: Check if player_specific_textures are stable
-    player_specific_textures = load_player_specific_textures(
-        TEXTURES[pixel_size],
-        base_env.num_agents
-    )
-    
-    # Print hash of textures to verify they're constant
-    import hashlib
-    texture_hash = hashlib.md5(np.array(player_specific_textures.player_textures).tobytes()).hexdigest()
-    print(f"Player textures hash: {texture_hash}")
-    print(f"Player textures shape: {player_specific_textures.player_textures.shape}")
-    print(f"First player first pixel color: {player_specific_textures.player_textures[0, 0, 0, 0, :]}")
-    
-    # Reset environment (single env, not batched)
-    rng = jax.random.PRNGKey(config["SEED"] + 999)  # Different seed for rendering
-    rng, reset_rng = jax.random.split(rng)
-    obs, state = base_env.reset(reset_rng)
-    
-    # Get number of agents
-    num_agents = base_env.num_agents
-    
-    print(f"Environment: {env_name}")
-    print(f"Number of agents: {num_agents}")
-    print(f"Using pixel renderer for visualization")
-    
-    # Initialize hidden states (batch size = num_agents for all agents)
-    ac_hstate = ScannedRNN.initialize_carry(num_agents, config["GRU_HIDDEN_DIM"])
-    
-    # Storage for frames
-    frames_per_agent = {i: [] for i in range(num_agents)} if render_ego else {}
-    frames_full_map = [] if render_fullmap else None
-    
-    # Track done state
-    done = {agent: False for agent in base_env.agents}
-    done["__all__"] = False
-    last_done = jnp.zeros((num_agents,), dtype=bool)
-    
-    max_steps = config.get("MAX_EPISODE_STEPS", 1000)
-    
-    print(f"Running episode for up to {max_steps} steps...")
-    if render_ego and render_fullmap:
-        print(f"Rendering both ego-perspectives AND full map view...")
-    elif render_ego:
-        print(f"Rendering ego-perspectives only...")
-    elif render_fullmap:
-        print(f"Rendering full map view only...")
-    
-    for step in range(max_steps):
-        # Render ego-perspective for each agent (if enabled)
-        if render_ego:
-            pixels = render_craftax_pixels_no_flicker(
-                state, 
-                pixel_size,
-                base_env.static_env_params,
-                player_specific_textures
-            )
-            
-            # pixels is array of shape (num_agents, height, width, 3)
-            # Convert to numpy once
-            pixels_np = np.array(pixels)
-            
-            # Pixels are already in [0, 255] range as float32
-            # Just convert to uint8
-            pixels_np = pixels_np.astype(np.uint8)
-            
-            # Extract frame for each agent
-            for agent_idx in range(num_agents):
-                frame = pixels_np[agent_idx]
-                
-                if step == 0:
-                    print(f"Agent {agent_idx}: Frame shape={frame.shape}, dtype={frame.dtype}")
-                
-                frames_per_agent[agent_idx].append(frame)
-        
-        # Render full map view (if enabled)
-        if render_fullmap:
-            full_map_pixels = render_full_map(
-                state,
-                pixel_size,
-                base_env.static_env_params,
-                TEXTURES[pixel_size],
-                player_specific_textures
-            )
-            
-            # Convert to numpy and uint8
-            full_map_np = np.array(full_map_pixels).astype(np.uint8)
-            
-            if step == 0:
-                print(f"Full map: Frame shape={full_map_np.shape}, dtype={full_map_np.dtype}")
-                print(f"Current floor: {state.player_level}")
-            
-            frames_full_map.append(full_map_np)
-        
-        # Get random actions instead of using policy (simpler for POC)
-        rng, action_rng = jax.random.split(rng)
-        action_keys = jax.random.split(action_rng, num_agents)
-        
-        # Random actions for each agent
+        # Convert to action dict
         action_dict = {}
-        for i, agent in enumerate(base_env.agents):
-            action_dict[agent] = jax.random.randint(
-                action_keys[i], 
-                shape=(), 
-                minval=0, 
-                maxval=base_env.action_space(agent).n
-            ).item()
+        for i, agent in enumerate(env.agents):
+            action_dict[agent] = actions[0, i].item()
         
-        # Step environment
-        rng, step_rng = jax.random.split(rng)
-        obs, state, reward, done, info = base_env.step(step_rng, state, action_dict)
-        
-        if done["__all__"]:
-            print(f"Episode finished at step {step + 1}")
-            break
+        return action_dict
     
-    # Save videos
-    print("\nSaving videos...")
-    
-    # Save ego-perspective videos (if enabled)
-    if render_ego:
-        print(f"Ego-perspective frames collected: {[(agent_idx, len(frames)) for agent_idx, frames in frames_per_agent.items()]}")
-        for agent_idx in range(num_agents):
-            if len(frames_per_agent[agent_idx]) > 0:
-                # Try MP4 first, fallback to GIF if ffmpeg not available
-                try:
-                    video_path = f"videos/agent_{agent_idx}_first_episode.mp4"
-                    imageio.mimsave(video_path, frames_per_agent[agent_idx], fps=10, codec='libx264')
-                    print(f"  Saved: {video_path} ({len(frames_per_agent[agent_idx])} frames)")
-                except Exception as e:
-                    print(f"  MP4 failed ({e}), saving as GIF instead...")
-                    video_path = f"videos/agent_{agent_idx}_first_episode.gif"
-                    imageio.mimsave(video_path, frames_per_agent[agent_idx], fps=10, loop=0)
-                    print(f"  Saved: {video_path} ({len(frames_per_agent[agent_idx])} frames)")
-            else:
-                print(f"  Agent {agent_idx}: No frames collected!")
-    
-    # Save full map video (if enabled)
-    if render_fullmap:
-        print(f"Full map frames collected: {len(frames_full_map)}")
-        if len(frames_full_map) > 0:
-            try:
-                video_path = "videos/full_map_first_episode.mp4"
-                imageio.mimsave(video_path, frames_full_map, fps=10, codec='libx264')
-                print(f"  Saved: {video_path} ({len(frames_full_map)} frames)")
-            except Exception as e:
-                print(f"  MP4 failed ({e}), saving as GIF instead...")
-                video_path = "videos/full_map_first_episode.gif"
-                imageio.mimsave(video_path, frames_full_map, fps=10, loop=0)
-                print(f"  Saved: {video_path} ({len(frames_full_map)} frames)")
-        else:
-            print(f"  Full map: No frames collected!")
-    
-    print("=== Rendering Complete ===\n")
+    return policy_fn
+
 
 # ===========================
 # Main Run Function
@@ -1041,18 +676,40 @@ def single_run(config):
 
     rng = jax.random.PRNGKey(config["SEED"])
 
-    # Render first episode if enabled
-    if config.get("RENDER_FIRST_EPISODE", False):
-        # Use the unwrapped base environment directly (before wrapping)
-        render_first_episode(env, config)
-
-    # Wrap env for training after rendering
+    # Wrap env for training
+    base_env = env  # Keep reference to unwrapped env for rendering
     env = WorldStateWrapper(env)
     env = LogWrapper(env)
 
-    rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    train_vjit = jax.jit(jax.vmap(make_train(config, env)))
-    outs = jax.block_until_ready(train_vjit(rngs))
+    # Train (no vmap/jit on outer level to allow rendering between blocks)
+    train_fn = make_train(config, env, base_env)
+    outs = train_fn(rng)
+    
+    # Render final trained policy if enabled
+    if config.get("RENDER_DURING_TRAINING", False):
+        print("\n" + "="*50)
+        print("Training complete! Rendering final evaluation episode...")
+        print("="*50 + "\n")
+        
+        # Import generic rendering function
+        from craftax.custom_rendering import render_policy_episode
+        
+        # Create MAPPO policy wrapper
+        policy_fn = create_mappo_policy(
+            actor_network=outs["actor_network"],
+            train_state=outs["runner_state"][0][0],  # actor train state
+            env=base_env,
+            config=config
+        )
+        
+        # Render final episode
+        render_policy_episode(
+            env=base_env,
+            policy_fn=policy_fn,
+            config=config,
+            update_num=None,  # Final episode
+            verbose=True
+        )
 
 
 def main():
@@ -1067,4 +724,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 

@@ -36,7 +36,9 @@ NUM_SEEDS: 1
 SEED: 0
 
 # Rendering configuration
-RENDER_FIRST_EPISODE: true
+RENDER_DURING_TRAINING: true
+RENDER_INTERVAL: 1  # Render every N blocks (not updates!)
+UPDATES_PER_BLOCK: 50  # How many updates per training block
 RENDER_EGO_PERSPECTIVE: true
 RENDER_FULL_MAP: true
 MAX_EPISODE_STEPS: 1000
