@@ -553,14 +553,285 @@ def make_train(config, env):
     return train
 
 # ===========================
+# Full Map Rendering Function
+# ===========================
+def render_full_map(state, block_pixel_size, static_params, textures, player_specific_textures):
+    """
+    Renders the complete map (48x48) for the current floor without HUD/inventory.
+    Shows all players, mobs, items, and terrain.
+    """
+    from craftax.craftax_coop.constants import (
+        BlockType, ItemType, OBS_DIM, MAX_OBS_DIM, 
+        MONSTERS_KILLED_TO_CLEAR_LEVEL, TEXTURES
+    )
+    from craftax.craftax_coop.util.game_logic_utils import is_boss_vulnerable
+    
+    # Get the full map for current floor (no viewport slicing)
+    map_full = state.map[state.player_level]  # Shape: (48, 48)
+    map_size = map_full.shape
+    
+    # Boss block handling
+    boss_block = jax.lax.select(
+        is_boss_vulnerable(state),
+        BlockType.NECROMANCER_VULNERABLE.value,
+        BlockType.NECROMANCER.value,
+    )
+    map_view_boss = map_full == BlockType.NECROMANCER.value
+    map_full = map_view_boss * boss_block + (1 - map_view_boss) * map_full
+    
+    # Initialize pixel array
+    map_pixels = jnp.zeros(
+        (map_size[0] * block_pixel_size, map_size[1] * block_pixel_size, 3),
+        dtype=jnp.float32
+    )
+    
+    # Render each block type by tiling individual block textures
+    def _add_block_type_to_pixels(pixels, block_index):
+        # Get positions where this block type appears
+        block_mask = map_full == block_index  # Shape: (48, 48)
+        
+        # Get the texture for this block type
+        block_texture = textures["block_textures"][block_index]  # Shape: (16, 16, 3)
+        
+        # Create full-size texture by repeating for each block position
+        # We'll scan through each tile position
+        def render_tile(y_tile, x_tile):
+            # Calculate pixel position for this tile
+            y_start = y_tile * block_pixel_size
+            x_start = x_tile * block_pixel_size
+            
+            # Return texture if this position has the block, else zeros
+            return jax.lax.select(
+                block_mask[y_tile, x_tile],
+                block_texture,
+                jnp.zeros_like(block_texture)
+            )
+        
+        # Vectorize over all tile positions
+        y_indices = jnp.arange(map_size[0])
+        x_indices = jnp.arange(map_size[1])
+        
+        # Use vmap to efficiently render all tiles
+        render_row = jax.vmap(render_tile, in_axes=(None, 0))
+        render_all = jax.vmap(render_row, in_axes=(0, None))
+        
+        tiled_textures = render_all(y_indices, x_indices)  # Shape: (48, 48, 16, 16, 3)
+        
+        # Reshape to full map: (48, 48, 16, 16, 3) -> (48*16, 48*16, 3)
+        full_texture = tiled_textures.transpose(0, 2, 1, 3, 4).reshape(
+            map_size[0] * block_pixel_size,
+            map_size[1] * block_pixel_size,
+            3
+        )
+        
+        return pixels + full_texture, None
+    
+    map_pixels, _ = jax.lax.scan(
+        _add_block_type_to_pixels, map_pixels, jnp.arange(len(BlockType))
+    )
+    
+    # Add items
+    item_map_full = state.item_map[state.player_level]
+    
+    # Insert blocked/open ladders
+    is_ladder_down_open = (
+        state.monsters_killed[state.player_level] >= MONSTERS_KILLED_TO_CLEAR_LEVEL
+    )
+    ladder_down_item = jax.lax.select(
+        is_ladder_down_open,
+        ItemType.LADDER_DOWN.value,
+        ItemType.LADDER_DOWN_BLOCKED.value,
+    )
+    item_map_view_is_ladder_down = item_map_full == ItemType.LADDER_DOWN.value
+    item_map_full = (
+        item_map_view_is_ladder_down * ladder_down_item
+        + (1 - item_map_view_is_ladder_down) * item_map_full
+    )
+    
+    # Add items with tiled textures
+    def _add_item_type_to_pixels(pixels, item_index):
+        # Get positions where this item type appears
+        item_mask = item_map_full == item_index
+        
+        # Extract single item texture from full_map_item_textures (which is tiled for ego-view)
+        # full_map_item_textures has shape (num_items, 9*16, 11*16, 4) for block_pixel_size=16
+        # We need just one tile (16x16x4)
+        full_item_tex = textures["full_map_item_textures"][item_index]
+        item_texture = full_item_tex[:block_pixel_size, :block_pixel_size, :]  # Extract first tile
+        
+        # Render all tiles with this item
+        def render_item_tile(y_tile, x_tile):
+            return jax.lax.select(
+                item_mask[y_tile, x_tile],
+                item_texture,
+                jnp.zeros_like(item_texture)
+            )
+        
+        y_indices = jnp.arange(map_size[0])
+        x_indices = jnp.arange(map_size[1])
+        
+        render_row = jax.vmap(render_item_tile, in_axes=(None, 0))
+        render_all = jax.vmap(render_row, in_axes=(0, None))
+        
+        tiled_items = render_all(y_indices, x_indices)  # Shape: (48, 48, 16, 16, 4)
+        
+        # Reshape to full map
+        full_item_texture = tiled_items.transpose(0, 2, 1, 3, 4).reshape(
+            map_size[0] * block_pixel_size,
+            map_size[1] * block_pixel_size,
+            4
+        )
+        
+        # Alpha blend: remove background and add item
+        alpha = full_item_texture[:, :, 3:4]
+        rgb = full_item_texture[:, :, :3]
+        pixels = pixels * (1 - alpha) + rgb * alpha
+        
+        return pixels, None
+    
+    map_pixels, _ = jax.lax.scan(
+        _add_item_type_to_pixels, map_pixels, jnp.arange(1, len(ItemType))
+    )
+    
+    # Render all players on the map
+    def _slice_pixel_map(player_pixels, position):
+        return jax.lax.dynamic_slice(
+            player_pixels,
+            (
+                position[0] * block_pixel_size,
+                position[1] * block_pixel_size,
+                0,
+            ),
+            (block_pixel_size, block_pixel_size, 3),
+        )
+    
+    def _update_slice_pixel_map(player_pixels, texture_with_background, position):
+        return jax.lax.dynamic_update_slice(
+            player_pixels,
+            texture_with_background,
+            (
+                position[0] * block_pixel_size,
+                position[1] * block_pixel_size,
+                0,
+            ),
+        )
+    
+    def _render_player(pixels, player_index):
+        position = state.player_position[player_index]
+        
+        # Get player texture based on state
+        player_texture_index = jax.lax.select(
+            state.is_sleeping[player_index], 4, state.player_direction[player_index] - 1
+        )
+        player_texture_index = jax.lax.select(
+            state.player_alive[player_index], player_texture_index, 5
+        )
+        player_texture = player_specific_textures.player_textures[player_index, player_texture_index]
+        player_texture, player_texture_alpha = (
+            player_texture[:, :, :3],
+            player_texture[:, :, 3:],
+        )
+        
+        # Blend with background
+        background = _slice_pixel_map(pixels, position)
+        player_texture_with_background = (1 - player_texture_alpha) * background
+        player_texture_with_background = (
+            player_texture_with_background + player_texture * player_texture_alpha
+        )
+        
+        pixels = _update_slice_pixel_map(pixels, player_texture_with_background, position)
+        return pixels, None
+    
+    map_pixels, _ = jax.lax.scan(
+        _render_player, map_pixels, jnp.arange(static_params.player_count)
+    )
+    
+    # Render mobs (melee, ranged, passive)
+    def _add_mob_to_pixels(carry, mob_index):
+        pixels, mobs, texture_name, alpha_texture_name = carry
+        position = mobs.position[state.player_level, mob_index]
+        is_on_map = mobs.mask[state.player_level, mob_index]
+        
+        mob_texture = texture_name[mobs.type_id[state.player_level, mob_index]]
+        mob_texture_alpha = alpha_texture_name[mobs.type_id[state.player_level, mob_index]]
+        
+        # Only render if mob is active
+        background = _slice_pixel_map(pixels, position)
+        mob_texture_with_background = (1 - mob_texture_alpha * is_on_map) * background
+        mob_texture_with_background = (
+            mob_texture_with_background + mob_texture * mob_texture_alpha * is_on_map
+        )
+        
+        pixels = jax.lax.cond(
+            is_on_map,
+            lambda p: _update_slice_pixel_map(p, mob_texture_with_background, position),
+            lambda p: p,
+            pixels
+        )
+        
+        return (pixels, mobs, texture_name, alpha_texture_name), None
+    
+    # Melee mobs
+    (map_pixels, _, _, _), _ = jax.lax.scan(
+        _add_mob_to_pixels,
+        (map_pixels, state.melee_mobs, textures["melee_mob_textures"], textures["melee_mob_texture_alphas"]),
+        jnp.arange(state.melee_mobs.mask.shape[1]),
+    )
+    
+    # Passive mobs
+    (map_pixels, _, _, _), _ = jax.lax.scan(
+        _add_mob_to_pixels,
+        (map_pixels, state.passive_mobs, textures["passive_mob_textures"], textures["passive_mob_texture_alphas"]),
+        jnp.arange(state.passive_mobs.mask.shape[1]),
+    )
+    
+    # Ranged mobs
+    (map_pixels, _, _, _), _ = jax.lax.scan(
+        _add_mob_to_pixels,
+        (map_pixels, state.ranged_mobs, textures["ranged_mob_textures"], textures["ranged_mob_texture_alphas"]),
+        jnp.arange(state.ranged_mobs.mask.shape[1]),
+    )
+    
+    # Apply lighting (underground darkness)
+    light_map = state.light_map[state.player_level]
+    light_map_pixels = light_map.repeat(block_pixel_size, axis=0).repeat(
+        block_pixel_size, axis=1
+    )
+    map_pixels = light_map_pixels[:, :, None] * map_pixels
+    
+    # Apply day/night cycle (only on floor 0 - surface)
+    daylight = state.light_level
+    daylight = jax.lax.select(state.player_level == 0, daylight, 1.0)
+    
+    # Simple night darkening without noise for full map view
+    night_intensity = 2 * (0.5 - daylight)
+    night_intensity = jnp.maximum(night_intensity, 0.0)
+    night_darkening = 1.0 - (night_intensity * 0.5)
+    map_pixels = night_darkening * map_pixels
+    
+    return map_pixels
+
+
+# ===========================
 # Episode Rendering Function
 # ===========================
 def render_first_episode(base_env, config):
     """
     Renders the first episode with random actions.
-    Saves videos for each agent's ego-perspective.
+    Saves videos for each agent's ego-perspective AND/OR a full map view.
     """
     print("\n=== Rendering First Episode ===")
+    
+    # Get rendering config
+    render_ego = config.get("RENDER_EGO_PERSPECTIVE", True)
+    render_fullmap = config.get("RENDER_FULL_MAP", True)
+    
+    if not render_ego and not render_fullmap:
+        print("Warning: Both RENDER_EGO_PERSPECTIVE and RENDER_FULL_MAP are False. Skipping rendering.")
+        return
+    
+    print(f"Render ego-perspective: {render_ego}")
+    print(f"Render full map: {render_fullmap}")
     
     # Create output directory
     os.makedirs("videos", exist_ok=True)
@@ -621,8 +892,9 @@ def render_first_episode(base_env, config):
     # Initialize hidden states (batch size = num_agents for all agents)
     ac_hstate = ScannedRNN.initialize_carry(num_agents, config["GRU_HIDDEN_DIM"])
     
-    # Storage for frames for each agent
-    frames_per_agent = {i: [] for i in range(num_agents)}
+    # Storage for frames
+    frames_per_agent = {i: [] for i in range(num_agents)} if render_ego else {}
+    frames_full_map = [] if render_fullmap else None
     
     # Track done state
     done = {agent: False for agent in base_env.agents}
@@ -632,32 +904,58 @@ def render_first_episode(base_env, config):
     max_steps = config.get("MAX_EPISODE_STEPS", 1000)
     
     print(f"Running episode for up to {max_steps} steps...")
+    if render_ego and render_fullmap:
+        print(f"Rendering both ego-perspectives AND full map view...")
+    elif render_ego:
+        print(f"Rendering ego-perspectives only...")
+    elif render_fullmap:
+        print(f"Rendering full map view only...")
     
     for step in range(max_steps):
-        # Render current state ONCE per step (not per agent!)
-        pixels = render_craftax_pixels_no_flicker(
-            state, 
-            pixel_size,
-            base_env.static_env_params,
-            player_specific_textures
-        )
+        # Render ego-perspective for each agent (if enabled)
+        if render_ego:
+            pixels = render_craftax_pixels_no_flicker(
+                state, 
+                pixel_size,
+                base_env.static_env_params,
+                player_specific_textures
+            )
+            
+            # pixels is array of shape (num_agents, height, width, 3)
+            # Convert to numpy once
+            pixels_np = np.array(pixels)
+            
+            # Pixels are already in [0, 255] range as float32
+            # Just convert to uint8
+            pixels_np = pixels_np.astype(np.uint8)
+            
+            # Extract frame for each agent
+            for agent_idx in range(num_agents):
+                frame = pixels_np[agent_idx]
+                
+                if step == 0:
+                    print(f"Agent {agent_idx}: Frame shape={frame.shape}, dtype={frame.dtype}")
+                
+                frames_per_agent[agent_idx].append(frame)
         
-        # pixels is array of shape (num_agents, height, width, 3)
-        # Convert to numpy once
-        pixels_np = np.array(pixels)
-        
-        # Pixels are already in [0, 255] range as float32
-        # Just convert to uint8
-        pixels_np = pixels_np.astype(np.uint8)
-        
-        # Extract frame for each agent
-        for agent_idx in range(num_agents):
-            frame = pixels_np[agent_idx]
+        # Render full map view (if enabled)
+        if render_fullmap:
+            full_map_pixels = render_full_map(
+                state,
+                pixel_size,
+                base_env.static_env_params,
+                TEXTURES[pixel_size],
+                player_specific_textures
+            )
+            
+            # Convert to numpy and uint8
+            full_map_np = np.array(full_map_pixels).astype(np.uint8)
             
             if step == 0:
-                print(f"Agent {agent_idx}: Frame shape={frame.shape}, dtype={frame.dtype}")
+                print(f"Full map: Frame shape={full_map_np.shape}, dtype={full_map_np.dtype}")
+                print(f"Current floor: {state.player_level}")
             
-            frames_per_agent[agent_idx].append(frame)
+            frames_full_map.append(full_map_np)
         
         # Get random actions instead of using policy (simpler for POC)
         rng, action_rng = jax.random.split(rng)
@@ -683,21 +981,40 @@ def render_first_episode(base_env, config):
     
     # Save videos
     print("\nSaving videos...")
-    print(f"Frames collected: {[(agent_idx, len(frames)) for agent_idx, frames in frames_per_agent.items()]}")
-    for agent_idx in range(num_agents):
-        if len(frames_per_agent[agent_idx]) > 0:
-            # Try MP4 first, fallback to GIF if ffmpeg not available
+    
+    # Save ego-perspective videos (if enabled)
+    if render_ego:
+        print(f"Ego-perspective frames collected: {[(agent_idx, len(frames)) for agent_idx, frames in frames_per_agent.items()]}")
+        for agent_idx in range(num_agents):
+            if len(frames_per_agent[agent_idx]) > 0:
+                # Try MP4 first, fallback to GIF if ffmpeg not available
+                try:
+                    video_path = f"videos/agent_{agent_idx}_first_episode.mp4"
+                    imageio.mimsave(video_path, frames_per_agent[agent_idx], fps=10, codec='libx264')
+                    print(f"  Saved: {video_path} ({len(frames_per_agent[agent_idx])} frames)")
+                except Exception as e:
+                    print(f"  MP4 failed ({e}), saving as GIF instead...")
+                    video_path = f"videos/agent_{agent_idx}_first_episode.gif"
+                    imageio.mimsave(video_path, frames_per_agent[agent_idx], fps=10, loop=0)
+                    print(f"  Saved: {video_path} ({len(frames_per_agent[agent_idx])} frames)")
+            else:
+                print(f"  Agent {agent_idx}: No frames collected!")
+    
+    # Save full map video (if enabled)
+    if render_fullmap:
+        print(f"Full map frames collected: {len(frames_full_map)}")
+        if len(frames_full_map) > 0:
             try:
-                video_path = f"videos/agent_{agent_idx}_first_episode.mp4"
-                imageio.mimsave(video_path, frames_per_agent[agent_idx], fps=10, codec='libx264')
-                print(f"  Saved: {video_path} ({len(frames_per_agent[agent_idx])} frames)")
+                video_path = "videos/full_map_first_episode.mp4"
+                imageio.mimsave(video_path, frames_full_map, fps=10, codec='libx264')
+                print(f"  Saved: {video_path} ({len(frames_full_map)} frames)")
             except Exception as e:
                 print(f"  MP4 failed ({e}), saving as GIF instead...")
-                video_path = f"videos/agent_{agent_idx}_first_episode.gif"
-                imageio.mimsave(video_path, frames_per_agent[agent_idx], fps=10, loop=0)
-                print(f"  Saved: {video_path} ({len(frames_per_agent[agent_idx])} frames)")
+                video_path = "videos/full_map_first_episode.gif"
+                imageio.mimsave(video_path, frames_full_map, fps=10, loop=0)
+                print(f"  Saved: {video_path} ({len(frames_full_map)} frames)")
         else:
-            print(f"  Agent {agent_idx}: No frames collected!")
+            print(f"  Full map: No frames collected!")
     
     print("=== Rendering Complete ===\n")
 
