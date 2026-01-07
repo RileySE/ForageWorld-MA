@@ -617,7 +617,7 @@ def generate_world(rng, params, static_params):
         player_direction=jnp.full(
             (static_params.player_count,), Action.UP.value, dtype=jnp.int32
         ),
-        player_level=jnp.asarray(2, dtype=jnp.int32),
+        player_level=jnp.asarray(1, dtype=jnp.int32),
         player_health=jnp.full((static_params.player_count,), 9.0, dtype=jnp.float32),
         player_alive=jnp.full((static_params.player_count,), True, dtype=bool),
         player_food=jnp.full((static_params.player_count,), 9, dtype=jnp.int32),
@@ -679,14 +679,14 @@ def generate_world(rng, params, static_params):
         timestep=jnp.asarray(0, dtype=jnp.int32),
     )
 
-    def print_agent_stats(i, spec, sc):
-        jax.debug.print("AGENT {i} INITIALIZED: Spec={s}, Subclass={c}", 
-                        i=i, s=spec, c=sc)
+    # def print_agent_stats(i, spec, sc):
+    #     jax.debug.print("AGENT {i} INITIALIZED: Spec={s}, Subclass={c}", 
+    #                     i=i, s=spec, c=sc)
         
-    jax.vmap(print_agent_stats)(
-        jnp.arange(static_params.player_count), 
-        player_specializations, 
-        player_sc
-    )
+    # jax.vmap(print_agent_stats)(
+    #     jnp.arange(static_params.player_count), 
+    #     player_specializations, 
+    #     player_sc
+    # )
 
     return state
