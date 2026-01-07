@@ -493,10 +493,11 @@ CAN_PLACE_ITEM_MAPPING = jnp.array(
 )
 
 # INTERACTIONS
-class Interaction(Enum):
-    Revive = 0
-    Damage = 1
-    Give = 2
+# class Interaction(Enum):
+#     Subclass_A_Give_to_Subclass_A = 0
+#     Subclass_A_Give_to_Subclass_B = 1
+#     Subclass_B_Give_to_Subclass_A = 2
+#     Subclass_B_Give_to_Subclass_B = 3
 
 # ACHIEVEMENTS
 class Achievement(Enum):
