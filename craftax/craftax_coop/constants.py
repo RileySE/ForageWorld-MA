@@ -492,6 +492,11 @@ CAN_PLACE_ITEM_MAPPING = jnp.array(
     [(block.value in CAN_PLACE_ITEM_BLOCKS) for block in BlockType], dtype=bool
 )
 
+# INTERACTIONS
+class Interaction(Enum):
+    Revive = 0
+    Damage = 1
+    Give = 2
 
 # ACHIEVEMENTS
 class Achievement(Enum):
