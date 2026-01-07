@@ -683,7 +683,7 @@ def generate_world(rng, params, static_params):
         jax.debug.print("AGENT {i} INITIALIZED: Spec={s}, Subclass={c}", 
                         i=i, s=spec, c=sc)
         
-    jax.vmap(_print_agent_stats)(
+    jax.vmap(print_agent_stats)(
         jnp.arange(static_params.player_count), 
         player_specializations, 
         player_sc
