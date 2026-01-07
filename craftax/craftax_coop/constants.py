@@ -179,16 +179,16 @@ def avail_actions_fn(num_agents):
         0,  # 40: LEVEL_UP_STRENGTH ❌
         0,  # 41: LEVEL_UP_INTELLIGENCE ❌
         0,  # 42: ENCHANT_BOW ❌
-        0,  # 43: REQUEST_FOOD ❌
-        0,  # 44: REQUEST_DRINK ❌
-        0,  # 45: REQUEST_WOOD ❌
+        1,  # 43: REQUEST_FOOD ✅
+        1,  # 44: REQUEST_DRINK ✅
+        1,  # 45: REQUEST_WOOD ✅
         0,  # 46: REQUEST_STONE ❌
         0,  # 47: REQUEST_IRON ❌
         0,  # 48: REQUEST_COAL ❌
         0,  # 49: REQUEST_DIAMOND ❌
         0,  # 50: REQUEST_RUBY ❌
         0,  # 51: REQUEST_SAPPHIRE ❌
-        0,  # 52: GIVE ❌
+        1,  # 52: GIVE ✅
     ]
 
     # Add GIVE_TO_PLAYER_X for other agents (all disabled)
