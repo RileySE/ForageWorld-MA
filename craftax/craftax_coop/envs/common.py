@@ -12,11 +12,11 @@ def compute_score(state: EnvState, done: bool, static_params: StaticEnvParams):
 
     return info
     
-def log_interactions(state: EnvState, done: bool, static_params: StaticEnvParams, actor, receiver):
-    info = {}
-    interactions = state.interactions * done * 100.0
-    for interaction in Interaction:
-        name = interaction.name.lower()
-        interaction_name = f"Interactions/{interaction.name.lower()}"
-        info[interaction_name] = interactions[:, interaction.value]      
-    return info
+# def log_interactions(state: EnvState, done: bool, static_params: StaticEnvParams, actor, receiver):
+#     info = {}
+#     interactions = state.interactions * done * 100.0
+#     for interaction in Interaction:
+#         name = interaction.name.lower()
+#         interaction_name = f"Interactions/{interaction.name.lower()}"
+#         info[interaction_name] = interactions[:, interaction.value]      
+#     return info
