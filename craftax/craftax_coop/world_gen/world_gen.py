@@ -668,6 +668,9 @@ def generate_world(rng, params, static_params):
         achievements=jnp.zeros(
             (static_params.player_count, len(Achievement)), dtype=bool
         ),
+        interactions=jnp.zeros(
+            (static_params.player_count, static_params.player_count, len(Interaction)), dtype=jnp.int32
+        ),
         light_level=jnp.asarray(calculate_light_level(0, params), dtype=jnp.float32),
         trade_count=jnp.asarray(0, dtype=jnp.int32),
         food_trade_count=jnp.asarray(0, dtype=jnp.int32),

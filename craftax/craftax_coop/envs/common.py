@@ -1,5 +1,6 @@
 from typing import List
 
+import jax.numpy as jnp
 from craftax_coop.craftax_state import EnvState, StaticEnvParams
 from craftax_coop.constants import *
 
@@ -19,18 +20,20 @@ def compute_score(state: EnvState, done: bool, static_params: StaticEnvParams):
 
 def log_interactions(state: EnvState, done: bool, static_params: StaticEnvParams):
     """
-    Log all interactions between agents including actor and receiver.
-    Interactions are 3D arrays with shape (actor, receiver, interaction_type).
-    Multiplies by done flag but uses multiplier of 1.0.
+    Log aggregated interactions between agents.
+    Sums interactions received by each agent across all interaction types.
+    Returns per-agent interaction counts to match the shape of other metrics.
     """
     interactions = state.interactions * done * 1.0
     info = {}
     
+    # Aggregate interactions per agent: sum over actor and interaction type
+    # Result shape: (player_count,) - total interactions received by each agent
     for interaction in Interaction:
         interaction_name = interaction.name.lower()
-        for actor in range(static_params.player_count):
-            for receiver in range(static_params.player_count):
-                key = f"Interactions/{interaction_name}/actor_{actor}/receiver_{receiver}"
-                info[key] = interactions[actor, receiver, interaction.value]
+        # Sum over all actors for each receiver
+        per_agent = jnp.sum(interactions[:, :, interaction.value], axis=0)
+        key = f"Interactions/{interaction_name}"
+        info[key] = per_agent
     
     return info

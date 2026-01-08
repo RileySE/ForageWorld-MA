@@ -3572,20 +3572,10 @@ def make_request(state, action):
         action,
         state.request_type
     )
-    
-    # Track MADE_REQUEST interactions (self-interaction where actor == receiver)
-    new_interactions = state.interactions.copy()
-    diagonal_indices = jnp.arange(state.interactions.shape[0])
-    new_interactions = new_interactions.at[
-        diagonal_indices,
-        diagonal_indices,
-        Interaction.MADE_REQUEST.value
-    ].add(is_making_request.astype(jnp.int32))
-    
+        
     state = state.replace(
         request_duration=jnp.maximum(state.request_duration, is_making_request * REQUEST_MAX_DURATION),
         request_type=new_request_type,
-        interactions=new_interactions,
     )
     return state
 

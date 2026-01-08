@@ -576,7 +576,6 @@ class Interaction(Enum):
     Damage = 2
 
 
-
 INTERMEDIATE_ACHIEVEMENTS = [
     Achievement.COLLECT_SAPPHIRE.value,
     Achievement.COLLECT_RUBY.value,
