@@ -115,7 +115,7 @@ class EnvState:
     light_level: float
 
     achievements: jnp.ndarray
-    # interactions: jnp.ndarray
+    interactions: jnp.ndarray
 
     state_rng: Any
 

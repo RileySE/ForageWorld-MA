@@ -492,13 +492,6 @@ CAN_PLACE_ITEM_MAPPING = jnp.array(
     [(block.value in CAN_PLACE_ITEM_BLOCKS) for block in BlockType], dtype=bool
 )
 
-# INTERACTIONS
-# class Interaction(Enum):
-#     Subclass_A_Give_to_Subclass_A = 0
-#     Subclass_A_Give_to_Subclass_B = 1
-#     Subclass_B_Give_to_Subclass_A = 2
-#     Subclass_B_Give_to_Subclass_B = 3
-
 # ACHIEVEMENTS
 class Achievement(Enum):
     COLLECT_WOOD = 0
@@ -575,6 +568,13 @@ class Achievement(Enum):
     DRINK_POTION = 63
     ENCHANT_SWORD = 64
     ENCHANT_ARMOUR = 65
+
+
+class Interaction(Enum):
+    Give_item = 0
+    Revive = 1
+    Damage = 2
+
 
 
 INTERMEDIATE_ACHIEVEMENTS = [

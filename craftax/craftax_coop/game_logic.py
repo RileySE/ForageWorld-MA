@@ -48,10 +48,44 @@ def interplayer_interaction(state, block_position, is_doing_action, env_params, 
         1.0,
         state.player_health - damage_taken,
     )
+    
+    # Track interactions in state.interactions (vectorized)
+    new_interactions = state.interactions.copy()
+    
+    # Track Revive
+    # Create 3D arrays to track interactions: [actor, receiver, interaction_type]
+    actor_indices = jnp.arange(static_params.player_count)[:, None]
+    
+    is_reviving = jnp.logical_and(
+        is_interacting_with_same_sc_player[:, None],
+        same_player_interacting_with[:, None] == actor_indices
+    )
+    is_receiver_being_revived = is_player_being_revived[None, :] * is_reviving
+    
+    new_interactions = new_interactions.at[
+        jnp.arange(static_params.player_count)[:, None],
+        jnp.arange(static_params.player_count)[None, :],
+        Interaction.Revive.value
+    ].add(is_receiver_being_revived)
+    
+    # Track Damage
+    is_dealing_ff = jnp.logical_and(
+        is_interacting_with_diff_sc_player[:, None],
+        diff_player_interacting_with[:, None] == actor_indices
+    )
+    
+    new_interactions = new_interactions.at[
+        jnp.arange(static_params.player_count)[:, None],
+        jnp.arange(static_params.player_count)[None, :],
+        Interaction.Damage.value
+    ].add(is_dealing_ff)
+
+    
     state = state.replace(
         player_health=new_player_health,
         revives=state.revives+is_player_being_revived.sum(),
         ff_damage_dealt=state.ff_damage_dealt+damage_taken.sum(),
+        interactions=new_interactions,
     )
     return state
 
@@ -3468,7 +3502,38 @@ def trade_materials(state, action, static_params): # only trade with agents in t
         Action.REQUEST_SAPPHIRE.value, state.inventory.sapphire, 99, new_trade_count
     )
 
-    # Update State
+    # Track interactions for trades
+    new_interactions = state.interactions.copy()
+
+    trade_happened = (
+        (new_food != state.player_food) |
+        (new_drink != state.player_drink) |
+        (new_wood != state.inventory.wood) |
+        (new_stone != state.inventory.stone) |
+        (new_iron != state.inventory.iron) |
+        (new_coal != state.inventory.coal) |
+        (new_diamond != state.inventory.diamond) |
+        (new_ruby != state.inventory.ruby) |
+        (new_sapphire != state.inventory.sapphire)
+    )
+    
+    # For each player, track interactions with their trading partner
+    actor_indices = jnp.arange(static_params.player_count)[:, None]
+    
+    # Create a matrix of trade events: [actor, receiver]
+    is_trading = jnp.logical_and(
+        is_giving[:, None],
+        player_trading_to[:, None] == actor_indices
+    )
+    
+    # Track Give_item
+    new_interactions = new_interactions.at[
+        jnp.arange(static_params.player_count)[:, None],
+        jnp.arange(static_params.player_count)[None, :],
+        Interaction.Give_item.value
+    ].add(is_trading.astype(jnp.int32) * trade_happened[:, None].astype(jnp.int32))
+    
+    
     state = state.replace(
         player_food=new_food,
         player_drink=new_drink,
@@ -3487,6 +3552,7 @@ def trade_materials(state, action, static_params): # only trade with agents in t
         trade_count=new_trade_count,
         food_trade_count=new_food_trade_count,
         drink_trade_count=new_drink_trade_count,
+        interactions=new_interactions,
     )
     return state
 
@@ -3506,9 +3572,20 @@ def make_request(state, action):
         action,
         state.request_type
     )
+    
+    # Track MADE_REQUEST interactions (self-interaction where actor == receiver)
+    new_interactions = state.interactions.copy()
+    diagonal_indices = jnp.arange(state.interactions.shape[0])
+    new_interactions = new_interactions.at[
+        diagonal_indices,
+        diagonal_indices,
+        Interaction.MADE_REQUEST.value
+    ].add(is_making_request.astype(jnp.int32))
+    
     state = state.replace(
         request_duration=jnp.maximum(state.request_duration, is_making_request * REQUEST_MAX_DURATION),
-        request_type=new_request_type
+        request_type=new_request_type,
+        interactions=new_interactions,
     )
     return state
 
