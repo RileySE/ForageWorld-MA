@@ -179,16 +179,16 @@ def avail_actions_fn(num_agents):
         0,  # 40: LEVEL_UP_STRENGTH ❌
         0,  # 41: LEVEL_UP_INTELLIGENCE ❌
         0,  # 42: ENCHANT_BOW ❌
-        0,  # 43: REQUEST_FOOD ❌
-        0,  # 44: REQUEST_DRINK ❌
-        0,  # 45: REQUEST_WOOD ❌
+        1,  # 43: REQUEST_FOOD ✅
+        1,  # 44: REQUEST_DRINK ✅
+        1,  # 45: REQUEST_WOOD ✅
         0,  # 46: REQUEST_STONE ❌
         0,  # 47: REQUEST_IRON ❌
         0,  # 48: REQUEST_COAL ❌
         0,  # 49: REQUEST_DIAMOND ❌
         0,  # 50: REQUEST_RUBY ❌
         0,  # 51: REQUEST_SAPPHIRE ❌
-        0,  # 52: GIVE ❌
+        1,  # 52: GIVE ✅
     ]
 
     # Add GIVE_TO_PLAYER_X for other agents (all disabled)
@@ -213,6 +213,9 @@ class ProjectileType(Enum):
     FIREBALL2 = 6
     ICEBALL2 = 7
 
+class Subclass(Enum): 
+    A = 0
+    B = 1
 
 class Specialization(Enum):
     UNASSIGNED = 0
@@ -227,8 +230,8 @@ FLOOR_MOB_MAPPING = jnp.array(
     [
         # (passive, melee, ranged)
         jnp.array([0, 0, 0]),  # Floor 0 (overworld)
-        jnp.array([2, 2, 2]),  # Floor 1 (dungeon)
-        jnp.array([1, 1, 1]),  # Floor 2 (gnomish mines)
+        jnp.array([2, 2, 2]),  # Floor 1 (gnomish mines)
+        jnp.array([1, 1, 1]),  # Floor 2 (dungeon)
         jnp.array([2, 3, 3]),  # Floor 3 (sewers)
         jnp.array([2, 4, 4]),  # Floor 4 (vaults)
         jnp.array([1, 5, 5]),  # Floor 5 (troll mines)
@@ -489,7 +492,6 @@ CAN_PLACE_ITEM_MAPPING = jnp.array(
     [(block.value in CAN_PLACE_ITEM_BLOCKS) for block in BlockType], dtype=bool
 )
 
-
 # ACHIEVEMENTS
 class Achievement(Enum):
     COLLECT_WOOD = 0
@@ -566,6 +568,12 @@ class Achievement(Enum):
     DRINK_POTION = 63
     ENCHANT_SWORD = 64
     ENCHANT_ARMOUR = 65
+
+
+class Interaction(Enum):
+    Give_item = 0
+    Revive = 1
+    Damage = 2
 
 
 INTERMEDIATE_ACHIEVEMENTS = [

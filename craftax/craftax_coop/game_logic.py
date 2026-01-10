@@ -5,27 +5,41 @@ import jax
 
 def interplayer_interaction(state, block_position, is_doing_action, env_params, static_params):
     # If other player is down revive them, otherwise damage (if friendly fire is enabled)
-    in_other_player = (jnp.expand_dims(state.player_position, axis=1) == jnp.expand_dims(block_position, axis=0)).all(axis=2).T
-    player_interacting_with = jnp.argmax(in_other_player, axis=-1)
+    # Only revive players in the same subclass, damage players in other subclasses   
 
-    is_interacting_with_other_player = jnp.logical_and(
-        in_other_player.any(axis=-1),
+    in_same_sc = (jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)).T
+    in_diff_sc = jnp.logical_not(in_same_sc)
+
+    in_other_player = (jnp.expand_dims(state.player_position, axis=1) == jnp.expand_dims(block_position, axis=0)).all(axis=2).T
+    in_same_sc_player = in_other_player & in_same_sc
+    in_diff_sc_player = in_other_player & in_diff_sc
+    same_player_interacting_with = jnp.argmax(in_same_sc_player, axis=-1)
+    diff_player_interacting_with = jnp.argmax(in_diff_sc_player, axis=-1)
+
+    is_interacting_with_same_sc_player = jnp.logical_and(
+        in_same_sc_player.any(axis=-1),
         is_doing_action,
     )
-    is_player_being_interacted_with = jnp.any(
+    is_interacting_with_diff_sc_player = jnp.logical_and(
+        in_diff_sc_player.any(axis=-1),
+        is_doing_action,
+    )
+    
+    is_player_being_interacted_with_same_sc = jnp.any(
         jnp.logical_and(
-            jnp.arange(static_params.player_count)[:, None] == player_interacting_with,
-            is_interacting_with_other_player[None, :]
+            jnp.arange(static_params.player_count)[:, None] == same_player_interacting_with,
+            is_interacting_with_same_sc_player[None, :]
         ),
         axis=-1
     )
+
     is_player_being_revived = jnp.logical_and(
-        is_player_being_interacted_with,
+        is_player_being_interacted_with_same_sc,
         jnp.logical_not(state.player_alive),
     )
 
-    damage_taken = jnp.zeros(static_params.player_count).at[player_interacting_with].add(
-        is_interacting_with_other_player * get_damage_between_players(state, player_interacting_with)
+    damage_taken = jnp.zeros(static_params.player_count).at[diff_player_interacting_with].add(
+        is_interacting_with_diff_sc_player * get_damage_between_players(state, diff_player_interacting_with)
     )
     damage_taken *= env_params.friendly_fire
 
@@ -34,10 +48,44 @@ def interplayer_interaction(state, block_position, is_doing_action, env_params, 
         1.0,
         state.player_health - damage_taken,
     )
+    
+    # Track interactions in state.interactions (vectorized)
+    new_interactions = state.interactions.copy()
+    
+    # Track Revive
+    # Create 3D arrays to track interactions: [actor, receiver, interaction_type]
+    actor_indices = jnp.arange(static_params.player_count)[:, None]
+    
+    is_reviving = jnp.logical_and(
+        is_interacting_with_same_sc_player[:, None],
+        same_player_interacting_with[:, None] == actor_indices
+    )
+    is_receiver_being_revived = is_player_being_revived[None, :] * is_reviving
+    
+    new_interactions = new_interactions.at[
+        jnp.arange(static_params.player_count)[:, None],
+        jnp.arange(static_params.player_count)[None, :],
+        Interaction.Revive.value
+    ].add(is_receiver_being_revived)
+    
+    # Track Damage
+    is_dealing_ff = jnp.logical_and(
+        is_interacting_with_diff_sc_player[:, None],
+        diff_player_interacting_with[:, None] == actor_indices
+    )
+    
+    new_interactions = new_interactions.at[
+        jnp.arange(static_params.player_count)[:, None],
+        jnp.arange(static_params.player_count)[None, :],
+        Interaction.Damage.value
+    ].add(is_dealing_ff)
+
+    
     state = state.replace(
         player_health=new_player_health,
         revives=state.revives+is_player_being_revived.sum(),
         ff_damage_dealt=state.ff_damage_dealt+damage_taken.sum(),
+        interactions=new_interactions,
     )
     return state
 
@@ -3361,21 +3409,27 @@ def calculate_inventory_achievements(state):
     return state.replace(achievements=achievements)
 
 
-def trade_materials(state, action, static_params):
+def trade_materials(state, action, static_params): # only trade with agents in the same subclass 
     new_achievements = state.achievements
     new_trade_count = state.trade_count
     new_food_trade_count = state.food_trade_count
     new_drink_trade_count = state.drink_trade_count
 
+    in_same_sc = (jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)).T
+
     player_trading_to = action - Action.GIVE.value
     player_trading_to += 1 * (player_trading_to >= jnp.arange(static_params.player_count))
+    
     is_giving = jnp.logical_and(
-        action >= Action.GIVE.value, 
-        action < (Action.GIVE.value + static_params.player_count - 1)
+        jnp.logical_and(
+            action >= Action.GIVE.value, 
+            action < (Action.GIVE.value + static_params.player_count - 1)
+        ),
+        in_same_sc[jnp.arange(static_params.player_count), player_trading_to]
     )
     other_player_is_requesting = jnp.logical_and(
         state.request_duration[player_trading_to] > 0,
-        state.player_alive[player_trading_to]
+        state.player_alive[player_trading_to]        
     )
 
     def _new_material_value(material_type, current_material_stock, material_max_value, old_trade_count):
@@ -3448,7 +3502,38 @@ def trade_materials(state, action, static_params):
         Action.REQUEST_SAPPHIRE.value, state.inventory.sapphire, 99, new_trade_count
     )
 
-    # Update State
+    # Track interactions for trades
+    new_interactions = state.interactions.copy()
+
+    trade_happened = (
+        (new_food != state.player_food) |
+        (new_drink != state.player_drink) |
+        (new_wood != state.inventory.wood) |
+        (new_stone != state.inventory.stone) |
+        (new_iron != state.inventory.iron) |
+        (new_coal != state.inventory.coal) |
+        (new_diamond != state.inventory.diamond) |
+        (new_ruby != state.inventory.ruby) |
+        (new_sapphire != state.inventory.sapphire)
+    )
+    
+    # For each player, track interactions with their trading partner
+    actor_indices = jnp.arange(static_params.player_count)[:, None]
+    
+    # Create a matrix of trade events: [actor, receiver]
+    is_trading = jnp.logical_and(
+        is_giving[:, None],
+        player_trading_to[:, None] == actor_indices
+    )
+    
+    # Track Give_item
+    new_interactions = new_interactions.at[
+        jnp.arange(static_params.player_count)[:, None],
+        jnp.arange(static_params.player_count)[None, :],
+        Interaction.Give_item.value
+    ].add(is_trading.astype(jnp.int32) * trade_happened[:, None].astype(jnp.int32))
+    
+    
     state = state.replace(
         player_food=new_food,
         player_drink=new_drink,
@@ -3467,6 +3552,7 @@ def trade_materials(state, action, static_params):
         trade_count=new_trade_count,
         food_trade_count=new_food_trade_count,
         drink_trade_count=new_drink_trade_count,
+        interactions=new_interactions,
     )
     return state
 
@@ -3486,9 +3572,10 @@ def make_request(state, action):
         action,
         state.request_type
     )
+        
     state = state.replace(
         request_duration=jnp.maximum(state.request_duration, is_making_request * REQUEST_MAX_DURATION),
-        request_type=new_request_type
+        request_type=new_request_type,
     )
     return state
 
@@ -3547,8 +3634,8 @@ def craftax_step(
         actions
     )
 
-    # Change floor
-    state = change_floor(state, actions, params, static_params)
+    # Change floor (disabled for level 2 dungeon-only task)
+    # state = change_floor(state, actions, params, static_params)
 
     # Crafting
     state = do_crafting(state, actions, static_params)

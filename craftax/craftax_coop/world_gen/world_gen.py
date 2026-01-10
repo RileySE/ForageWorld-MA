@@ -506,6 +506,10 @@ def generate_world(rng, params, static_params):
     player_specialization_order = jnp.array([Specialization.WARRIOR.value, Specialization.FORAGER.value, Specialization.MINER.value])
     player_specializations = player_specialization_order[jnp.arange(static_params.player_count) % 3]
 
+    # Fix player subclasses
+    player_sc_order = jnp.array([Subclass.A.value, Subclass.B.value])
+    player_sc = player_sc_order[jnp.arange(static_params.player_count) % 2]
+
     # Generate smoothgens (overworld, caves, elemental levels, boss level)
     rngs = jax.random.split(rng, 7)
     rng, _rng = rngs[0], rngs[1:]
@@ -525,7 +529,7 @@ def generate_world(rng, params, static_params):
     # Splice smoothgens and dungeons in order of levels
     map, item_map, light_map, ladders_down, ladders_up = jax.tree_util.tree_map(
         lambda x, y: jnp.stack(
-            (x[0], y[0], x[1], y[1], y[2], x[2], x[3], x[4], x[5]), axis=0
+            (x[0], x[1], y[0], y[1], y[2], x[2], x[3], x[4], x[5]), axis=0
         ),
         smoothgens,
         dungeons,
@@ -613,7 +617,7 @@ def generate_world(rng, params, static_params):
         player_direction=jnp.full(
             (static_params.player_count,), Action.UP.value, dtype=jnp.int32
         ),
-        player_level=jnp.asarray(0, dtype=jnp.int32),
+        player_level=jnp.asarray(1, dtype=jnp.int32),
         player_health=jnp.full((static_params.player_count,), 9.0, dtype=jnp.float32),
         player_alive=jnp.full((static_params.player_count,), True, dtype=bool),
         player_food=jnp.full((static_params.player_count,), 9, dtype=jnp.int32),
@@ -634,6 +638,7 @@ def generate_world(rng, params, static_params):
         player_strength=jnp.full((static_params.player_count,), 1, dtype=jnp.int32),
         player_intelligence=jnp.full((static_params.player_count,), 1, dtype=jnp.int32),
         player_specialization=player_specializations,
+        player_sc = player_sc,
         request_duration=jnp.full((static_params.player_count,), 0, dtype=jnp.int32),
         request_type=jnp.full((static_params.player_count,), 0, dtype=jnp.int32),
         inventory=inventory,
@@ -663,6 +668,9 @@ def generate_world(rng, params, static_params):
         achievements=jnp.zeros(
             (static_params.player_count, len(Achievement)), dtype=bool
         ),
+        interactions=jnp.zeros(
+            (static_params.player_count, static_params.player_count, len(Interaction)), dtype=jnp.int32
+        ),
         light_level=jnp.asarray(calculate_light_level(0, params), dtype=jnp.float32),
         trade_count=jnp.asarray(0, dtype=jnp.int32),
         food_trade_count=jnp.asarray(0, dtype=jnp.int32),
@@ -673,5 +681,15 @@ def generate_world(rng, params, static_params):
         state_rng=_rng,
         timestep=jnp.asarray(0, dtype=jnp.int32),
     )
+
+    # def print_agent_stats(i, spec, sc):
+    #     jax.debug.print("AGENT {i} INITIALIZED: Spec={s}, Subclass={c}", 
+    #                     i=i, s=spec, c=sc)
+        
+    # jax.vmap(print_agent_stats)(
+    #     jnp.arange(static_params.player_count), 
+    #     player_specializations, 
+    #     player_sc
+    # )
 
     return state
