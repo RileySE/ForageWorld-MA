@@ -1,3 +1,5 @@
-**/__pycache__/
+.venv
+baselines/wandb
+craftax/__pycache__/
+__pycache__/
 *.pyc
-baselines/wandb/

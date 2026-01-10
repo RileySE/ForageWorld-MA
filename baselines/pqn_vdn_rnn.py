@@ -184,7 +184,7 @@ def make_train(config, env):
             hidden_size=config["HIDDEN_SIZE"],
             num_layers=config["NUM_LAYERS"],
             norm_type=config["NORM_TYPE"],
-            norm_input=config.get("NORM_INPUT", False),
+            #norm_input=config.get("NORM_INPUT", False),
             dueling=config.get("DUELING", False),
         )
 
@@ -218,7 +218,7 @@ def make_train(config, env):
             train_state = CustomTrainState.create(
                 apply_fn=network.apply,
                 params=network_variables["params"],
-                batch_stats=network_variables["batch_stats"],
+                batch_stats=network_variables.get("batch_stats", {}),
                 tx=tx,
             )
             return train_state

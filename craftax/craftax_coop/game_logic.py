@@ -3705,9 +3705,24 @@ def craftax_step(
     ).sum(axis=1)
 
     # Gain reward if player gained health
-    health_reward = (state.player_health - init_health) * 0.1
+    vanilla_health_reward = (state.player_health - init_health) * 0.1
 
-    individual_reward = achievement_reward + health_reward
+    #ma foraging rewards
+    alive_reward = jnp.full(static_params.player_count, 0.1)
+    health_reward = jnp.where(state.player_health / get_max_health(state) > 0.5, 0.1, -0.1)
+    food_reward = jnp.where(state.player_food / get_max_food(state) > 0.5, 0.1, -0.1)
+    drink_reward = jnp.where(state.player_drink / get_max_drink(state) > 0.5, 0.1, -0.1)
+    energy_reward = jnp.where(state.player_energy / get_max_energy(state) > 0.5, 0.1, -0.1)
+
+
+    individual_vanilla_reward = achievement_reward + vanilla_health_reward
+    individual_foraging_reward = health_reward + food_reward + drink_reward + energy_reward + alive_reward
+
+    individual_reward = jax.lax.select(
+        params.reward_func == 'foraging',
+        individual_foraging_reward,
+        individual_vanilla_reward
+    )
 
     shared_reward = individual_reward.sum().repeat(static_params.player_count)
 
