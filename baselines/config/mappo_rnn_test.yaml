@@ -14,8 +14,8 @@ FC_DIM_SIZE: 128
 ACTIVATION: "tanh"
 
 # Training parameters
-TOTAL_TIMESTEPS: 1000
-NUM_ENVS: 64
+TOTAL_TIMESTEPS: 1000000000
+NUM_ENVS: 128
 NUM_STEPS: 64
 NUM_MINIBATCHES: 8
 UPDATE_EPOCHS: 4
@@ -34,3 +34,6 @@ REW_SHAPING_HORIZON: 1000000
 # Seed configuration
 NUM_SEEDS: 1
 SEED: 0
+
+# Output configuration
+OUTPUT_DIR: "/n/holylfs06/LABS/krajan_lab/Lab/foraging/Craftax_Coop_24hr_test1_01_08_26"
