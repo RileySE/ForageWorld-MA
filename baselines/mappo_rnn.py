@@ -578,50 +578,6 @@ def single_run(config):
     train_vjit = jax.jit(jax.vmap(make_train(config, env)))
     outs = jax.block_until_ready(train_vjit(rngs))
     
-    # Log final interactions state to wandb if available
-    try:
-        runner_state = outs["runner_state"]
-        env_state = runner_state[1]  # env_state is at index 1 in runner_state
-        
-        if hasattr(env_state, 'interactions'):
-            # Convert interactions array to loggable format
-            # interactions shape: (num_seeds, player_count, player_count, num_interaction_types)
-            interactions_np = np.array(env_state.interactions)
-            
-            # Log summary statistics
-            interactions_summary = {
-                "final_interactions/total": float(interactions_np.sum()),
-                "final_interactions/mean_per_agent": float(interactions_np.sum(axis=(1, 2)).mean()),
-                "final_interactions/max_interaction": float(interactions_np.max()),
-            }
-            wandb.log(interactions_summary)
-            
-            # Log as table for detailed analysis
-            from craftax_coop.constants import Interaction
-            
-            # Average across seeds for reporting
-            interactions_mean = interactions_np.mean(axis=0)  # (player_count, player_count, num_interaction_types)
-            
-            interaction_table_data = []
-            for actor in range(interactions_mean.shape[0]):
-                for receiver in range(interactions_mean.shape[1]):
-                    for itype in Interaction:
-                        count = interactions_mean[actor, receiver, itype.value]
-                        if count > 0:  # Only log non-zero interactions
-                            interaction_table_data.append({
-                                "actor": actor,
-                                "receiver": receiver,
-                                "interaction_type": itype.name,
-                                "count": float(count)
-                            })
-            
-            if interaction_table_data:
-                interactions_table = wandb.Table(dataframe=__import__('pandas').DataFrame(interaction_table_data))
-                wandb.log({"final_interactions/table": interactions_table})
-    except Exception as e:
-        print(f"Could not log interactions to wandb: {e}")
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_file", help="Name of the config YAML file (in baselines/config/)")
