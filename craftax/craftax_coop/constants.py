@@ -568,12 +568,15 @@ class Achievement(Enum):
     DRINK_POTION = 63
     ENCHANT_SWORD = 64
     ENCHANT_ARMOUR = 65
+    GIVE_ITEM = 58
+    Random_1 = 57
+    Random_2 = 59
 
 
-class Interaction(Enum):
-    Give_item = 0
-    Revive = 1
-    Damage = 2
+# class Interaction(Enum):
+#     Give_item = 0
+#     Revive = 1
+#     Damage = 2
 
 
 INTERMEDIATE_ACHIEVEMENTS = [
