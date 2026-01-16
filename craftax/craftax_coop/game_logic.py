@@ -48,39 +48,7 @@ def interplayer_interaction(state, block_position, is_doing_action, env_params, 
         1.0,
         state.player_health - damage_taken,
     )
-    
-    # Track interactions in state.interactions (vectorized)
-    new_interactions = state.interactions.copy()
-    
-    # Track Revive
-    # Create 3D arrays to track interactions: [actor, receiver, interaction_type]
-    actor_indices = jnp.arange(static_params.player_count)[:, None]
-    
-    is_reviving = jnp.logical_and(
-        is_interacting_with_same_sc_player[:, None],
-        same_player_interacting_with[:, None] == actor_indices
-    )
-    is_receiver_being_revived = is_player_being_revived[None, :] * is_reviving
-    
-    new_interactions = new_interactions.at[
-        jnp.arange(static_params.player_count)[:, None],
-        jnp.arange(static_params.player_count)[None, :],
-        Interaction.Revive.value
-    ].add(is_receiver_being_revived)
-    
-    # Track Damage
-    is_dealing_ff = jnp.logical_and(
-        is_interacting_with_diff_sc_player[:, None],
-        diff_player_interacting_with[:, None] == actor_indices
-    )
-    
-    new_interactions = new_interactions.at[
-        jnp.arange(static_params.player_count)[:, None],
-        jnp.arange(static_params.player_count)[None, :],
-        Interaction.Damage.value
-    ].add(is_dealing_ff)
-
-    
+       
     state = state.replace(
         player_health=new_player_health,
         revives=state.revives+is_player_being_revived.sum(),
