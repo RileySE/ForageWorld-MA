@@ -53,7 +53,6 @@ def interplayer_interaction(state, block_position, is_doing_action, env_params, 
         player_health=new_player_health,
         revives=state.revives+is_player_being_revived.sum(),
         ff_damage_dealt=state.ff_damage_dealt+damage_taken.sum(),
-        interactions=new_interactions,
     )
     return state
 
@@ -3469,30 +3468,6 @@ def trade_materials(state, action, static_params): # only trade with agents in t
     new_sapphire, new_trade_count = _new_material_value(
         Action.REQUEST_SAPPHIRE.value, state.inventory.sapphire, 99, new_trade_count
     )
-
-    # Track interactions for trades
-    new_interactions = state.interactions.copy()
-
-    trade_happened = (
-        (new_food != state.player_food) |
-        (new_drink != state.player_drink) |
-        (new_wood != state.inventory.wood) |
-        (new_stone != state.inventory.stone) |
-        (new_iron != state.inventory.iron) |
-        (new_coal != state.inventory.coal) |
-        (new_diamond != state.inventory.diamond) |
-        (new_ruby != state.inventory.ruby) |
-        (new_sapphire != state.inventory.sapphire)
-    )
-    
-    # For each player, track interactions with their trading partner
-    actor_indices = jnp.arange(static_params.player_count)[:, None]
-    
-    # Create a matrix of trade events: [actor, receiver]
-    is_trading = jnp.logical_and(
-        is_giving[:, None],
-        player_trading_to[:, None] == actor_indices
-    )
         
     state = state.replace(
         player_food=new_food,
@@ -3512,7 +3487,6 @@ def trade_materials(state, action, static_params): # only trade with agents in t
         trade_count=new_trade_count,
         food_trade_count=new_food_trade_count,
         drink_trade_count=new_drink_trade_count,
-        interactions=new_interactions,
     )
     return state
 
