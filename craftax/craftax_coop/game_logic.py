@@ -3493,15 +3493,7 @@ def trade_materials(state, action, static_params): # only trade with agents in t
         is_giving[:, None],
         player_trading_to[:, None] == actor_indices
     )
-    
-    # Track Give_item
-    new_interactions = new_interactions.at[
-        jnp.arange(static_params.player_count)[:, None],
-        jnp.arange(static_params.player_count)[None, :],
-        Interaction.Give_item.value
-    ].add(is_trading.astype(jnp.int32) * trade_happened[:, None].astype(jnp.int32))
-    
-    
+        
     state = state.replace(
         player_food=new_food,
         player_drink=new_drink,
