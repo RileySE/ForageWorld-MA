@@ -124,6 +124,9 @@ class EnvState:
     trade_count: int
     food_trade_count: int
     drink_trade_count: int
+    wood_trade_count: int
+    same_trade_count: int
+    diff_trade_count: int
     revives: int
     ff_damage_dealt: float
     

@@ -19,6 +19,9 @@ def compute_score(state: EnvState, done: bool, static_params: StaticEnvParams):
     info["Trade/total_trades"] = jnp.full(static_params.player_count, state.trade_count, dtype=jnp.float32)
     info["Trade/food_trades"] = jnp.full(static_params.player_count, state.food_trade_count, dtype=jnp.float32)
     info["Trade/drink_trades"] = jnp.full(static_params.player_count, state.drink_trade_count, dtype=jnp.float32)
+    info["Trade/wood_trades"] = jnp.full(static_params.player_count, state.wood_trade_count, dtype=jnp.float32)
+    info["Trade/same_subclass_trades"] = jnp.full(static_params.player_count, state.same_trade_count, dtype=jnp.float32)
+    info["Trade/diff_subclass_trades"] = jnp.full(static_params.player_count, state.diff_trade_count, dtype=jnp.float32)
     
     return info
 
