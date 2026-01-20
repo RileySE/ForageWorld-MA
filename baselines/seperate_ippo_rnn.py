@@ -144,9 +144,9 @@ def make_train(config, env):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-    config["MINIBATCH_SIZE"] = (
-        config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
-    )
+    # Note: In separate IPPO, minibatching is done over NUM_ENVS per agent
+    # Each minibatch has shape (num_steps, num_agents, num_envs // NUM_MINIBATCHES, ...)
+    config["MINIBATCH_SIZE"] = config["NUM_ENVS"] // config["NUM_MINIBATCHES"]
 
     env = LogWrapper(env)
 
@@ -231,7 +231,9 @@ def make_train(config, env):
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
         init_hstate = jnp.tile(init_hstate[np.newaxis, :, :], (env.num_agents, 1, 1))
         # Initial done flags as dict (will be converted to array in _env_step)
+        # Must include "__all__" key to match structure returned by env.step
         init_done = {a: jnp.zeros((config["NUM_ENVS"],), dtype=bool) for a in env.agents}
+        init_done["__all__"] = jnp.zeros((config["NUM_ENVS"],), dtype=bool)
 
         # TRAIN LOOP
         def _update_step(update_runner_state, unused):
@@ -397,14 +399,16 @@ def make_train(config, env):
                         value = jnp.transpose(value, (1, 0, 2))
                         
                         # CALCULATE VALUE LOSS
+                        # Shape: (num_steps, num_agents, num_envs_minibatch)
                         value_pred_clipped = train_batch.value + (
                             value - train_batch.value
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
                         value_losses = jnp.square(value - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = 0.5 * jnp.maximum(
-                            value_losses, value_losses_clipped
-                        ).mean()
+                        value_loss_per_elem = 0.5 * jnp.maximum(value_losses, value_losses_clipped)
+                        # Per-agent value loss: mean over time (0) and envs (2), keep agents (1)
+                        value_loss_per_agent = value_loss_per_elem.mean(axis=(0, 2))  # (num_agents,)
+                        value_loss = value_loss_per_agent.mean()  # scalar for gradient
 
                         # CALCULATE ACTOR LOSS
                         logratio = log_prob - train_batch.log_prob
@@ -424,23 +428,35 @@ def make_train(config, env):
                             )
                             * gae
                         )
-                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                        loss_actor = loss_actor.mean()
+                        loss_actor_per_elem = -jnp.minimum(loss_actor1, loss_actor2)
+                        # Per-agent actor loss: mean over time (0) and envs (2), keep agents (1)
+                        loss_actor_per_agent = loss_actor_per_elem.mean(axis=(0, 2))  # (num_agents,)
+                        loss_actor = loss_actor_per_agent.mean()  # scalar for gradient
                         
                         # Entropy: use distrax directly (batch-aware)
                         # pi.entropy() returns (num_agents, num_steps, num_envs_minibatch)
-                        entropy = pi.entropy().mean()
+                        entropy_per_elem = pi.entropy()  # (num_agents, num_steps, num_envs)
+                        entropy_per_agent = entropy_per_elem.mean(axis=(1, 2))  # (num_agents,)
+                        entropy = entropy_per_agent.mean()  # scalar for gradient
 
-                        # debug
-                        approx_kl = ((ratio - 1) - logratio).mean()
-                        clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
+                        # debug - per agent
+                        approx_kl_per_agent = ((ratio - 1) - logratio).mean(axis=(0, 2))  # (num_agents,)
+                        clip_frac_per_agent = (jnp.abs(ratio - 1) > config["CLIP_EPS"]).mean(axis=(0, 2))  # (num_agents,)
+                        approx_kl = approx_kl_per_agent.mean()
+                        clip_frac = clip_frac_per_agent.mean()
 
-                        total_loss = (
-                            loss_actor
-                            + config["VF_COEF"] * value_loss
-                            - config["ENT_COEF"] * entropy
+                        total_loss_per_agent = (
+                            loss_actor_per_agent
+                            + config["VF_COEF"] * value_loss_per_agent
+                            - config["ENT_COEF"] * entropy_per_agent
+                        )  # (num_agents,)
+                        total_loss = total_loss_per_agent.mean()  # scalar for gradient
+                        
+                        # Return both scalar losses (for gradient) and per-agent losses (for logging)
+                        return total_loss, (
+                            value_loss, loss_actor, entropy, ratio, approx_kl, clip_frac,
+                            total_loss_per_agent, value_loss_per_agent, loss_actor_per_agent, entropy_per_agent
                         )
-                        return total_loss, (value_loss, loss_actor, entropy, ratio, approx_kl, clip_frac)
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                     total_loss, grads = grad_fn(
@@ -551,42 +567,42 @@ def make_train(config, env):
             )
             train_state = update_state[0]
             
-            # traj_info is a dict from LogWrapper - use it directly like in original ippo_rnn.py
-            # (Don't spread with {**traj_info, ...} as that can fail with FrozenDict in JIT)
-            metric = traj_info
-
+            # traj_info is a FrozenDict from LogWrapper - create new dict to avoid mutation issues
             # ratio_0: get before mean reduction (like original)
             ratio_0 = loss_info[1][3].at[0, 0].get().mean()
             
-            # Per-agent losses before mean reduction
-            # loss_info shape: (num_epochs, num_minibatches, ...)
-            # After mean over epochs and minibatches, we get per-agent values
-            loss_per_agent = jax.tree.map(lambda x: x.mean(axis=(0, 1)), loss_info)
-            # loss_per_agent[0] is total_loss per agent: (num_agents,)
-            # loss_per_agent[1][0] is value_loss per agent: (num_agents,)
-            # etc.
+            # Per-agent losses are now returned directly from loss_fn
+            # loss_info[1][6:10] are the per-agent values: total, value, actor, entropy
+            # Shape after scan: (num_epochs, num_minibatches, num_agents)
+            # Mean over epochs and minibatches to get (num_agents,)
+            total_loss_per_agent = loss_info[1][6].mean(axis=(0, 1))    # (num_agents,)
+            value_loss_per_agent = loss_info[1][7].mean(axis=(0, 1))    # (num_agents,)
+            actor_loss_per_agent = loss_info[1][8].mean(axis=(0, 1))    # (num_agents,)
+            entropy_per_agent = loss_info[1][9].mean(axis=(0, 1))       # (num_agents,)
             
             # Global mean for backward compatibility
-            loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
+            loss_info_mean = jax.tree.map(lambda x: x.mean(), loss_info)
             
-            # Add keys directly to metric dict (mutation works on LogWrapper's dict)
-            metric["update_steps"] = update_steps
-            metric["loss"] = {
-                "total_loss": loss_info[0],
-                "value_loss": loss_info[1][0],
-                "actor_loss": loss_info[1][1],
-                "entropy": loss_info[1][2],
-                "ratio": loss_info[1][3],
-                "ratio_0": ratio_0,
-                "approx_kl": loss_info[1][4],
-                "clip_frac": loss_info[1][5],
-            }
-            # Per-agent losses for monitoring individual agent training
-            metric["loss_per_agent"] = {
-                "total_loss": loss_per_agent[0],      # (num_agents,)
-                "value_loss": loss_per_agent[1][0],   # (num_agents,)
-                "actor_loss": loss_per_agent[1][1],   # (num_agents,)
-                "entropy": loss_per_agent[1][2],      # (num_agents,)
+            # Create new metric dict (don't mutate FrozenDict from LogWrapper)
+            metric = {
+                **dict(traj_info),  # Convert FrozenDict to regular dict
+                "update_steps": update_steps,
+                "loss": {
+                    "total_loss": loss_info_mean[0],
+                    "value_loss": loss_info_mean[1][0],
+                    "actor_loss": loss_info_mean[1][1],
+                    "entropy": loss_info_mean[1][2],
+                    "ratio": loss_info_mean[1][3],
+                    "ratio_0": ratio_0,
+                    "approx_kl": loss_info_mean[1][4],
+                    "clip_frac": loss_info_mean[1][5],
+                },
+                "loss_per_agent": {
+                    "total_loss": total_loss_per_agent,      # (num_agents,)
+                    "value_loss": value_loss_per_agent,      # (num_agents,)
+                    "actor_loss": actor_loss_per_agent,      # (num_agents,)
+                    "entropy": entropy_per_agent,            # (num_agents,)
+                },
             }
 
             rng = update_state[-1]
@@ -602,13 +618,13 @@ def make_train(config, env):
                     **metrics["loss"],
                 }
                 
-                # Log per-agent losses
+                # Log per-agent losses (use np.asarray().item() for safe conversion)
                 num_agents = metrics["loss_per_agent"]["total_loss"].shape[0]
                 for i in range(num_agents):
-                    to_log[f"agent_{i}/total_loss"] = metrics["loss_per_agent"]["total_loss"][i]
-                    to_log[f"agent_{i}/value_loss"] = metrics["loss_per_agent"]["value_loss"][i]
-                    to_log[f"agent_{i}/actor_loss"] = metrics["loss_per_agent"]["actor_loss"][i]
-                    to_log[f"agent_{i}/entropy"] = metrics["loss_per_agent"]["entropy"][i]
+                    to_log[f"agent_{i}/total_loss"] = np.asarray(metrics["loss_per_agent"]["total_loss"][i]).item()
+                    to_log[f"agent_{i}/value_loss"] = np.asarray(metrics["loss_per_agent"]["value_loss"][i]).item()
+                    to_log[f"agent_{i}/actor_loss"] = np.asarray(metrics["loss_per_agent"]["actor_loss"][i]).item()
+                    to_log[f"agent_{i}/entropy"] = np.asarray(metrics["loss_per_agent"]["entropy"][i]).item()
                 
                 if metrics["returned_episode"].any():
                     to_log.update(jax.tree.map(
