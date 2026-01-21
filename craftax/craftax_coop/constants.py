@@ -230,8 +230,8 @@ FLOOR_MOB_MAPPING = jnp.array(
     [
         # (passive, melee, ranged)
         jnp.array([0, 0, 0]),  # Floor 0 (overworld)
-        jnp.array([2, 2, 2]),  # Floor 1 (gnomish mines)
-        jnp.array([1, 1, 1]),  # Floor 2 (dungeon)
+        jnp.array([1, 1, 1]),  # Floor 1 (gnomish mines)
+        jnp.array([2, 2, 2]),  # Floor 2 (dungeon)
         jnp.array([2, 3, 3]),  # Floor 3 (sewers)
         jnp.array([2, 4, 4]),  # Floor 4 (vaults)
         jnp.array([1, 5, 5]),  # Floor 5 (troll mines)
