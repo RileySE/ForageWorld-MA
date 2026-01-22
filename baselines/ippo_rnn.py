@@ -31,6 +31,8 @@ import wandb
 
 from jaxmarl.wrappers.baselines import LogWrapper
 from craftax.craftax_env import make_craftax_env_from_name
+from craftax.environment_base.wrappers import VideoPlotWrapper
+
 
 # ===========================
 # Model Definitions
@@ -128,6 +130,7 @@ def make_train(config, env):
     )
 
     env = LogWrapper(env)
+    env = VideoPlotWrapper(env, './output/', 256, False)
 
     def linear_schedule(count):
         frac = (
@@ -171,47 +174,61 @@ def make_train(config, env):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
+        def _env_step(runner_state, unused):
+            train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+
+            # SELECT ACTION
+            rng, _rng = jax.random.split(rng)
+            obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
+            ac_in = (
+                obs_batch[np.newaxis, :],
+                last_done[np.newaxis, :],
+            )
+            hstate, pi, value = network.apply(train_state.params, hstate, ac_in)
+            action = pi.sample(seed=_rng)
+            log_prob = pi.log_prob(action)
+            env_act = unbatchify(
+                action, env.agents, config["NUM_ENVS"], env.num_agents
+            )
+            env_act = {k: v.squeeze() for k, v in env_act.items()}
+
+            # STEP ENV
+            rng, _rng = jax.random.split(rng)
+            rng_step = jax.random.split(_rng, config["NUM_ENVS"])
+            obsv, env_state, reward, done, info = jax.vmap(
+                env.step, in_axes=(0, 0, 0)
+            )(rng_step, env_state, env_act)
+            done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
+            transition = Transition(
+                jnp.tile(done["__all__"], env.num_agents),
+                last_done,
+                action.squeeze(),
+                value.squeeze(),
+                batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
+                log_prob.squeeze(),
+                obs_batch,
+                info,
+            )
+
+            # Compute distance to origin for aux loss
+            # starting_pos = env_state.env_state.player_starting_position[env_state.env_state.player_level]
+            # deltas_to_start = env_state.env_state.player_position - starting_pos
+
+            # Add hstate and other non-env metrics to info so they can be logged
+            info['value'] = value
+            info['hidden_state'] = hstate
+            # info['pred_delta'] = aux
+            # info['delta'] = deltas_to_start
+            # TODO is this all the agent distributions rolled into one?
+            info['entropy'] = pi.entropy().squeeze(0)
+            info['log_prob'] = log_prob
+
+            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng)
+            return runner_state, transition
+
         # TRAIN LOOP
         def _update_step(update_runner_state, unused):
             runner_state, update_steps = update_runner_state
-
-            def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, last_done, hstate, rng = runner_state
-
-                # SELECT ACTION
-                rng, _rng = jax.random.split(rng)
-                obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
-                ac_in = (
-                    obs_batch[np.newaxis, :],
-                    last_done[np.newaxis, :],
-                )
-                hstate, pi, value = network.apply(train_state.params, hstate, ac_in)
-                action = pi.sample(seed=_rng)
-                log_prob = pi.log_prob(action)
-                env_act = unbatchify(
-                    action, env.agents, config["NUM_ENVS"], env.num_agents
-                )
-                env_act = {k: v.squeeze() for k, v in env_act.items()}
-
-                # STEP ENV
-                rng, _rng = jax.random.split(rng)
-                rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                obsv, env_state, reward, done, info = jax.vmap(
-                    env.step, in_axes=(0, 0, 0)
-                )(rng_step, env_state, env_act)
-                done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
-                transition = Transition(
-                    jnp.tile(done["__all__"], env.num_agents),
-                    last_done,
-                    action.squeeze(),
-                    value.squeeze(),
-                    batchify(reward, env.agents, config["NUM_ACTORS"]).squeeze(),
-                    log_prob.squeeze(),
-                    obs_batch,
-                    info,
-                )
-                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng)
-                return runner_state, transition
 
             initial_hstate = runner_state[-2]
             runner_state, traj_batch = jax.lax.scan(
@@ -424,6 +441,149 @@ def make_train(config, env):
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             return (runner_state, update_steps), metric
 
+
+        # Do one "step" of logging, writing the result to a file.
+        # Several steps can be run in series using --logging_steps_per_viz to do long rollouts without hitting memory limits
+        def _logging_step(runner_state, unused, logging_threads):
+            # Visualization rollouts
+            runner_state, traj_batch = jax.lax.scan(
+                _env_step, runner_state, None, 1024,
+            )
+
+            # Finally, log data associated with the visualization runs
+            update_step = runner_state[-1]
+            hidden_states = traj_batch.info['hidden_state']
+            # Null this for memory savings
+            traj_batch.info['hidden_state'] = None
+
+            # Add new logging fields here
+            fields_to_log = ['health', 'food', 'drink', 'energy', 'done', 'is_sleeping', 'is_resting',
+                             'player_position_x',
+                             'player_position_y', 'recover', 'hunger', 'thirst', 'fatigue', 'light_level',
+                             #'dist_to_melee_l1',
+                             #'melee_on_screen', 'dist_to_passive_l1', 'passive_on_screen', 'dist_to_ranged_l1',
+                             #'ranged_on_screen', 'num_melee_nearby', 'num_passives_nearby', 'num_ranged_nearby',
+                             #'delta', 'pred_delta',
+                             'num_monsters_killed', 'has_sword', 'has_pick', 'held_iron', 'value',
+                             'entropy', 'log_prob', 'episode_id', 'agent_id']
+
+            # Callback function for logging hidden states
+            def write_rnn_hstate(hstate, scalars, increment=0):
+
+                header_field_names = ['health', 'food', 'drink', 'energy', 'done', 'is_sleeping', 'is_resting',
+                                      'player_position_x',
+                                      'player_position_y', 'recover', 'hunger', 'thirst', 'fatigue', 'light_level',
+                                      #'dist_to_melee_l1',
+                                      #'melee_on_screen', 'dist_to_passive_l1', 'passive_on_screen', 'dist_to_ranged_l1',
+                                      #'ranged_on_screen', 'num_melee_nearby', 'num_passives_nearby',
+                                      #'num_ranged_nearby', 'delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y',
+                                      'num_monsters_killed', 'has_sword',
+                                      'has_pick', 'held_iron', 'value', 'entropy', 'log_prob', 'episode_id', 'agent_id']
+
+                run_out_path = os.path.join('./', wandb.run.id)
+                os.makedirs(run_out_path, exist_ok=True)
+                # Assemble header for the scalar file(s)
+                scalar_file_header = 'action'
+                for key in header_field_names:
+                    scalar_file_header += ',' + key
+
+                # We save to temp files and then append to the target file since numpy apparently cannot write files in append mode for some reason
+                for i in range(logging_threads):
+                    out_filename_hstates = os.path.join(run_out_path, 'hstates_{}_{}.csv'.format(increment, i))
+                    temp_filename = os.path.join(run_out_path, 'temp.csv')
+                    np.savetxt(temp_filename,
+                               hstate[:, i, :], delimiter=',')
+                    temp_file = open(temp_filename, 'r')
+                    out_file_hstates = open(out_filename_hstates, 'a+')
+                    out_file_hstates.write(temp_file.read())
+                    out_file_hstates.close()
+                    temp_file.close()
+                    # Then do the same thing for the scalars
+                    out_filename_scalars = os.path.join(run_out_path, 'scalars_{}_{}.csv'.format(increment, i))
+                    np.savetxt(temp_filename,
+                               scalars[:, i, :], delimiter=',', fmt='%f',
+                               header=scalar_file_header
+                               )
+                    temp_file = open(temp_filename, 'r')
+                    out_file_scalars = open(out_filename_scalars, 'a+')
+                    out_file_scalars.write(temp_file.read())
+                    temp_file.close()
+                    out_file_scalars.close()
+                    print('Writing log file', out_filename_hstates)
+
+            # Add the specified field to the logging array
+            # Also assembles the header for the log file itself
+            # TODO fix, not all fields are dicts, most have an extra dim
+            def add_field_to_log_array(info_dict, log_array, field_key, agent_to_log):
+                breakpoint()
+                field_value = info_dict[field_key][agent_to_log]
+                if len(field_value.shape) < 3:
+                    new_shape = field_value.shape + (1,)
+                    field_value = field_value.reshape(new_shape)
+                else:
+                    field_value = field_value.squeeze()
+                log_array = jnp.concatenate([log_array, field_value], axis=2)
+
+                return log_array
+
+            # Assemble logging variable array
+            for key in traj_batch.info['action'].keys():
+                log_array = traj_batch.info['action'][key].reshape(traj_batch.info['action'][key].shape + (1,))
+                # Yes this is a for loop in the JAX code but this stuff was getting done in serial before anyway and it's cheap operations
+                for field_to_log in fields_to_log:
+                    log_array = add_field_to_log_array(traj_batch.info, log_array, field_to_log, key)
+                # Add agent ID at the end
+                log_array = jnp.concatenate([log_array, key], axis=2)
+
+                jax.debug.callback(write_rnn_hstate, hidden_states, log_array, update_step)
+
+            return runner_state, None
+
+            # Func to interleave update steps and plotting
+
+        def _update_plot(runner_state, unused):
+            # First, update
+            runner_state, metric = jax.lax.scan(
+                _update_step, runner_state, None, 32
+            )
+
+            # Log model weights
+            def save_weights_callback(weights, iter):
+                weights_flat = jax.tree.flatten(weights)
+                run_out_path = os.path.join('./', wandb.run.id)
+                os.makedirs(run_out_path, exist_ok=True)
+                weight_filename = os.path.join(run_out_path, 'weights_{}.csv'.format(iter))
+                weight_file = open(weight_filename, 'w')
+                weights_params = weights['params']
+
+                def save_weight_dict(curr_value, key_string=''):
+                    if type(curr_value) != dict:
+                        np.savetxt(weight_file, np.transpose(curr_value), delimiter=',', fmt='%f', header=key_string)
+                        return True
+                    else:
+                        for key in curr_value.keys():
+                            save_weight_dict(curr_value[key], key_string + '/' + key)
+                    return True
+
+                save_weight_dict(weights_params)
+
+                print('Saving weights in file', weight_filename)
+
+            # TODO make weight saving work
+            #jax.debug.callback(save_weights_callback, runner_state[0].params, runner_state[-1])
+
+            # Can we save the environment state and resume training later?
+            # runner_state_copy = runner_state
+
+            # Then do iterations of logging
+            state, update_steps = runner_state
+            state, empty = jax.lax.scan(
+                functools.partial(_logging_step, logging_threads=1), state, None,
+                1024,
+            )
+
+            return (state, update_steps), metric
+
         rng, _rng = jax.random.split(rng)
         runner_state = (
             train_state,
@@ -434,7 +594,7 @@ def make_train(config, env):
             _rng,
         )
         runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, 0), None, config["NUM_UPDATES"]
+            _update_plot, (runner_state, 0), None, config["NUM_UPDATES"]
         )
         return {"runner_state": runner_state}
 
