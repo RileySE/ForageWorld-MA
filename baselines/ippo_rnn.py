@@ -215,6 +215,8 @@ def make_train(config, env):
             # deltas_to_start = env_state.env_state.player_position - starting_pos
 
             # Add hstate and other non-env metrics to info so they can be logged
+            info['action'] = action.squeeze()
+            info['done'] = done_batch
             info['value'] = value
             info['hidden_state'] = hstate
             # info['pred_delta'] = aux
@@ -444,14 +446,15 @@ def make_train(config, env):
 
         # Do one "step" of logging, writing the result to a file.
         # Several steps can be run in series using --logging_steps_per_viz to do long rollouts without hitting memory limits
-        def _logging_step(runner_state, unused, logging_threads):
+        def _logging_step(runner_state, unused, logging_threads, update_step):
             # Visualization rollouts
+            #update_step = runner_state[-1]
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, 1024,
             )
 
             # Finally, log data associated with the visualization runs
-            update_step = runner_state[-1]
+
             hidden_states = traj_batch.info['hidden_state']
             # Null this for memory savings
             traj_batch.info['hidden_state'] = None
@@ -464,11 +467,13 @@ def make_train(config, env):
                              #'melee_on_screen', 'dist_to_passive_l1', 'passive_on_screen', 'dist_to_ranged_l1',
                              #'ranged_on_screen', 'num_melee_nearby', 'num_passives_nearby', 'num_ranged_nearby',
                              #'delta', 'pred_delta',
-                             'num_monsters_killed', 'has_sword', 'has_pick', 'held_iron', 'value',
-                             'entropy', 'log_prob', 'episode_id', 'agent_id']
+                             'num_monsters_killed',
+                             'has_sword', 'has_pick', 'held_iron', 'value',
+                             'entropy', 'log_prob', #'episode_id',
+                            ]
 
             # Callback function for logging hidden states
-            def write_rnn_hstate(hstate, scalars, increment=0):
+            def write_rnn_hstate(hstate, scalars, increment=0, agent_n=0):
 
                 header_field_names = ['health', 'food', 'drink', 'energy', 'done', 'is_sleeping', 'is_resting',
                                       'player_position_x',
@@ -477,8 +482,10 @@ def make_train(config, env):
                                       #'melee_on_screen', 'dist_to_passive_l1', 'passive_on_screen', 'dist_to_ranged_l1',
                                       #'ranged_on_screen', 'num_melee_nearby', 'num_passives_nearby',
                                       #'num_ranged_nearby', 'delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y',
-                                      'num_monsters_killed', 'has_sword',
-                                      'has_pick', 'held_iron', 'value', 'entropy', 'log_prob', 'episode_id', 'agent_id']
+                                      'num_monsters_killed',
+                                      'has_sword',
+                                      'has_pick', 'held_iron', 'value', 'entropy', 'log_prob', #'episode_id',
+                                        ]
 
                 run_out_path = os.path.join('./', wandb.run.id)
                 os.makedirs(run_out_path, exist_ok=True)
@@ -489,7 +496,7 @@ def make_train(config, env):
 
                 # We save to temp files and then append to the target file since numpy apparently cannot write files in append mode for some reason
                 for i in range(logging_threads):
-                    out_filename_hstates = os.path.join(run_out_path, 'hstates_{}_{}.csv'.format(increment, i))
+                    out_filename_hstates = os.path.join(run_out_path, 'hstates_{}_{}_{}.csv'.format(increment, agent_n, i))
                     temp_filename = os.path.join(run_out_path, 'temp.csv')
                     np.savetxt(temp_filename,
                                hstate[:, i, :], delimiter=',')
@@ -499,7 +506,7 @@ def make_train(config, env):
                     out_file_hstates.close()
                     temp_file.close()
                     # Then do the same thing for the scalars
-                    out_filename_scalars = os.path.join(run_out_path, 'scalars_{}_{}.csv'.format(increment, i))
+                    out_filename_scalars = os.path.join(run_out_path, 'scalars_{}_{}_{}.csv'.format(increment, agent_n, i))
                     np.savetxt(temp_filename,
                                scalars[:, i, :], delimiter=',', fmt='%f',
                                header=scalar_file_header
@@ -515,27 +522,37 @@ def make_train(config, env):
             # Also assembles the header for the log file itself
             # TODO fix, not all fields are dicts, most have an extra dim
             def add_field_to_log_array(info_dict, log_array, field_key, agent_to_log):
-                breakpoint()
-                field_value = info_dict[field_key][agent_to_log]
-                if len(field_value.shape) < 3:
-                    new_shape = field_value.shape + (1,)
-                    field_value = field_value.reshape(new_shape)
-                else:
-                    field_value = field_value.squeeze()
+                field_value = info_dict[field_key]
+                #Select the current agent if this is a per-agent field
+                if len(field_value.shape) == 3:
+                    field_value = field_value[:,:,agent_to_log]
+                new_shape = field_value.shape + (1,)
+                field_value = field_value.reshape(new_shape)
+
                 log_array = jnp.concatenate([log_array, field_value], axis=2)
 
                 return log_array
 
             # Assemble logging variable array
-            for key in traj_batch.info['action'].keys():
-                log_array = traj_batch.info['action'][key].reshape(traj_batch.info['action'][key].shape + (1,))
+            #for agent_n in range(len(traj_batch.info['agents'].keys())):
+            # Assign
+            traj_batch.info['action'] = traj_batch.info['action'].reshape((traj_batch.info['action'].shape[0],) +
+                                                              (config['NUM_ENVS'], env.num_agents))
+            traj_batch.info['done'] = traj_batch.info['done'].reshape((traj_batch.info['done'].shape[0],) +
+                                                              (config['NUM_ENVS'], env.num_agents))
+            traj_batch.info['value'] = traj_batch.info['value'].reshape((traj_batch.info['value'].shape[0],) +
+                                                              (config['NUM_ENVS'], env.num_agents))
+            traj_batch.info['log_prob'] = traj_batch.info['log_prob'].reshape((traj_batch.info['log_prob'].shape[0],) +
+                                                              (config['NUM_ENVS'], env.num_agents))
+            traj_batch.info['entropy'] = traj_batch.info['entropy'].reshape((traj_batch.info['entropy'].shape[0],) +
+                                                              (config['NUM_ENVS'], env.num_agents))
+            for agent_n in range(env.num_agents):
+                log_array = traj_batch.info['action'][:,:,agent_n].reshape(traj_batch.info['action'].shape[:-1] + (1,))
                 # Yes this is a for loop in the JAX code but this stuff was getting done in serial before anyway and it's cheap operations
                 for field_to_log in fields_to_log:
-                    log_array = add_field_to_log_array(traj_batch.info, log_array, field_to_log, key)
-                # Add agent ID at the end
-                log_array = jnp.concatenate([log_array, key], axis=2)
+                    log_array = add_field_to_log_array(traj_batch.info, log_array, field_to_log, agent_n)
 
-                jax.debug.callback(write_rnn_hstate, hidden_states, log_array, update_step)
+                jax.debug.callback(write_rnn_hstate, hidden_states, log_array, update_step, agent_n)
 
             return runner_state, None
 
@@ -578,7 +595,7 @@ def make_train(config, env):
             # Then do iterations of logging
             state, update_steps = runner_state
             state, empty = jax.lax.scan(
-                functools.partial(_logging_step, logging_threads=1), state, None,
+                functools.partial(_logging_step, logging_threads=1, update_step=update_steps), state, None,
                 1024,
             )
 

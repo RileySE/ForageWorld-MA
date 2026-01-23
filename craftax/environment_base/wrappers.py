@@ -286,12 +286,12 @@ class VideoPlotWrapper(GymnaxWrapper):
             self.vis_renderer.add_frame(new_obs, t, done)
 
         # Add fields to be logged
-        info['action'] = action
+        #info['action'] = jnp.concatenate(list(action.values()), axis=0)
         info['health'] = env_state.player_health
         info['food'] = env_state.player_food
         info['drink'] = env_state.player_drink
         info['energy'] = env_state.player_energy
-        info['done'] = done
+        #info['done'] = done
         info['is_sleeping'] = env_state.is_sleeping
         info['is_resting'] = env_state.is_resting
         info['player_position_x'] = env_state.player_position[:,0]
