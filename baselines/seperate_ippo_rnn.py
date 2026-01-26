@@ -627,16 +627,39 @@ def make_train(config, env):
                     to_log[f"agent_{i}/entropy"] = np.asarray(metrics["loss_per_agent"]["entropy"][i]).item()
                 
                 if metrics["returned_episode"].any():
+                    # Log aggregated achievements (mean across all agents) - thicker line with error bars
                     to_log.update(jax.tree.map(
                         lambda x: x[metrics["returned_episode"]].mean(),
                         metrics["user_info"]
                     ))
+                    # Log per-agent achievements
+                    num_agents = metrics["returned_episode"].shape[1]
+                    for agent_idx in range(num_agents):
+                        # Get mask for this agent's returned episodes
+                        agent_mask = metrics["returned_episode"][:, agent_idx, :]
+                        if agent_mask.any():
+                            for key, value in metrics["user_info"].items():
+                                # value shape: (num_steps, num_agents, num_envs)
+                                agent_value = value[:, :, agent_idx]
+                                agent_mean = agent_value[agent_mask].mean()
+                                to_log[f"agent_{agent_idx}/{key}"] = np.asarray(agent_mean).item()
+                    
                     to_log["episode_lengths"] = metrics["returned_episode_lengths"][:, :, 0][
                         metrics["returned_episode"][:, :, 0]
                     ].mean()
                     to_log["episode_returns"] = metrics["returned_episode_returns"][:, :, 0][
                         metrics["returned_episode"][:, :, 0]
                     ].mean()
+                    
+                    # Log per-agent episode returns
+                    for agent_idx in range(num_agents):
+                        agent_mask = metrics["returned_episode"][:, agent_idx, 0]
+                        if agent_mask.any():
+                            agent_returns = metrics["returned_episode_returns"][:, agent_idx, 0][agent_mask].mean()
+                            to_log[f"agent_{agent_idx}/episode_returns"] = np.asarray(agent_returns).item()
+                            agent_lengths = metrics["returned_episode_lengths"][:, agent_idx, 0][agent_mask].mean()
+                            to_log[f"agent_{agent_idx}/episode_lengths"] = np.asarray(agent_lengths).item()
+                            
                 print(to_log)
                 wandb.log(to_log, step=metrics["update_steps"])
 
