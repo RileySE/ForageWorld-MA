@@ -633,15 +633,17 @@ def make_train(config, env):
                         metrics["user_info"]
                     ))
                     # Log per-agent achievements
-                    num_agents = metrics["returned_episode"].shape[1]
+                    # info shape from LogWrapper: (num_steps, num_envs, num_agents)
+                    num_agents = metrics["returned_episode"].shape[2]
                     for agent_idx in range(num_agents):
                         # Get mask for this agent's returned episodes
-                        agent_mask = metrics["returned_episode"][:, agent_idx, :]
+                        agent_mask = metrics["returned_episode"][:, :, agent_idx]  # (num_steps, num_envs)
                         if agent_mask.any():
                             for key, value in metrics["user_info"].items():
-                                # value shape: (num_steps, num_agents, num_envs)
-                                agent_value = value[:, :, agent_idx]
+                                # value shape: (num_steps, num_envs, num_agents)
+                                agent_value = value[:, :, agent_idx]  # (num_steps, num_envs)
                                 agent_mean = agent_value[agent_mask].mean()
+                                # Log as "agent_0/Achievements/collect_wood" - organized by agent
                                 to_log[f"agent_{agent_idx}/{key}"] = np.asarray(agent_mean).item()
                     
                     to_log["episode_lengths"] = metrics["returned_episode_lengths"][:, :, 0][
@@ -653,11 +655,11 @@ def make_train(config, env):
                     
                     # Log per-agent episode returns
                     for agent_idx in range(num_agents):
-                        agent_mask = metrics["returned_episode"][:, agent_idx, 0]
+                        agent_mask = metrics["returned_episode"][:, :, agent_idx]  # (num_steps, num_envs)
                         if agent_mask.any():
-                            agent_returns = metrics["returned_episode_returns"][:, agent_idx, 0][agent_mask].mean()
+                            agent_returns = metrics["returned_episode_returns"][:, :, agent_idx][agent_mask].mean()
                             to_log[f"agent_{agent_idx}/episode_returns"] = np.asarray(agent_returns).item()
-                            agent_lengths = metrics["returned_episode_lengths"][:, agent_idx, 0][agent_mask].mean()
+                            agent_lengths = metrics["returned_episode_lengths"][:, :, agent_idx][agent_mask].mean()
                             to_log[f"agent_{agent_idx}/episode_lengths"] = np.asarray(agent_lengths).item()
                             
                 print(to_log)
