@@ -2,23 +2,23 @@
 WANDB_MODE: "online" # Change to "online" for logging and include appropriate ENTITY and PROJECT arguments
 ENTITY: ""
 PROJECT: ""
-RUN_NAME: "MAPPO - Base"
+RUN_NAME: "IPPO - Test POC"
 
 # Environment configuration
 ENV_NAME: "Craftax-Coop-Symbolic" # Can be changed to "Craftax-Coop-Symbolic", "Craftax-Coop-Pixels", "Craftax-MA-Symbolic", "Craftax-MA-Pixels"
 
 # Model parameters
-ALG_NAME: "mappo-rnn"
-GRU_HIDDEN_DIM: 128
-FC_DIM_SIZE: 64
+ALG_NAME: "ippo-rnn"
+GRU_HIDDEN_DIM: 32
+FC_DIM_SIZE: 16
 ACTIVATION: "tanh"
 
 # Training parameters
-TOTAL_TIMESTEPS: 100000000
-NUM_ENVS: 128
+TOTAL_TIMESTEPS: 100000
+NUM_ENVS: 16
 NUM_STEPS: 32
-NUM_MINIBATCHES: 4
-UPDATE_EPOCHS: 2
+NUM_MINIBATCHES: 8
+UPDATE_EPOCHS: 4
 GAE_LAMBDA: 0.8
 GAMMA: 0.99
 CLIP_EPS: 0.2
@@ -26,10 +26,16 @@ SCALE_CLIP_EPS: false
 ENT_COEF: 0.01
 VF_COEF: 0.5
 ANNEAL_LR: true
-LR: 0.0003
+LR: 0.0002
 MAX_GRAD_NORM: 1.0
 LR_WARMUP: 0.0
 REW_SHAPING_HORIZON: 1000000
+
+# Logging parameters
+LOGGING_UPDATES_INTERVAL: 12  # Number of updates between logging phases
+LOGGING_NUM_CALLS: 2  # Number of logging_step calls per phase
+LOGGING_STEPS_PER_CALL: 1024  # Number of env steps per logging_step call
+LOGGING_THREADS: 1  # Number of env threads to log (must be <= NUM_ENVS) -> set to 1 for less computing time
 
 # Seed configuration
 NUM_SEEDS: 1

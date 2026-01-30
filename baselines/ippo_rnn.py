@@ -450,12 +450,20 @@ def make_train(config, env):
             # Visualization rollouts
             #update_step = runner_state[-1]
             runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, 1024,
+                _env_step, runner_state, None, config["LOGGING_STEPS_PER_CALL"],
             )
 
             # Finally, log data associated with the visualization runs
 
             hidden_states = traj_batch.info['hidden_state']
+            # Reshape from (T, NUM_ACTORS, hidden_dim) to (T, num_agents, NUM_ENVS, hidden_dim)
+            # Agent is the outer dimension because batchify stacks: [agent0, agent1, ...] then flattens
+            hidden_states = hidden_states.reshape(
+                hidden_states.shape[0],   # T
+                env.num_agents,           # num_agents
+                config["NUM_ENVS"],       # NUM_ENVS  
+                config["GRU_HIDDEN_DIM"]  # hidden_dim
+            )
             # Null this for memory savings
             traj_batch.info['hidden_state'] = None
 
@@ -519,13 +527,20 @@ def make_train(config, env):
                     print('Writing log file', out_filename_hstates)
 
             # Add the specified field to the logging array
-            # Also assembles the header for the log file itself
-            # TODO fix, not all fields are dicts, most have an extra dim
+            # Network outputs (value, entropy, log_prob, done) have shape (T, num_agents, NUM_ENVS) - extract [:, agent, :]
+            # Environment fields (health, food, etc.) have shape (T, NUM_ENVS, num_agents) - extract [:, :, agent]
+            network_output_fields = {'value', 'entropy', 'log_prob', 'done'}
+            
             def add_field_to_log_array(info_dict, log_array, field_key, agent_to_log):
                 field_value = info_dict[field_key]
-                #Select the current agent if this is a per-agent field
+                # Select the current agent if this is a per-agent field
                 if len(field_value.shape) == 3:
-                    field_value = field_value[:,:,agent_to_log]
+                    if field_key in network_output_fields:
+                        # Network outputs: shape (T, num_agents, NUM_ENVS)
+                        field_value = field_value[:, agent_to_log, :]
+                    else:
+                        # Environment fields: shape (T, NUM_ENVS, num_agents)
+                        field_value = field_value[:, :, agent_to_log]
                 new_shape = field_value.shape + (1,)
                 field_value = field_value.reshape(new_shape)
 
@@ -534,25 +549,28 @@ def make_train(config, env):
                 return log_array
 
             # Assemble logging variable array
-            #for agent_n in range(len(traj_batch.info['agents'].keys())):
-            # Assign
+            # Network outputs (action, done, value, log_prob, entropy) come from batchify with agent-major ordering:
+            # [A0_E0, A0_E1, ..., A0_En, A1_E0, A1_E1, ...] so reshape must be (num_agents, NUM_ENVS)
             traj_batch.info['action'] = traj_batch.info['action'].reshape((traj_batch.info['action'].shape[0],) +
-                                                              (config['NUM_ENVS'], env.num_agents))
+                                                              (env.num_agents, config['NUM_ENVS']))
             traj_batch.info['done'] = traj_batch.info['done'].reshape((traj_batch.info['done'].shape[0],) +
-                                                              (config['NUM_ENVS'], env.num_agents))
+                                                              (env.num_agents, config['NUM_ENVS']))
             traj_batch.info['value'] = traj_batch.info['value'].reshape((traj_batch.info['value'].shape[0],) +
-                                                              (config['NUM_ENVS'], env.num_agents))
+                                                              (env.num_agents, config['NUM_ENVS']))
             traj_batch.info['log_prob'] = traj_batch.info['log_prob'].reshape((traj_batch.info['log_prob'].shape[0],) +
-                                                              (config['NUM_ENVS'], env.num_agents))
+                                                              (env.num_agents, config['NUM_ENVS']))
             traj_batch.info['entropy'] = traj_batch.info['entropy'].reshape((traj_batch.info['entropy'].shape[0],) +
-                                                              (config['NUM_ENVS'], env.num_agents))
+                                                              (env.num_agents, config['NUM_ENVS']))
             for agent_n in range(env.num_agents):
-                log_array = traj_batch.info['action'][:,:,agent_n].reshape(traj_batch.info['action'].shape[:-1] + (1,))
+                # Network outputs have shape (T, num_agents, NUM_ENVS) - extract agent_n -> (T, NUM_ENVS)
+                log_array = traj_batch.info['action'][:, agent_n, :].reshape((traj_batch.info['action'].shape[0], config['NUM_ENVS'], 1))
                 # Yes this is a for loop in the JAX code but this stuff was getting done in serial before anyway and it's cheap operations
                 for field_to_log in fields_to_log:
                     log_array = add_field_to_log_array(traj_batch.info, log_array, field_to_log, agent_n)
 
-                jax.debug.callback(write_rnn_hstate, hidden_states, log_array, update_step, agent_n)
+                # Extract hidden states only for this agent: (T, NUM_ENVS, hidden_dim)
+                agent_hidden_states = hidden_states[:, agent_n, :, :]
+                jax.debug.callback(write_rnn_hstate, agent_hidden_states, log_array, update_step, agent_n)
 
             return runner_state, None
 
@@ -561,7 +579,7 @@ def make_train(config, env):
         def _update_plot(runner_state, unused):
             # First, update
             runner_state, metric = jax.lax.scan(
-                _update_step, runner_state, None, 32
+                _update_step, runner_state, None, config["LOGGING_UPDATES_INTERVAL"]
             )
 
             # Log model weights
@@ -595,8 +613,8 @@ def make_train(config, env):
             # Then do iterations of logging
             state, update_steps = runner_state
             state, empty = jax.lax.scan(
-                functools.partial(_logging_step, logging_threads=1, update_step=update_steps), state, None,
-                1024,
+                functools.partial(_logging_step, logging_threads=config["LOGGING_THREADS"], update_step=update_steps), state, None,
+                config["LOGGING_NUM_CALLS"],
             )
 
             return (state, update_steps), metric
