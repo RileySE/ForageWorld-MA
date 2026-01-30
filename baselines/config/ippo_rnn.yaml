@@ -31,6 +31,12 @@ MAX_GRAD_NORM: 1.0
 LR_WARMUP: 0.0
 REW_SHAPING_HORIZON: 1000000
 
+# Logging parameters
+LOGGING_UPDATES_INTERVAL: 12  # Number of updates between logging phases
+LOGGING_NUM_CALLS: 2  # Number of logging_step calls per phase
+LOGGING_STEPS_PER_CALL: 1024  # Number of env steps per logging_step call
+LOGGING_THREADS: 1  # Number of env threads to log (must be <= NUM_ENVS) -> set to 1 for less computing time
+
 # Seed configuration
 NUM_SEEDS: 1
 SEED: 0
