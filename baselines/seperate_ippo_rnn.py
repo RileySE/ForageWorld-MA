@@ -35,6 +35,7 @@ import wandb
 
 from jaxmarl.wrappers.baselines import LogWrapper
 from craftax.craftax_env import make_craftax_env_from_name
+from craftax.environment_base.wrappers import VideoPlotWrapper
 
 # ===========================
 # Model Definitions
@@ -149,6 +150,7 @@ def make_train(config, env):
     config["MINIBATCH_SIZE"] = config["NUM_ENVS"] // config["NUM_MINIBATCHES"]
 
     env = LogWrapper(env)
+    env = VideoPlotWrapper(env, './output/', 256, False)
 
     def linear_schedule(count):
         frac = (
@@ -236,71 +238,81 @@ def make_train(config, env):
         init_done["__all__"] = jnp.zeros((config["NUM_ENVS"],), dtype=bool)
 
         # TRAIN LOOP
+        def _env_step(runner_state, unused):
+            train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+
+            # SELECT ACTION
+            rng, _rng = jax.random.split(rng)
+            # obs_batch shape: (num_agents, num_envs, obs_dim)
+            obs_batch = batchify(last_obs, env.agents)
+            # done_batch shape: (num_agents, num_envs)
+            # last_done is a dict from env, convert to array
+            done_batch_in = batchify(last_done, env.agents)
+            
+            # Forward pass for each agent with their own params
+            # ac_in: (1, num_envs, obs_dim), (1, num_envs)
+            # hstate: (num_agents, num_envs, hidden_dim)
+            def forward_single_agent(params, hs, obs, done):
+                ac_in = (obs[np.newaxis, :], done[np.newaxis, :])
+                return network.apply({"params": params}, hs, ac_in)
+            
+            hstate, pi, value = jax.vmap(forward_single_agent)(
+                train_state.params,  # (num_agents, ...)
+                hstate,              # (num_agents, num_envs, hidden_dim)
+                obs_batch,           # (num_agents, num_envs, obs_dim)
+                done_batch_in,       # (num_agents, num_envs)
+            )
+            # pi.logits shape: (num_agents, 1, num_envs, action_dim)
+            # value shape: (num_agents, 1, num_envs)
+            
+            # Sample actions - distrax is batch-aware, sample directly
+            # pi.logits: (num_agents, 1, num_envs, action_dim)
+            action = pi.sample(seed=_rng)  # (num_agents, 1, num_envs)
+            log_prob = pi.log_prob(action)  # (num_agents, 1, num_envs)
+            
+            action = action.squeeze(axis=1)      # (num_agents, num_envs)
+            log_prob = log_prob.squeeze(axis=1)  # (num_agents, num_envs)
+            value = value.squeeze(axis=1)        # (num_agents, num_envs)
+            
+            env_act = unbatchify(action, env.agents)
+            env_act = {k: v.squeeze() for k, v in env_act.items()}
+
+            # STEP ENV
+            rng, _rng = jax.random.split(rng)
+            rng_step = jax.random.split(_rng, config["NUM_ENVS"])
+            obsv, env_state, reward, done, info = jax.vmap(
+                env.step, in_axes=(0, 0, 0)
+            )(rng_step, env_state, env_act)
+            
+            done_batch = batchify(done, env.agents)  # (num_agents, num_envs)
+            reward_batch = batchify(reward, env.agents)  # (num_agents, num_envs)
+            
+            transition = Transition(
+                jnp.tile(done["__all__"][np.newaxis, :], (env.num_agents, 1)),  # (num_agents, num_envs)
+                done_batch_in,   # (num_agents, num_envs)
+                action,          # (num_agents, num_envs)
+                value,           # (num_agents, num_envs)
+                reward_batch,    # (num_agents, num_envs)
+                log_prob,        # (num_agents, num_envs)
+                obs_batch,       # (num_agents, num_envs, obs_dim)
+                info,
+            )
+
+            # Add hstate and other non-env metrics to info so they can be logged
+            info['action'] = action           # (num_agents, num_envs)
+            info['done'] = done_batch         # (num_agents, num_envs)
+            info['value'] = value             # (num_agents, num_envs)
+            info['hidden_state'] = hstate     # (num_agents, num_envs, hidden_dim)
+            # pi.entropy() returns (num_agents, 1, num_envs) - squeeze axis 1
+            info['entropy'] = pi.entropy().squeeze(1)  # (num_agents, num_envs)
+            info['log_prob'] = log_prob       # (num_agents, num_envs)
+
+            # Keep done as dict for next iteration (env returns dict)
+            runner_state = (train_state, env_state, obsv, done, hstate, rng)
+            return runner_state, transition
+
         def _update_step(update_runner_state, unused):
             runner_state, update_steps = update_runner_state
-
-            def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, last_done, hstate, rng = runner_state
-
-                # SELECT ACTION
-                rng, _rng = jax.random.split(rng)
-                # obs_batch shape: (num_agents, num_envs, obs_dim)
-                obs_batch = batchify(last_obs, env.agents)
-                # done_batch shape: (num_agents, num_envs)
-                # last_done is a dict from env, convert to array
-                done_batch_in = batchify(last_done, env.agents)
-                
-                # Forward pass for each agent with their own params
-                # ac_in: (1, num_envs, obs_dim), (1, num_envs)
-                # hstate: (num_agents, num_envs, hidden_dim)
-                def forward_single_agent(params, hs, obs, done):
-                    ac_in = (obs[np.newaxis, :], done[np.newaxis, :])
-                    return network.apply({"params": params}, hs, ac_in)
-                
-                hstate, pi, value = jax.vmap(forward_single_agent)(
-                    train_state.params,  # (num_agents, ...)
-                    hstate,              # (num_agents, num_envs, hidden_dim)
-                    obs_batch,           # (num_agents, num_envs, obs_dim)
-                    done_batch_in,       # (num_agents, num_envs)
-                )
-                # pi.logits shape: (num_agents, 1, num_envs, action_dim)
-                # value shape: (num_agents, 1, num_envs)
-                
-                # Sample actions - distrax is batch-aware, sample directly
-                # pi.logits: (num_agents, 1, num_envs, action_dim)
-                action = pi.sample(seed=_rng)  # (num_agents, 1, num_envs)
-                log_prob = pi.log_prob(action)  # (num_agents, 1, num_envs)
-                
-                action = action.squeeze(axis=1)      # (num_agents, num_envs)
-                log_prob = log_prob.squeeze(axis=1)  # (num_agents, num_envs)
-                value = value.squeeze(axis=1)        # (num_agents, num_envs)
-                
-                env_act = unbatchify(action, env.agents)
-                env_act = {k: v.squeeze() for k, v in env_act.items()}
-
-                # STEP ENV
-                rng, _rng = jax.random.split(rng)
-                rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                obsv, env_state, reward, done, info = jax.vmap(
-                    env.step, in_axes=(0, 0, 0)
-                )(rng_step, env_state, env_act)
-                
-                done_batch = batchify(done, env.agents)  # (num_agents, num_envs)
-                reward_batch = batchify(reward, env.agents)  # (num_agents, num_envs)
-                
-                transition = Transition(
-                    jnp.tile(done["__all__"][np.newaxis, :], (env.num_agents, 1)),  # (num_agents, num_envs)
-                    done_batch_in,   # (num_agents, num_envs)
-                    action,          # (num_agents, num_envs)
-                    value,           # (num_agents, num_envs)
-                    reward_batch,    # (num_agents, num_envs)
-                    log_prob,        # (num_agents, num_envs)
-                    obs_batch,       # (num_agents, num_envs, obs_dim)
-                    info,
-                )
-                # Keep done as dict for next iteration (env returns dict)
-                runner_state = (train_state, env_state, obsv, done, hstate, rng)
-                return runner_state, transition
 
             # Save initial hidden state BEFORE rollout for PPO rerun
             initial_hstate = runner_state[4]  # hstate before rollout
@@ -635,16 +647,96 @@ def make_train(config, env):
                     # Log per-agent achievements
                     # info shape from LogWrapper: (num_steps, num_envs, num_agents)
                     num_agents = metrics["returned_episode"].shape[2]
+                    
+                    # Define team assignments: Team A (even indices), Team B (odd indices)
+                    team_a_agents = list(range(0, num_agents, 2))  # [0, 2, 4, ...]
+                    team_b_agents = list(range(1, num_agents, 2))  # [1, 3, 5, ...]
+                    
+                    # Collect team-level metrics
+                    team_a_returns = []
+                    team_b_returns = []
+                    team_a_lengths = []
+                    team_b_lengths = []
+                    team_a_achievements = {key: [] for key in metrics["user_info"].keys()}
+                    team_b_achievements = {key: [] for key in metrics["user_info"].keys()}
+                    
                     for agent_idx in range(num_agents):
                         # Get mask for this agent's returned episodes
                         agent_mask = metrics["returned_episode"][:, :, agent_idx]  # (num_steps, num_envs)
                         if agent_mask.any():
+                            # Log per-agent achievements
                             for key, value in metrics["user_info"].items():
                                 # value shape: (num_steps, num_envs, num_agents)
                                 agent_value = value[:, :, agent_idx]  # (num_steps, num_envs)
                                 agent_mean = agent_value[agent_mask].mean()
                                 # Log as "agent_0/Achievements/collect_wood" - organized by agent
                                 to_log[f"agent_{agent_idx}/{key}"] = np.asarray(agent_mean).item()
+                                
+                                # Collect for team aggregation
+                                if agent_idx in team_a_agents:
+                                    team_a_achievements[key].append(np.asarray(agent_mean).item())
+                                else:
+                                    team_b_achievements[key].append(np.asarray(agent_mean).item())
+                            
+                            # Log per-agent episode returns and lengths
+                            agent_returns = metrics["returned_episode_returns"][:, :, agent_idx][agent_mask].mean()
+                            to_log[f"agent_{agent_idx}/episode_returns"] = np.asarray(agent_returns).item()
+                            agent_lengths = metrics["returned_episode_lengths"][:, :, agent_idx][agent_mask].mean()
+                            to_log[f"agent_{agent_idx}/episode_lengths"] = np.asarray(agent_lengths).item()
+                            
+                            # Collect for team aggregation
+                            if agent_idx in team_a_agents:
+                                team_a_returns.append(np.asarray(agent_returns).item())
+                                team_a_lengths.append(np.asarray(agent_lengths).item())
+                            else:
+                                team_b_returns.append(np.asarray(agent_returns).item())
+                                team_b_lengths.append(np.asarray(agent_lengths).item())
+                    
+                    # Log team-aggregated metrics (mean over team members)
+                    if team_a_returns:
+                        to_log["team_a/episode_returns"] = np.mean(team_a_returns)
+                        to_log["team_a/episode_lengths"] = np.mean(team_a_lengths)
+                        for key, values in team_a_achievements.items():
+                            if values:
+                                to_log[f"team_a/{key}"] = np.mean(values)
+                    
+                    if team_b_returns:
+                        to_log["team_b/episode_returns"] = np.mean(team_b_returns)
+                        to_log["team_b/episode_lengths"] = np.mean(team_b_lengths)
+                        for key, values in team_b_achievements.items():
+                            if values:
+                                to_log[f"team_b/{key}"] = np.mean(values)
+                    
+                    # Log team-specific trade and combat metrics
+                    # Note: same_subclass_trades tracks trades within teams (Team A with Team A, Team B with Team B)
+                    # Since trades are team-restricted, this is the total valid trades
+                    if "Trade/same_subclass_trades" in metrics["user_info"]:
+                        trade_value = metrics["user_info"]["Trade/same_subclass_trades"]
+                        # trade_value is (num_steps, num_envs, num_agents) - it's broadcast same value for all agents
+                        # Just take mean over returned episodes
+                        if metrics["returned_episode"].any():
+                            trade_mean = trade_value[metrics["returned_episode"]].mean()
+                            to_log["team_trades/total_same_team_trades"] = np.asarray(trade_mean).item()
+                    
+                    # Log diff_subclass_trades (should be 0 since trades are blocked between teams, but log for verification)
+                    if "Trade/diff_subclass_trades" in metrics["user_info"]:
+                        diff_trade_value = metrics["user_info"]["Trade/diff_subclass_trades"]
+                        if metrics["returned_episode"].any():
+                            diff_trade_mean = diff_trade_value[metrics["returned_episode"]].mean()
+                            to_log["team_trades/blocked_cross_team_trades"] = np.asarray(diff_trade_mean).item()
+                    
+                    # Log team kills (kills against the opposite team)
+                    if "Combat/team_a_kills" in metrics["user_info"]:
+                        team_a_kills_value = metrics["user_info"]["Combat/team_a_kills"]
+                        if metrics["returned_episode"].any():
+                            team_a_kills_mean = team_a_kills_value[metrics["returned_episode"]].mean()
+                            to_log["team_combat/team_a_kills"] = np.asarray(team_a_kills_mean).item()
+                    
+                    if "Combat/team_b_kills" in metrics["user_info"]:
+                        team_b_kills_value = metrics["user_info"]["Combat/team_b_kills"]
+                        if metrics["returned_episode"].any():
+                            team_b_kills_mean = team_b_kills_value[metrics["returned_episode"]].mean()
+                            to_log["team_combat/team_b_kills"] = np.asarray(team_b_kills_mean).item()
                     
                     to_log["episode_lengths"] = metrics["returned_episode_lengths"][:, :, 0][
                         metrics["returned_episode"][:, :, 0]
@@ -652,15 +744,6 @@ def make_train(config, env):
                     to_log["episode_returns"] = metrics["returned_episode_returns"][:, :, 0][
                         metrics["returned_episode"][:, :, 0]
                     ].mean()
-                    
-                    # Log per-agent episode returns
-                    for agent_idx in range(num_agents):
-                        agent_mask = metrics["returned_episode"][:, :, agent_idx]  # (num_steps, num_envs)
-                        if agent_mask.any():
-                            agent_returns = metrics["returned_episode_returns"][:, :, agent_idx][agent_mask].mean()
-                            to_log[f"agent_{agent_idx}/episode_returns"] = np.asarray(agent_returns).item()
-                            agent_lengths = metrics["returned_episode_lengths"][:, :, agent_idx][agent_mask].mean()
-                            to_log[f"agent_{agent_idx}/episode_lengths"] = np.asarray(agent_lengths).item()
                             
                 print(to_log)
                 wandb.log(to_log, step=metrics["update_steps"])
@@ -669,6 +752,166 @@ def make_train(config, env):
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             return (runner_state, update_steps), metric
+
+
+        # Do one "step" of logging, writing the result to a file.
+        # Several steps can be run in series using --logging_steps_per_viz to do long rollouts without hitting memory limits
+        def _logging_step(runner_state, unused, logging_threads, update_step):
+            # Visualization rollouts
+            runner_state, traj_batch = jax.lax.scan(
+                _env_step, runner_state, None, config["LOGGING_STEPS_PER_CALL"],
+            )
+
+            # Finally, log data associated with the visualization runs
+
+            hidden_states = traj_batch.info['hidden_state']
+            # In seperate_ippo_rnn, hidden_states already has shape (T, num_agents, NUM_ENVS, hidden_dim)
+            # No reshape needed - it's already in the correct format
+            # Null this for memory savings
+            traj_batch.info['hidden_state'] = None
+
+            # Add new logging fields here
+            fields_to_log = ['health', 'food', 'drink', 'energy', 'done', 'is_sleeping', 'is_resting',
+                             'player_position_x',
+                             'player_position_y', 'recover', 'hunger', 'thirst', 'fatigue', 'light_level',
+                             #'dist_to_melee_l1',
+                             #'melee_on_screen', 'dist_to_passive_l1', 'passive_on_screen', 'dist_to_ranged_l1',
+                             #'ranged_on_screen', 'num_melee_nearby', 'num_passives_nearby', 'num_ranged_nearby',
+                             #'delta', 'pred_delta',
+                             'num_monsters_killed',
+                             'has_sword', 'has_pick', 'held_iron', 'value',
+                             'entropy', 'log_prob', #'episode_id',
+                            ]
+
+            # Callback function for logging hidden states
+            def write_rnn_hstate(hstate, scalars, increment=0, agent_n=0):
+
+                header_field_names = ['health', 'food', 'drink', 'energy', 'done', 'is_sleeping', 'is_resting',
+                                      'player_position_x',
+                                      'player_position_y', 'recover', 'hunger', 'thirst', 'fatigue', 'light_level',
+                                      #'dist_to_melee_l1',
+                                      #'melee_on_screen', 'dist_to_passive_l1', 'passive_on_screen', 'dist_to_ranged_l1',
+                                      #'ranged_on_screen', 'num_melee_nearby', 'num_passives_nearby',
+                                      #'num_ranged_nearby', 'delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y',
+                                      'num_monsters_killed',
+                                      'has_sword',
+                                      'has_pick', 'held_iron', 'value', 'entropy', 'log_prob', #'episode_id',
+                                        ]
+
+                run_out_path = os.path.join('./', wandb.run.id)
+                os.makedirs(run_out_path, exist_ok=True)
+                # Assemble header for the scalar file(s)
+                scalar_file_header = 'action'
+                for key in header_field_names:
+                    scalar_file_header += ',' + key
+
+                # We save to temp files and then append to the target file since numpy apparently cannot write files in append mode for some reason
+                for i in range(logging_threads):
+                    out_filename_hstates = os.path.join(run_out_path, 'hstates_{}_{}_{}.csv'.format(increment, agent_n, i))
+                    temp_filename = os.path.join(run_out_path, 'temp.csv')
+                    np.savetxt(temp_filename,
+                               hstate[:, i, :], delimiter=',')
+                    temp_file = open(temp_filename, 'r')
+                    out_file_hstates = open(out_filename_hstates, 'a+')
+                    out_file_hstates.write(temp_file.read())
+                    out_file_hstates.close()
+                    temp_file.close()
+                    # Then do the same thing for the scalars
+                    out_filename_scalars = os.path.join(run_out_path, 'scalars_{}_{}_{}.csv'.format(increment, agent_n, i))
+                    np.savetxt(temp_filename,
+                               scalars[:, i, :], delimiter=',', fmt='%f',
+                               header=scalar_file_header
+                               )
+                    temp_file = open(temp_filename, 'r')
+                    out_file_scalars = open(out_filename_scalars, 'a+')
+                    out_file_scalars.write(temp_file.read())
+                    temp_file.close()
+                    out_file_scalars.close()
+                    print('Writing log file', out_filename_hstates)
+
+            # Add the specified field to the logging array
+            # In seperate_ippo_rnn:
+            # - Network outputs (action, done, value, entropy, log_prob) have shape (T, num_agents, NUM_ENVS)
+            # - Environment fields (health, food, etc.) have shape (T, NUM_ENVS, num_agents)
+            network_output_fields = {'value', 'entropy', 'log_prob', 'done', 'action'}
+            
+            def add_field_to_log_array(info_dict, log_array, field_key, agent_to_log):
+                field_value = info_dict[field_key]
+                # Select the current agent if this is a per-agent field
+                if len(field_value.shape) == 3:
+                    if field_key in network_output_fields:
+                        # Network outputs: shape (T, num_agents, NUM_ENVS)
+                        field_value = field_value[:, agent_to_log, :]
+                    else:
+                        # Environment fields: shape (T, NUM_ENVS, num_agents)
+                        field_value = field_value[:, :, agent_to_log]
+                new_shape = field_value.shape + (1,)
+                field_value = field_value.reshape(new_shape)
+
+                log_array = jnp.concatenate([log_array, field_value], axis=2)
+
+                return log_array
+
+            # Assemble logging variable array
+            # In seperate_ippo_rnn, network outputs already have shape (T, num_agents, NUM_ENVS)
+            # No reshape needed - shapes are already correct
+            for agent_n in range(env.num_agents):
+                # Network outputs have shape (T, num_agents, NUM_ENVS) - extract agent_n -> (T, NUM_ENVS)
+                log_array = traj_batch.info['action'][:, agent_n, :].reshape((traj_batch.info['action'].shape[0], config['NUM_ENVS'], 1))
+                # Yes this is a for loop in the JAX code but this stuff was getting done in serial before anyway and it's cheap operations
+                for field_to_log in fields_to_log:
+                    log_array = add_field_to_log_array(traj_batch.info, log_array, field_to_log, agent_n)
+
+                # Extract hidden states only for this agent: (T, NUM_ENVS, hidden_dim)
+                agent_hidden_states = hidden_states[:, agent_n, :, :]
+                jax.debug.callback(write_rnn_hstate, agent_hidden_states, log_array, update_step, agent_n)
+
+            return runner_state, None
+
+            # Func to interleave update steps and plotting
+
+        def _update_plot(runner_state, unused):
+            # First, update
+            runner_state, metric = jax.lax.scan(
+                _update_step, runner_state, None, config["LOGGING_UPDATES_INTERVAL"]
+            )
+
+            # Log model weights
+            def save_weights_callback(weights, iter):
+                weights_flat = jax.tree.flatten(weights)
+                run_out_path = os.path.join('./', wandb.run.id)
+                os.makedirs(run_out_path, exist_ok=True)
+                weight_filename = os.path.join(run_out_path, 'weights_{}.csv'.format(iter))
+                weight_file = open(weight_filename, 'w')
+                weights_params = weights['params']
+
+                def save_weight_dict(curr_value, key_string=''):
+                    if type(curr_value) != dict:
+                        np.savetxt(weight_file, np.transpose(curr_value), delimiter=',', fmt='%f', header=key_string)
+                        return True
+                    else:
+                        for key in curr_value.keys():
+                            save_weight_dict(curr_value[key], key_string + '/' + key)
+                    return True
+
+                save_weight_dict(weights_params)
+
+                print('Saving weights in file', weight_filename)
+
+            # TODO make weight saving work
+            #jax.debug.callback(save_weights_callback, runner_state[0].params, runner_state[-1])
+
+            # Can we save the environment state and resume training later?
+            # runner_state_copy = runner_state
+
+            # Then do iterations of logging
+            state, update_steps = runner_state
+            state, empty = jax.lax.scan(
+                functools.partial(_logging_step, logging_threads=config["LOGGING_THREADS"], update_step=update_steps), state, None,
+                config["LOGGING_NUM_CALLS"],
+            )
+
+            return (state, update_steps), metric
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
@@ -680,7 +923,7 @@ def make_train(config, env):
             _rng,
         )
         runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, 0), None, config["NUM_UPDATES"]
+            _update_plot, (runner_state, 0), None, config["NUM_UPDATES"]
         )
         return {"runner_state": runner_state}
 

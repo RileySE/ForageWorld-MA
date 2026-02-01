@@ -677,6 +677,7 @@ def generate_world(rng, params, static_params):
         diff_trade_count=jnp.asarray(0, dtype=jnp.int32),
         revives=jnp.asarray(0, dtype=jnp.int32),
         ff_damage_dealt=jnp.asarray(0.0, dtype=jnp.float32),
+        team_kills=jnp.zeros(2, dtype=jnp.int32),  # [team_a_kills, team_b_kills]
         all_necessities_frac=jnp.ones((static_params.player_count,), dtype=jnp.float32),
         state_rng=_rng,
         timestep=jnp.asarray(0, dtype=jnp.int32),

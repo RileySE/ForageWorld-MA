@@ -129,6 +129,7 @@ class EnvState:
     diff_trade_count: int
     revives: int
     ff_damage_dealt: float
+    team_kills: jnp.ndarray  # (2,) array: [team_a_kills, team_b_kills] - kills against opposite team
     
     # Misc Metrics
     all_necessities_frac: jnp.ndarray
@@ -154,6 +155,7 @@ class EnvParams:
     # Game Mode Parameters
     god_mode: bool = False
     shared_reward: bool = True
+    team_based_sharing: bool = True  # If True, share rewards only within teams; if False, share across all agents
     reward_func: str = 'foraging'  # 'vanilla' or 'foraging'
     friendly_fire: bool = True
 

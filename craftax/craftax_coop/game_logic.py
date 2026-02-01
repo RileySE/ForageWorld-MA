@@ -48,11 +48,24 @@ def interplayer_interaction(state, block_position, is_doing_action, env_params, 
         1.0,
         state.player_health - damage_taken,
     )
+    
+    # Track kills between teams
+    # Players who were alive and now dead due to damage from opposite team
+    was_alive = state.player_health > 0
+    is_now_dead = new_player_health <= 0
+    just_killed = jnp.logical_and(was_alive, is_now_dead)
+    
+    # Count kills per team: team_kills[0] = kills by Team A (subclass 0), team_kills[1] = kills by Team B (subclass 1)
+    # A kill by Team A happens when a Team B player (subclass 1) dies
+    team_a_kills = jnp.logical_and(just_killed, state.player_sc == 1).sum()  # Team B deaths = Team A kills
+    team_b_kills = jnp.logical_and(just_killed, state.player_sc == 0).sum()  # Team A deaths = Team B kills
+    new_team_kills = state.team_kills.at[0].add(team_a_kills).at[1].add(team_b_kills)
        
     state = state.replace(
         player_health=new_player_health,
         revives=state.revives+is_player_being_revived.sum(),
         ff_damage_dealt=state.ff_damage_dealt+damage_taken.sum(),
+        team_kills=new_team_kills,
     )
     return state
 
@@ -2057,6 +2070,19 @@ def update_mobs(rng, state, params, env_params, static_params):
         player_damage_dealt = get_damage(projectile_damage_vector, player_defense_vector) * did_attack_player * env_params.friendly_fire
         new_player_health = state.player_health.at[player_attack_index].add(-player_damage_dealt)
         
+        # Track projectile kills between teams
+        shooter_index = state.player_projectile_owners[state.player_level, projectile_index]
+        shooter_team = state.player_sc[shooter_index]
+        victim_team = state.player_sc[player_attack_index]
+        was_alive_victim = state.player_health[player_attack_index] > 0
+        is_now_dead_victim = new_player_health[player_attack_index] <= 0
+        just_killed_projectile = jnp.logical_and(
+            jnp.logical_and(was_alive_victim, is_now_dead_victim),
+            shooter_team != victim_team  # Only count cross-team kills
+        )
+        # team_kills[0] = Team A kills, team_kills[1] = Team B kills
+        new_team_kills_projectile = state.team_kills.at[shooter_team].add(just_killed_projectile.astype(jnp.int32))
+        
         state, did_attack_mob0, did_kill_mob0 = attack_mob(
             state,
             deal_damage,
@@ -2094,6 +2120,7 @@ def update_mobs(rng, state, params, env_params, static_params):
 
         state = state.replace(
             player_health=new_player_health,
+            team_kills=new_team_kills_projectile,
             player_projectiles=state.player_projectiles.replace(
                 position=state.player_projectiles.position.at[
                     state.player_level, projectile_index
@@ -3692,7 +3719,19 @@ def craftax_step(
         individual_vanilla_reward
     )
 
-    shared_reward = individual_reward.sum().repeat(static_params.player_count)
+    # Share reward only within the same team (subclass)
+    # Team A (subclass 0): agents 0, 2, 4, ...
+    # Team B (subclass 1): agents 1, 3, 5, ...
+    team_mask = jnp.expand_dims(state.player_sc, axis=1) == jnp.expand_dims(state.player_sc, axis=0)
+    team_rewards = jnp.where(
+        team_mask,
+        jnp.expand_dims(individual_reward, axis=0),  # Share this agent's reward with team
+        0.0
+    )
+    shared_reward = team_rewards.sum(axis=1)  # Sum rewards within each agent's team
+    
+    # Old behavior (global sharing across all agents):
+    # shared_reward = individual_reward.sum().repeat(static_params.player_count)
 
     reward = jax.lax.select(
         params.shared_reward,
