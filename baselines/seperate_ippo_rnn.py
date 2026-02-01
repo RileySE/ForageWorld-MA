@@ -725,18 +725,7 @@ def make_train(config, env):
                             diff_trade_mean = diff_trade_value[metrics["returned_episode"]].mean()
                             to_log["team_trades/blocked_cross_team_trades"] = np.asarray(diff_trade_mean).item()
                     
-                    # Log team kills (kills against the opposite team)
-                    if "Combat/team_a_kills" in metrics["user_info"]:
-                        team_a_kills_value = metrics["user_info"]["Combat/team_a_kills"]
-                        if metrics["returned_episode"].any():
-                            team_a_kills_mean = team_a_kills_value[metrics["returned_episode"]].mean()
-                            to_log["team_combat/team_a_kills"] = np.asarray(team_a_kills_mean).item()
-                    
-                    if "Combat/team_b_kills" in metrics["user_info"]:
-                        team_b_kills_value = metrics["user_info"]["Combat/team_b_kills"]
-                        if metrics["returned_episode"].any():
-                            team_b_kills_mean = team_b_kills_value[metrics["returned_episode"]].mean()
-                            to_log["team_combat/team_b_kills"] = np.asarray(team_b_kills_mean).item()
+                    # Note: Combat/team_a_kills and Combat/team_b_kills are already logged via the general user_info loop above
                     
                     to_log["episode_lengths"] = metrics["returned_episode_lengths"][:, :, 0][
                         metrics["returned_episode"][:, :, 0]
