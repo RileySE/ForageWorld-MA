@@ -4,3 +4,4 @@ craftax/__pycache__/
 __pycache__/
 *.pyc
 wandb
+*.mp4
