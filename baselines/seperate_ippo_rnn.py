@@ -96,7 +96,15 @@ class ActorCriticRNN(nn.Module):
         critic = nn.relu(critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(critic)
 
-        return hidden, pi, jnp.squeeze(critic, axis=-1)
+        aux = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
+            embedding
+        )
+        aux = nn.relu(aux)
+        aux = nn.Dense(2, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
+            aux
+        )
+
+        return hidden, pi, jnp.squeeze(critic, axis=-1), aux
 
 # ===========================
 # Data Structures and Utilities
@@ -257,7 +265,7 @@ def make_train(config, env):
                     ac_in = (obs[np.newaxis, :], done[np.newaxis, :])
                     return network.apply({"params": params}, hs, ac_in)
                 
-                hstate, pi, value = jax.vmap(forward_single_agent)(
+                hstate, pi, value, _ = jax.vmap(forward_single_agent)(
                     train_state.params,  # (num_agents, ...)
                     hstate,              # (num_agents, num_envs, hidden_dim)
                     obs_batch,           # (num_agents, num_envs, obs_dim)
@@ -285,8 +293,13 @@ def make_train(config, env):
                     env.step, in_axes=(0, 0, 0)
                 )(rng_step, env_state, env_act)
                 
-                done_batch = batchify(done, env.agents)  # (num_agents, num_envs)
+                done_batch_in = batchify(done, env.agents)  # (num_agents, num_envs)
                 reward_batch = batchify(reward, env.agents)  # (num_agents, num_envs)
+
+                # Compute displacement to origin for aux loss
+                starting_pos = env_state.env_state.player_starting_position[env_state.env_state.player_level]
+                # dists_to_start = jnp.linalg.norm(env_state.player_position - starting_pos, ord=1, axis=-1)
+                deltas_to_start = env_state.env_state.player_position - starting_pos
                 
                 transition = Transition(
                     jnp.tile(done["__all__"][np.newaxis, :], (env.num_agents, 1)),  # (num_agents, num_envs)
@@ -296,6 +309,7 @@ def make_train(config, env):
                     reward_batch,    # (num_agents, num_envs)
                     log_prob,        # (num_agents, num_envs)
                     obs_batch,       # (num_agents, num_envs, obs_dim)
+                    deltas_to_start, # (num_agnets, num_envs, 2)
                     info,
                 )
                 # Keep done as dict for next iteration (env returns dict)
@@ -381,7 +395,7 @@ def make_train(config, env):
                         done_per_agent = jnp.transpose(train_batch.done, (1, 0, 2))   # (num_agents, num_steps, num_envs)
                         action_per_agent = jnp.transpose(train_batch.action, (1, 0, 2))  # (num_agents, num_steps, num_envs)
                         
-                        _, pi, value = jax.vmap(forward_single_agent)(
+                        _, pi, value, aux = jax.vmap(forward_single_agent)(
                             params,          # (num_agents, ...)
                             init_hstate,     # (num_agents, num_envs_minibatch, hidden_dim)
                             obs_per_agent,   # (num_agents, num_steps, num_envs_minibatch, obs_dim)
@@ -439,6 +453,12 @@ def make_train(config, env):
                         entropy_per_agent = entropy_per_elem.mean(axis=(1, 2))  # (num_agents,)
                         entropy = entropy_per_agent.mean()  # scalar for gradient
 
+                        # Calculate auxiliary loss (predict distance to origin)
+                        # Simple L2
+                        aux_loss_per_elem = jnp.square(aux - traj_batch.deltas_to_start)  # Full shape
+                        aux_loss_per_agent = aux_loss_per_elem.mean(axis=(1, 2, 3))  # (num_agents,)
+                        aux_loss = aux_loss_per_agent.mean()  # scalar for gradient
+
                         # debug - per agent
                         approx_kl_per_agent = ((ratio - 1) - logratio).mean(axis=(0, 2))  # (num_agents,)
                         clip_frac_per_agent = (jnp.abs(ratio - 1) > config["CLIP_EPS"]).mean(axis=(0, 2))  # (num_agents,)
@@ -449,13 +469,14 @@ def make_train(config, env):
                             loss_actor_per_agent
                             + config["VF_COEF"] * value_loss_per_agent
                             - config["ENT_COEF"] * entropy_per_agent
+                            + config["AUX_COEF"] * aux_loss
                         )  # (num_agents,)
                         total_loss = total_loss_per_agent.mean()  # scalar for gradient
                         
                         # Return both scalar losses (for gradient) and per-agent losses (for logging)
                         return total_loss, (
                             value_loss, loss_actor, entropy, ratio, approx_kl, clip_frac,
-                            total_loss_per_agent, value_loss_per_agent, loss_actor_per_agent, entropy_per_agent
+                            total_loss_per_agent, value_loss_per_agent, loss_actor_per_agent, entropy_per_agent, aux_loss_per_agent
                         )
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
