@@ -118,6 +118,7 @@ class Transition(NamedTuple):
     reward: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
+    deltas_to_start: jnp.ndarray
     info: jnp.ndarray
 
 class TrainBatch(NamedTuple):
@@ -129,6 +130,7 @@ class TrainBatch(NamedTuple):
     reward: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
+    deltas_to_start: jnp.ndarray
 
 def batchify(x: dict, agent_list):
     """Stack agent observations, preserving agent dimension.
@@ -296,10 +298,10 @@ def make_train(config, env):
                 done_batch_in = batchify(done, env.agents)  # (num_agents, num_envs)
                 reward_batch = batchify(reward, env.agents)  # (num_agents, num_envs)
 
-                # Compute displacement to origin for aux loss
-                starting_pos = env_state.env_state.player_starting_position[env_state.env_state.player_level]
-                # dists_to_start = jnp.linalg.norm(env_state.player_position - starting_pos, ord=1, axis=-1)
-                deltas_to_start = env_state.env_state.player_position - starting_pos
+                # Auxiliary task: predict player position
+                # env_state.player_position shape: (num_envs, num_agents, 2) from vmap over environments
+                # Transpose to (num_agents, num_envs, 2)
+                deltas_to_start = jnp.transpose(env_state.env_state.player_position, (1, 0, 2))
                 
                 transition = Transition(
                     jnp.tile(done["__all__"][np.newaxis, :], (env.num_agents, 1)),  # (num_agents, num_envs)
@@ -331,7 +333,7 @@ def make_train(config, env):
                 ac_in = (obs[np.newaxis, :], done[np.newaxis, :])
                 return network.apply({"params": params}, hs, ac_in)
             
-            _, _, last_val = jax.vmap(forward_single_agent)(
+            _, _, last_val, _ = jax.vmap(forward_single_agent)(
                 train_state.params, hstate, last_obs_batch, last_done_batch
             )
             last_val = last_val.squeeze()  # (num_agents, num_envs)
@@ -371,6 +373,7 @@ def make_train(config, env):
                 reward=traj_batch.reward,
                 log_prob=traj_batch.log_prob,
                 obs=traj_batch.obs,
+                deltas_to_start=traj_batch.deltas_to_start,
             )
             # Keep info separate for logging
             traj_info = traj_batch.info
@@ -411,6 +414,7 @@ def make_train(config, env):
                         # Transpose back to (num_steps, num_agents, num_envs_minibatch)
                         log_prob = jnp.transpose(log_prob, (1, 0, 2))
                         value = jnp.transpose(value, (1, 0, 2))
+                        aux = jnp.transpose(aux, (1, 0, 2, 3))  # (num_steps, num_agents, num_envs_minibatch, 2)
                         
                         # CALCULATE VALUE LOSS
                         # Shape: (num_steps, num_agents, num_envs_minibatch)
@@ -455,8 +459,9 @@ def make_train(config, env):
 
                         # Calculate auxiliary loss (predict distance to origin)
                         # Simple L2
-                        aux_loss_per_elem = jnp.square(aux - traj_batch.deltas_to_start)  # Full shape
-                        aux_loss_per_agent = aux_loss_per_elem.mean(axis=(1, 2, 3))  # (num_agents,)
+                        # aux and train_batch.deltas_to_start both have shape (num_steps, num_agents, num_envs_minibatch, 2)
+                        aux_loss_per_elem = jnp.square(aux - train_batch.deltas_to_start)  # (num_steps, num_agents, num_envs_minibatch, 2)
+                        aux_loss_per_agent = aux_loss_per_elem.mean(axis=(0, 2, 3))  # (num_agents,) - mean over steps, envs, and position dims
                         aux_loss = aux_loss_per_agent.mean()  # scalar for gradient
 
                         # debug - per agent
@@ -475,7 +480,7 @@ def make_train(config, env):
                         
                         # Return both scalar losses (for gradient) and per-agent losses (for logging)
                         return total_loss, (
-                            value_loss, loss_actor, entropy, ratio, approx_kl, clip_frac,
+                            value_loss, loss_actor, entropy, ratio, approx_kl, clip_frac, aux_loss,
                             total_loss_per_agent, value_loss_per_agent, loss_actor_per_agent, entropy_per_agent, aux_loss_per_agent
                         )
 
@@ -519,6 +524,7 @@ def make_train(config, env):
                     reward=shuffle_batch(train_batch.reward),
                     log_prob=shuffle_batch(train_batch.log_prob),
                     obs=shuffle_batch(train_batch.obs),
+                    deltas_to_start=shuffle_batch(train_batch.deltas_to_start),
                 )
                 
                 # Shuffle advantages/targets: (num_steps, num_agents, num_envs) -> axis 2
@@ -555,6 +561,7 @@ def make_train(config, env):
                     reward=minibatch_array(train_batch_shuffled.reward),
                     log_prob=minibatch_array(train_batch_shuffled.log_prob),
                     obs=minibatch_array(train_batch_shuffled.obs),
+                    deltas_to_start=minibatch_array(train_batch_shuffled.deltas_to_start),
                 )
                 
                 advantages_mb = minibatch_array(advantages_shuffled)
@@ -593,13 +600,14 @@ def make_train(config, env):
             ratio_0 = loss_info[1][3].at[0, 0].get().mean()
             
             # Per-agent losses are now returned directly from loss_fn
-            # loss_info[1][6:10] are the per-agent values: total, value, actor, entropy
+            # loss_info[1][7:12] are the per-agent values: total, value, actor, entropy, aux
             # Shape after scan: (num_epochs, num_minibatches, num_agents)
             # Mean over epochs and minibatches to get (num_agents,)
-            total_loss_per_agent = loss_info[1][6].mean(axis=(0, 1))    # (num_agents,)
-            value_loss_per_agent = loss_info[1][7].mean(axis=(0, 1))    # (num_agents,)
-            actor_loss_per_agent = loss_info[1][8].mean(axis=(0, 1))    # (num_agents,)
-            entropy_per_agent = loss_info[1][9].mean(axis=(0, 1))       # (num_agents,)
+            total_loss_per_agent = loss_info[1][7].mean(axis=(0, 1))    # (num_agents,)
+            value_loss_per_agent = loss_info[1][8].mean(axis=(0, 1))    # (num_agents,)
+            actor_loss_per_agent = loss_info[1][9].mean(axis=(0, 1))    # (num_agents,)
+            entropy_per_agent = loss_info[1][10].mean(axis=(0, 1))       # (num_agents,)
+            aux_loss_per_agent = loss_info[1][11].mean(axis=(0, 1))     # (num_agents,)
             
             # Global mean for backward compatibility
             loss_info_mean = jax.tree.map(lambda x: x.mean(), loss_info)
@@ -617,12 +625,14 @@ def make_train(config, env):
                     "ratio_0": ratio_0,
                     "approx_kl": loss_info_mean[1][4],
                     "clip_frac": loss_info_mean[1][5],
+                    "aux_loss": loss_info_mean[1][6],
                 },
                 "loss_per_agent": {
                     "total_loss": total_loss_per_agent,      # (num_agents,)
                     "value_loss": value_loss_per_agent,      # (num_agents,)
                     "actor_loss": actor_loss_per_agent,      # (num_agents,)
                     "entropy": entropy_per_agent,            # (num_agents,)
+                    "aux_loss": aux_loss_per_agent,          # (num_agents,)
                 },
             }
 
@@ -646,6 +656,7 @@ def make_train(config, env):
                     to_log[f"agent_{i}/value_loss"] = np.asarray(metrics["loss_per_agent"]["value_loss"][i]).item()
                     to_log[f"agent_{i}/actor_loss"] = np.asarray(metrics["loss_per_agent"]["actor_loss"][i]).item()
                     to_log[f"agent_{i}/entropy"] = np.asarray(metrics["loss_per_agent"]["entropy"][i]).item()
+                    to_log[f"agent_{i}/aux_loss"] = np.asarray(metrics["loss_per_agent"]["aux_loss"][i]).item()
                 
                 if metrics["returned_episode"].any():
                     # Log aggregated achievements (mean across all agents) - thicker line with error bars
