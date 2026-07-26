@@ -2357,7 +2357,11 @@ def update_mobs(rng, state, params, env_params, static_params):
 def update_player_intrinsics(state, action, static_params):
     # Start sleeping?
     is_starting_sleep = jnp.logical_and(
-        action == Action.SLEEP.value, state.player_energy < get_max_energy(state)
+        action == Action.SLEEP.value,
+        jnp.logical_and(
+            state.player_energy < get_max_energy(state),
+            state.player_energy <= 5, # can't take sleep action when energy is greater than five
+        ),
     )
     new_is_sleeping = jnp.logical_or(state.is_sleeping, is_starting_sleep)
     state = state.replace(
