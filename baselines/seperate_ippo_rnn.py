@@ -298,12 +298,14 @@ def make_train(config, env):
         _self_team_idx_arr = np.arange(_n) % _agents_per_team  # (N,)
         _eye_team_4d = (np.arange(_agents_per_team)[None, :] == _self_team_idx_arr[:, None])[None, :, :, None]  # (1, N, apt, 1)
 
+    _lr_anneal_updates = config.get("LR_ANNEAL_UPDATES", config["NUM_UPDATES"])
     def linear_schedule(count):
         frac = (
             1.0
             - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"]))
-            / config["NUM_UPDATES"]
+            / _lr_anneal_updates
         )
+        frac = jnp.maximum(frac, 0.0)
         return config["LR"] * frac
 
     # Per-agent gradient clipping to avoid coupling agents through global norm
@@ -1178,6 +1180,7 @@ def make_train(config, env):
                             if v is not None:
                                 to_log[f"{tp}/{short_name}"] = v
 
+                to_log["overview/lr"] = config["LR"] * max(0.0, 1.0 - metrics["update_steps"] / _lr_anneal_updates)
                 wandb.log(to_log, step=metrics["update_steps"])
 
             jax.experimental.io_callback(callback, None, metric, update_steps, ordered=True)
