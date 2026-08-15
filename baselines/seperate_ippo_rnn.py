@@ -574,7 +574,25 @@ def make_train(config, env):
         _default_max_timesteps = env.default_params.max_timesteps
         _post_early_cap = _general_episode_cap if _general_episode_cap > 0 else _default_max_timesteps
 
+        # Progressive multi-phase cap schedule
+        # Format: list of [start_update, cap]
+        # pairs, sorted, first entry must start at 0.
+        _cap_schedule = config.get("EPISODE_CAP_SCHEDULE", None)
+        if _cap_schedule is not None:
+            assert len(_cap_schedule) > 0, "EPISODE_CAP_SCHEDULE is empty"
+            _starts = [int(s) for s, c in _cap_schedule]
+            _caps = [float(c) for s, c in _cap_schedule]
+            assert _starts[0] == 0, "EPISODE_CAP_SCHEDULE must start at step 0"
+            assert _starts == sorted(_starts), "EPISODE_CAP_SCHEDULE must be sorted by start step"
+            _cap_starts_arr = jnp.asarray(_starts, dtype=jnp.int32)
+            _cap_values_arr = jnp.asarray(_caps, dtype=jnp.float32)
+            _n_cap_phases = len(_cap_schedule)
+
         def _get_effective_episode_cap(update_steps):
+            if _cap_schedule is not None:
+                idx = jnp.sum(update_steps >= _cap_starts_arr) - 1
+                idx = jnp.clip(idx, 0, _n_cap_phases - 1)
+                return _cap_values_arr[idx]
             if _early_episode_cap > 0 and _early_episode_cap_until > 0:
                 return jax.lax.select(
                     update_steps < _early_episode_cap_until,
