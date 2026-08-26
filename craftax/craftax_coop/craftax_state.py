@@ -216,6 +216,7 @@ class EnvParams:
     enable_auto_respawning: bool = False  # If True, auto-revive dead agents after auto_respawn_steps.
     auto_respawn_steps: int = 50  # Dead-step threshold for auto-respawn when enabled.
     restrict_auto_respawning_to_spawn_room: bool = True  # If True, auto-respawn only triggers when the dead agent is inside its own starter room.
+    auto_respawn_team_penalty: float = 0.0 #team reward penalty applied once per auto-respawn event
 
 
     # Team Spawning Parameters

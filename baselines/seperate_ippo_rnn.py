@@ -1658,6 +1658,7 @@ def build_env(config):
     enable_warrior_to_warrior_trading = config.get("ENABLE_WARRIOR_TO_WARRIOR_TRADING", False)
     auto_respawn_steps = int(config.get("AUTO_RESPAWN_STEPS", 50))
     restrict_auto_respawning_to_spawn_room = config.get("RESTRICT_AUTO_RESPAWNING_TO_SPAWN_ROOM", True)
+    auto_respawn_team_penalty = config.get("AUTO_RESPAWN_TEAM_PENALTY", 0.0)
     initial_predators_spawn_in_warrior_rooms_only = config.get("INITIAL_PREDATORS_SPAWN_IN_WARRIOR_ROOMS_ONLY", False)
     non_forager_always_in_lone_room = config.get("NON_FORAGER_ALWAYS_IN_LONE_ROOM", False)
     spread_non_foragers_across_rooms = config.get("SPREAD_NON_FORAGERS_ACROSS_ROOMS", False)
@@ -1726,6 +1727,7 @@ def build_env(config):
         "trade_reward_requires_both_outside_starter_room": trade_reward_requires_both_outside_starter_room,
         "enable_auto_respawning": enable_auto_respawning,
         "auto_respawn_steps": auto_respawn_steps,
+        "auto_respawn_team_penalty": auto_respawn_team_penalty,
         "melee_mobs_despawn_when_far": melee_mobs_despawn_when_far,
         "melee_mob_despawn_distance": melee_mob_despawn_distance,
         "passive_mobs_static": passive_mobs_static,
