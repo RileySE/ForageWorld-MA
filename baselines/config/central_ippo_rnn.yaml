@@ -1,16 +1,21 @@
+# Config for baselines/central_ippo_rnn.py — FULLY CENTRALIZED PPO.
+# One policy + one critic over the concatenated (global) observation, emitting
+# the concatenated (joint) action.  Mirrors seperate_ippo_rnn.yaml so the two
+# runners can be compared directly; keys that only make sense for decentralized
+# agents (USE_TEAMMATE_AUXILIARY_LOSS / AUX_TEAMMATE_WEIGHT) are omitted.
+
 # Weights & Biases configuration
 WANDB_MODE: "online" # Change to "online" for logging and include appropriate ENTITY and PROJECT arguments
 ENTITY: ""
 PROJECT: ""
-RUN_NAME: "RUN-Seperate-IPPO-RNN-Experiment3-ForagerPredDmg0p25-FoodCap12-WarriorStartPredator"  # Optional run name. Run files go to <OUTPUT_DIR or .>/<RUN_NAME>/<timestamp>_<wandb_run_id>/
-DESCRIPTION: "Experiment 3: foragers deal 0.25x damage to predator mobs, forager max food is capped at 12, and t=0 preset melee predators spawn only in the actual warrior starting room."
+RUN_NAME: "RUN-Central-IPPO-RNN"  # Optional run name. Run files go to <OUTPUT_DIR or .>/<RUN_NAME>/<timestamp>_<wandb_run_id>/
 OUTPUT_DIR: ""  # Optional artifact root. Run files go to <OUTPUT_DIR or .>/<RUN_NAME>/<timestamp>_<wandb_run_id>/
 
 # Environment configuration
 
 ENV_NAME: "Craftax-Coop-Symbolic" # Can be changed to "Craftax-Coop-Symbolic", "Craftax-Coop-Pixels", "Craftax-MA-Symbolic", "Craftax-MA-Pixels"
-MAX_PASSIVE_MOBS: 131  # Maximum number of passive mobs allocated/spawnable
-MAX_MELEE_MOBS: 20  # 50% of the default melee predator cap
+MAX_PASSIVE_MOBS: 105  # Maximum number of passive mobs allocated/spawnable
+MAX_MELEE_MOBS: 40  # Maximum number of melee predator mobs allocated/spawnable
 MAX_RANGED_MOBS: 0  # Maximum number of ranged predator mobs allocated/spawnable
 
 DISABLE_REVIVE: false
@@ -18,6 +23,7 @@ REVIVING_COOLDOWN_STEPS: 50
 ACTION_MASK_WHILE_DEAD: true
 
 SHARED_REWARD: true
+ENABLE_WARRIOR_TO_WARRIOR_TRADING: false #Set to true to allow warriors to trade with each other
 
 TEAMMATE_ALIVE_BONUS: 0.05
 ALL_TEAM_ALIVE_BONUS: 0.2
@@ -25,18 +31,20 @@ DEAD_SELF_PENALTY_WEIGHT: 0.2 #individual penalty - does not affect shared rewar
 ONE_TIME_DEATH_PENALTY_SHARED: 0.0
 ONE_TIME_DEATH_PENALTY_INDIVIDUAL: 0.0
 WARRIOR_MELEE_KILL_REWARD: 7.5
-FORAGER_MELEE_KILL_REWARD: 0.0  # Bonus given to foragers per credited melee predator kill
-WARRIOR_PASSIVE_FOOD_GAIN: 2  # Food gained by a warrior when eating a killed passive mob
-FORAGER_PASSIVE_FOOD_GAIN: 2  # Food gained by a forager when eating a killed passive mob
-FORAGER_FOOD_CAPACITY: 12  # Maximum food capacity for foragers
-FORAGER_PREDATOR_DAMAGE_MULTIPLIER: 0.25  # Forager damage multiplier against melee/ranged predator mobs
+WARRIOR_PASSIVE_FOOD_GAIN: 1  # Food gained by a warrior when eating a killed passive mob
+FORAGER_PASSIVE_FOOD_GAIN: 3  # Food gained by a forager when eating a killed passive mob
+FORAGER_FOOD_CAPACITY: 27  # Maximum food capacity for foragers
 FORAGER_TO_WARRIOR_FOOD_TRADE_REWARD: 1.0
 FORAGER_TO_WARRIOR_DRINK_TRADE_REWARD: 1.0
+WARRIOR_TO_WARRIOR_FOOD_TRADE_REWARD: 1.0
+WARRIOR_TO_WARRIOR_DRINK_TRADE_REWARD: 1.0
+
+SPREAD_NON_FORAGERS_ACROSS_ROOMS: false  # If true, warriors/miners on a team spawn in distinct rooms (lone room first, then rooms A/B, wrapping after 3)
+PASSIVE_MOBS_STATIC: false  # snails do not move if true. boosts sps
 
 ENABLE_AUTO_RESPAWNING: false
 AUTO_RESPAWN_STEPS: 50
 RESTRICT_AUTO_RESPAWNING_TO_SPAWN_ROOM: true
-INITIAL_PREDATORS_SPAWN_IN_WARRIOR_ROOMS_ONLY: true  # Restrict t=0 preset melee predator to the warrior's assigned start room
 
 TRADE_RADIUS: 15
 TRADE_RADIUS_SHAPE: "circle"  # "square" or "circle"
@@ -51,8 +59,15 @@ NUM_TEAMS: 1
 TEAM_COMPOSITION: [1, 1, 2]  # [FORAGER, FORAGER, WARRIOR] # Specialization values: FORAGER=1, WARRIOR=2, MINER=3
 USE_REDUCED_ACTION_SPACE: true  # If true, use actions 0-24 plus team-local GIVE target actions
 
+# Centralization
+# How the per-agent rewards are collapsed into the single scalar the critic
+# predicts. "mean" keeps the reward scale identical to seperate_ippo_rnn (and is
+# exactly the shared reward when SHARED_REWARD: true); "sum" makes the return
+# scale with the number of agents.
+CENTRAL_REWARD_AGGREGATION: "mean"  # "mean" or "sum"
+
 # Model parameters
-ALG_NAME: "ippo-rnn"
+ALG_NAME: "central-ippo-rnn"
 GRU_HIDDEN_DIM: 512
 FC_DIM_SIZE: 128
 ACTIVATION: "tanh"
@@ -62,12 +77,10 @@ ACTIVATION: "tanh"
 POLICY_ARCH: "gru"
 
 # Transformer policy hyperparameters (used only when POLICY_ARCH: "transformer").
-# These are PER AGENT, and parameter-matched to the per-agent GRU core: with
-# FC_DIM_SIZE=128 / GRU_HIDDEN_DIM=512 the GRU core is 985,088 params and these
-# defaults give 1,016,768 (1.032x).
-TF_MAX_HISTORY: 16        # attention window, in env steps. Each agent's carry
-                          #   holds this many of its own past token embeddings;
-                          #   older steps are dropped.
+# Parameter-matched to the GRU core: with FC_DIM_SIZE=128 / GRU_HIDDEN_DIM=512 the
+# GRU core is 985,088 params and these defaults give 1,016,768 (1.032x).
+TF_MAX_HISTORY: 16        # attention window, in env steps. The carry holds this
+                          #   many past token embeddings; older steps are dropped.
 TF_D_MODEL: 192           # residual stream width. "auto" solves for the width
                           #   that best matches the GRU parameter count.
 TF_N_LAYERS: 2            # transformer blocks
@@ -86,7 +99,7 @@ TF_INIT_SCALE: 1.0        # orthogonal gain on the in/out projections
 
 
 # Training parameters
-TOTAL_TIMESTEPS: 2000000000
+TOTAL_TIMESTEPS: 4000000000
 NUM_ENVS: 512
 NUM_STEPS: 64
 NUM_MINIBATCHES: 8
@@ -95,11 +108,14 @@ GAE_LAMBDA: 0.8
 GAMMA: 0.99
 CLIP_EPS: 0.2
 SCALE_CLIP_EPS: false
-ENT_COEF: 0.01
+# Entropy is the JOINT entropy (sum over the num_agents action heads), so it is
+# ~num_agents times larger than the per-agent entropy in seperate_ippo_rnn.
+# ENT_COEF is scaled down accordingly to keep the exploration pressure per head
+# comparable (0.01 / 4 agents).
+ENT_COEF: 0.0025
 VF_COEF: 0.5
 AUX_COEF: 0.1
-USE_TEAMMATE_AUXILIARY_LOSS: false
-AUX_TEAMMATE_WEIGHT: 0.3333
+AUX_SELF_WEIGHT: 1.0
 ANNEAL_LR: true
 LR: 0.0002
 MAX_GRAD_NORM: 1.0
@@ -121,3 +137,11 @@ SAVE_VIDEO: true             # Whether to record and save videos during logging
 VIDEO_LENGTH: 1000  # Number of env steps per video (rollout continues from current state)
 VIDEO_PIXEL_SIZE: 16  # Pixel size for rendering (7=agent, 16=medium, 64=large)
 SAVE_HIDDEN_STATES: false     # Whether to save hidden state CSVs during logging (large files!)
+
+# Checkpointing configuration
+CHECKPOINTING: true             # Enable saving/resuming training checkpoints
+CHECKPOINT_DIR: ""              # Empty -> <OUTPUT_DIR or .>/<RUN_NAME>/checkpoints (must stay stable across restarts)
+CHECKPOINT_INTERVAL_BLOCKS: 1   # Save a checkpoint every N logging phases
+CHECKPOINT_MAX_TO_KEEP: 3       # Number of recent checkpoints to retain
+RESUME: "auto"                  # "auto" resumes if a checkpoint exists, true forces resume, false starts fresh
+MAX_BLOCKS_THIS_RUN: 0          # >0 checkpoints and exits after this many logging phases this run (for wall-time limits)

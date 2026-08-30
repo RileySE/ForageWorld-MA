@@ -1,31 +1,68 @@
 """
-Code is adapted from the IPPO RNN implementation of JaxMARL (https://github.com/FLAIROx/JaxMARL/tree/main) 
+Fully CENTRALIZED PPO runner (single policy + single critic).
+
+Derived from baselines/seperate_ippo_rnn.py, but every trace of decentralized /
+per-agent-network logic is removed.  The multi-agent problem is reduced to a
+single-agent MDP over the joint observation and the joint action:
+
+  * OBSERVATION  — the per-agent egocentric observations are concatenated in
+    fixed agent order into one global vector of size num_agents * obs_dim.
+    Both the actor and the critic consume this same global vector.
+  * RECURRENCE   — ONE sequence model with ONE carry.  There is no per-agent
+    hidden state.  POLICY_ARCH selects the model:
+      - "gru" (default): one GRU, carry (num_envs, GRU_HIDDEN_DIM).
+      - "transformer": one causal, fixed-window transformer, carry
+        (num_envs, TF_MAX_HISTORY, TF_D_MODEL + 1) — a ring buffer of the last
+        TF_MAX_HISTORY token embeddings plus a per-slot validity flag.  It
+        attends over the last TF_MAX_HISTORY env steps and nothing older, and
+        never across an episode boundary.  Both models emit a width-
+        GRU_HIDDEN_DIM vector, so the actor / critic / aux heads are identical
+        and the total parameter count stays within a few percent (with the
+        defaults: 1.03x the GRU core).  See baselines/transformer_policy.py for
+        the full hyperparameter table and the parameter-budget helpers.
+  * ACTION       — the actor head emits num_agents * action_dim logits, viewed
+    as (num_agents, action_dim).  The joint action is the concatenation of the
+    per-agent actions, and the joint log-probability / entropy are the sums over
+    agents.  The joint distribution is therefore factored across agents given
+    the shared recurrent state (a non-factored distribution over action_dim ^
+    num_agents joint actions is not tractable).  PPO's importance ratio is
+    computed on the JOINT log-probability, i.e. one ratio per (step, env).
+  * VALUE        — ONE critic head, V(global_state).  A single scalar per
+    (step, env), a single GAE, a single advantage.  There are no per-agent
+    values, per-agent advantages, or per-agent gradient clipping.
+  * REWARD       — the per-agent rewards are aggregated into one team scalar via
+    CENTRAL_REWARD_AGGREGATION ("mean", the default, or "sum").  With
+    SHARED_REWARD: true all per-agent rewards are identical, so "mean" simply
+    recovers the shared reward and keeps the reward scale identical to
+    seperate_ippo_rnn.
+  * TERMINATION  — the environment terminates globally (done["__all__"]), so the
+    single episode / single value function is well defined.
+
+Kept from seperate_ippo_rnn.py because they are environment constraints or
+logging features rather than decentralization:
+  * reduced action space (USE_REDUCED_ACTION_SPACE),
+  * dead-agent NOOP masking (ACTION_MASK_WHILE_DEAD) — applied per action head,
+  * dynamic episode caps (EARLY_EPISODE_CAP / GENERAL_EPISODE_CAP),
+  * the auxiliary displacement-prediction head — now centralized: one head
+    predicts EVERY agent's displacement from spawn, so AUX_OUTPUT_DIM =
+    num_agents * 2.  USE_TEAMMATE_AUXILIARY_LOSS / AUX_TEAMMATE_WEIGHT are
+    meaningless for a controller that already observes everything and are
+    ignored (a warning is printed if they are set),
+  * CSV scalar logging, video recording, and the wandb metric layout (including
+    overview/sps).  The CSV column schema is unchanged so existing analysis
+    tooling keeps working; note that the `value` column is now the single global
+    V(s) repeated for every agent, while `entropy` / `log_prob` are that agent's
+    action-head marginals,
+  * orbax checkpointing / resume.  build_env() and single_run() are byte-identical
+    to seperate_ippo_rnn.py apart from the ALG_NAME default and one error string,
+    so the block loop, sidecar metadata, signal handling, buffer donation and
+    MAX_BLOCKS_THIS_RUN behaviour match exactly.  The carry fingerprints differ
+    between the two runners (different param/hidden-state structure), so orbax
+    will refuse a cross-runner resume rather than silently mis-restore.
+
+Code is adapted from the IPPO RNN implementation of JaxMARL
+(https://github.com/FLAIROx/JaxMARL/tree/main).
 Credit goes to the original authors: Rutherford et al.
-
-Modified to use SEPARATE network parameters per agent (no parameter sharing).
-Each agent has its own ActorCriticRNN with independent parameters.
-Gradient clipping is done PER-AGENT to avoid coupling through global norm computation.
-
-SEQUENCE MODEL — POLICY_ARCH selects what carries information across time:
-  * "gru" (default): one GRU per agent, carry (num_agents, num_envs, GRU_HIDDEN_DIM).
-  * "agalite": one AGaLiTe gated-linear-recurrent-attention stack per agent
-    (Pramanik et al., TMLR 2024), carry (num_agents, num_envs, AG carry width).
-    Unlike "transformer" this has NO context window: the carry is a fixed-size
-    summary of the agent's WHOLE episode, so nothing is forgotten at a horizon
-    cut-off, and per-step cost is constant in episode length.  Cost of that:
-    with the paper's Craftax architecture the carry is ~52x the GRU's and the
-    core has ~1.8x the GRU's parameters.  See baselines/agalite_policy.py.
-  * "transformer": one causal, fixed-window transformer per agent, carry
-    (num_agents, num_envs, TF_MAX_HISTORY, TF_D_MODEL + 1) — a per-agent ring
-    buffer of that agent's last TF_MAX_HISTORY token embeddings plus a per-slot
-    validity flag.  Each agent attends only over its OWN egocentric observation
-    history, for the last TF_MAX_HISTORY env steps and nothing older, and never
-    across an episode boundary.  No information crosses agents, so the setup
-    stays decentralized.  Both models emit a width-GRU_HIDDEN_DIM vector, so the
-    actor / critic / aux heads are identical and the per-agent parameter count
-    stays within a few percent (with the defaults: 1.03x the GRU core).  See
-    baselines/transformer_policy.py for the hyperparameter table and the
-    parameter-budget helpers.
 """
 
 # ===========================
@@ -42,7 +79,7 @@ import time
 import functools
 import tempfile
 import yaml
-from typing import Sequence, NamedTuple, Dict
+from typing import NamedTuple, Dict
 
 import jax
 if not hasattr(jax, 'tree_map'):
@@ -71,7 +108,6 @@ from craftax.custom_rendering.full_map_rendering import render_full_map
 
 import checkpoint_utils as ckpt
 import transformer_policy as tfp
-import agalite_policy as agp
 
 # ===========================
 # Model Definitions
@@ -102,25 +138,22 @@ class ScannedRNN(nn.Module):
         return cell.initialize_carry(jax.random.PRNGKey(0), (batch_size, hidden_size))
 
 
-class ActorCriticRNN(nn.Module):
-    """Per-agent actor-critic.  One copy of these params exists per agent; the
-    runner vmaps this module over the leading agent axis.
+class CentralizedActorCriticRNN(nn.Module):
+    """Single policy + single critic over the joint observation.
 
-    The sequence model is selected by POLICY_ARCH ("gru" | "transformer" |
-    "agalite").  All three consume (embedding, resets) and emit one vector per
-    step, so the actor / critic / aux heads below are identical either way.
-    Per-agent carry:
-        gru         (num_envs, GRU_HIDDEN_DIM)
-        transformer (num_envs, TF_MAX_HISTORY, TF_D_MODEL + 1)
-        agalite     (num_envs, agp.carry_size(hp))
-    Output width is GRU_HIDDEN_DIM for gru/transformer and AG_D_MODEL for
-    agalite (AG_OUT_DIM: 512 makes it GRU_HIDDEN_DIM there too).
-    Each agent's sequence model sees only that agent's OWN egocentric
-    observation history -- a fixed window for "transformer", the whole episode
-    for "gru" and "agalite".  Nothing is shared across agents, so this stays
-    decentralized either way.
+    Input  : global obs (T, B, num_agents * obs_dim), resets (T, B)
+    Outputs: hidden      (B, hidden_dim)          -- GRU carry, or
+                         (B, TF_MAX_HISTORY, TF_D_MODEL + 1) for the transformer
+             pi          Categorical over logits (T, B, num_agents, action_dim)
+             value       (T, B)                      -- ONE critic head
+             aux         (T, B, num_agents * 2)
+
+    The sequence model is selected by POLICY_ARCH ("gru" | "transformer").  Both
+    consume (embedding, resets) and emit a width-GRU_HIDDEN_DIM vector, so the
+    actor / critic / aux heads below are identical either way.
     """
-    action_dim: Sequence[int]
+    action_dim: int
+    num_agents: int
     config: Dict
 
     @nn.compact
@@ -132,34 +165,38 @@ class ActorCriticRNN(nn.Module):
         embedding = nn.relu(embedding)
 
         rnn_in = (embedding, dones)
-        arch = str(self.config.get("POLICY_ARCH", "gru")).lower()
-        if arch == "transformer":
+        if self.config.get("POLICY_ARCH", "gru") == "transformer":
             hidden, embedding = tfp.ScannedTransformer(
                 **tfp.hparams_from_config(self.config)
-            )(hidden, rnn_in)
-        elif arch == "agalite":
-            hidden, embedding = agp.ScannedAGaLiTe(
-                **agp.hparams_from_config(self.config)
             )(hidden, rnn_in)
         else:
             hidden, embedding = ScannedRNN()(hidden, rnn_in)
 
+        # ── Joint policy: one trunk, num_agents * action_dim logits ──
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
         )
         actor_mean = nn.relu(actor_mean)
         action_logits = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+            self.num_agents * self.action_dim,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0),
         )(actor_mean)
+        # (T, B, num_agents * action_dim) -> (T, B, num_agents, action_dim)
+        action_logits = action_logits.reshape(
+            action_logits.shape[:-1] + (self.num_agents, self.action_dim)
+        )
 
         pi = distrax.Categorical(logits=action_logits)
 
+        # ── Single centralized critic: V(global state) ──
         critic = nn.Dense(self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
         )
         critic = nn.relu(critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(critic)
 
+        # ── Auxiliary head: predicts every agent's displacement from spawn ──
         aux = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
         )
@@ -174,20 +211,20 @@ class ActorCriticRNN(nn.Module):
 # Data Structures and Utilities
 # ===========================
 class Transition(NamedTuple):
-    """Full transition including info for logging."""
-    global_done: jnp.ndarray
-    done: jnp.ndarray
-    alive: jnp.ndarray
-    action: jnp.ndarray
-    value: jnp.ndarray
-    reward: jnp.ndarray
-    log_prob: jnp.ndarray
-    obs: jnp.ndarray
-    deltas_to_start: jnp.ndarray
+    """One centralized transition.  Every field is (num_envs, ...) per step."""
+    global_done: jnp.ndarray   # (num_envs,)     episode termination
+    done: jnp.ndarray          # (num_envs,)     previous done -> RNN reset
+    alive: jnp.ndarray         # (num_envs, N)   per-agent alive flags (action masking)
+    action: jnp.ndarray        # (num_envs, N)   joint action (policy indices)
+    value: jnp.ndarray         # (num_envs,)     V(global state)
+    reward: jnp.ndarray        # (num_envs,)     aggregated team reward
+    log_prob: jnp.ndarray      # (num_envs,)     JOINT log-probability
+    obs: jnp.ndarray           # (num_envs, N*obs_dim) global observation
+    aux_targets: jnp.ndarray   # (num_envs, N*2) displacement-from-spawn targets
     info: jnp.ndarray
 
 class TrainBatch(NamedTuple):
-    """Batch for PPO update (without info to avoid minibatch issues)."""
+    """Same as Transition without info (info breaks minibatch reshaping)."""
     global_done: jnp.ndarray
     done: jnp.ndarray
     alive: jnp.ndarray
@@ -196,7 +233,7 @@ class TrainBatch(NamedTuple):
     reward: jnp.ndarray
     log_prob: jnp.ndarray
     obs: jnp.ndarray
-    deltas_to_start: jnp.ndarray
+    aux_targets: jnp.ndarray
 
 class LossAux(NamedTuple):
     """Auxiliary outputs from _loss_fn — passed through has_aux=True, only used for logging.
@@ -208,25 +245,7 @@ class LossAux(NamedTuple):
     approx_kl: jnp.ndarray
     clip_frac: jnp.ndarray
     aux_loss: jnp.ndarray
-    total_loss_per_agent: jnp.ndarray
-    value_loss_per_agent: jnp.ndarray
-    loss_actor_per_agent: jnp.ndarray
-    entropy_per_agent: jnp.ndarray
-    aux_loss_per_agent: jnp.ndarray
-
-def batchify(x: dict, agent_list):
-    """Stack agent observations, preserving agent dimension.
-    
-    Returns shape: (num_agents, num_envs, obs_dim)
-    """
-    return jnp.stack([x[a] for a in agent_list], axis=0)
-
-def unbatchify(x: jnp.ndarray, agent_list):
-    """Convert stacked array back to agent dict.
-    
-    Input shape: (num_agents, num_envs, ...) or (num_agents, num_envs)
-    """
-    return {a: x[i] for i, a in enumerate(agent_list)}
+    entropy_per_agent: jnp.ndarray  # (num_agents,) per-action-head marginal entropy
 
 # ===========================
 # Training Function
@@ -262,6 +281,13 @@ def make_train(config, env):
             f"Got LOGGING_THREADS={logging_threads}, NUM_ENVS={config['NUM_ENVS']}."
         )
 
+    reward_aggregation = str(config.get("CENTRAL_REWARD_AGGREGATION", "mean")).lower()
+    if reward_aggregation not in {"mean", "sum"}:
+        raise ValueError(
+            "CENTRAL_REWARD_AGGREGATION must be 'mean' or 'sum', "
+            f"got {reward_aggregation!r}."
+        )
+
     config["NUM_AGENTS"] = env.num_agents
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
@@ -269,8 +295,8 @@ def make_train(config, env):
     )
     config["NUM_LOGGING_ITERS"] = config["NUM_UPDATES"] // config["LOGGING_UPDATES_INTERVAL"]
     config["REMAINING_UPDATES"] = config["NUM_UPDATES"] % config["LOGGING_UPDATES_INTERVAL"]
-    # Note: In separate IPPO, minibatching is done over NUM_ENVS per agent
-    # Each minibatch has shape (num_steps, num_agents, num_envs // NUM_MINIBATCHES, ...)
+    # Centralized: one joint transition per (step, env), so minibatching is over
+    # NUM_ENVS only.  Each minibatch is (num_steps, num_envs // NUM_MINIBATCHES, ...).
     config["MINIBATCH_SIZE"] = config["NUM_ENVS"] // config["NUM_MINIBATCHES"]
 
     # Load rendering resources BEFORE wrapping (need base env's static_env_params)
@@ -309,44 +335,22 @@ def make_train(config, env):
     env_log = VideoPlotWrapper(env_train, os.path.join(get_run_output_dir(), 'debug_output'), 256, False)
     env = env_log  # default reference for property access (agents, num_agents, action_space, etc.)
 
-    # Auxiliary loss configuration
-    _n = env.num_agents
-    _agents_per_team = len(config.get("TEAM_COMPOSITION", [1, 1, 2]))
-    _aux_self_w = config.get("AUX_SELF_WEIGHT", 1.0)
-    _use_teammate_aux = config.get("USE_TEAMMATE_AUXILIARY_LOSS", True)
-    _aux_team_w = config.get("AUX_TEAMMATE_WEIGHT", 1/3) if _use_teammate_aux else 0.0
+    num_agents = env.num_agents
+    obs_dim = env.observation_space(env.agents[0]).shape[0]
+    global_obs_dim = num_agents * obs_dim
 
-    # AUX_OUTPUT_DIM: number of aux output values per agent
-    # Self-only: 2 (dx, dy). With teammates: agents_per_team * 2.
-    if _use_teammate_aux:
-        config["AUX_OUTPUT_DIM"] = _agents_per_team * 2
-    else:
-        config["AUX_OUTPUT_DIM"] = 2
+    # ── Auxiliary loss configuration (centralized) ──
+    # One head predicts every agent's displacement from spawn: (dx, dy) per agent.
+    if config.get("USE_TEAMMATE_AUXILIARY_LOSS", False):
+        print(
+            "[central_ippo_rnn] USE_TEAMMATE_AUXILIARY_LOSS is ignored: the centralized "
+            "controller already observes all agents, so there is no egocentric "
+            "teammate-relative target.  The aux head predicts every agent's "
+            "displacement from spawn."
+        )
+    config["AUX_OUTPUT_DIM"] = num_agents * 2
     _aux_output_dim = config["AUX_OUTPUT_DIM"]
-
-    # Build auxiliary loss weight mask: (num_agents, AUX_OUTPUT_DIM)
-    _aux_wm = np.zeros((_n, _aux_output_dim))
-    if _use_teammate_aux:
-        for _i in range(_n):
-            _self_team_idx = _i % _agents_per_team
-            for _j in range(_agents_per_team):
-                w = _aux_self_w if _j == _self_team_idx else _aux_team_w
-                _aux_wm[_i, _j * 2] = w
-                _aux_wm[_i, _j * 2 + 1] = w
-    else:
-        _aux_wm[:, 0] = _aux_self_w
-        _aux_wm[:, 1] = _aux_self_w
-    aux_weight_mask = jnp.array(_aux_wm)  # (num_agents, AUX_OUTPUT_DIM)
-
-    # Precompute team structure arrays for aux target computation
-    if _use_teammate_aux:
-        # _team_indices[i] = global indices of agent i's team members
-        _team_indices = np.array([
-            [(i // _agents_per_team) * _agents_per_team + j for j in range(_agents_per_team)]
-            for i in range(_n)
-        ])  # (N, agents_per_team)
-        _self_team_idx_arr = np.arange(_n) % _agents_per_team  # (N,)
-        _eye_team_4d = (np.arange(_agents_per_team)[None, :] == _self_team_idx_arr[:, None])[None, :, :, None]  # (1, N, apt, 1)
+    _aux_self_w = config.get("AUX_SELF_WEIGHT", 1.0)
 
     def linear_schedule(count):
         frac = (
@@ -355,33 +359,6 @@ def make_train(config, env):
             / config["NUM_UPDATES"]
         )
         return config["LR"] * frac
-
-    # Per-agent gradient clipping to avoid coupling agents through global norm
-    def per_agent_clip_by_global_norm(max_norm):
-        """Clip gradients per agent independently, not across all agents."""
-        def init_fn(params):
-            del params
-            return optax.EmptyState()
-        
-        def update_fn(updates, state, params=None):
-            del params
-            # updates has shape (num_agents, ...) for each leaf
-            # We need to clip each agent's gradients independently
-            
-            def clip_single_agent(agent_grads):
-                # Compute norm for this agent only
-                leaves = jax.tree_util.tree_leaves(agent_grads)
-                sum_of_squares = sum(jnp.sum(jnp.square(x)) for x in leaves)
-                norm = jnp.sqrt(sum_of_squares)
-                # Clip
-                scale = jnp.minimum(1.0, max_norm / (norm + 1e-6))
-                return jax.tree_util.tree_map(lambda x: x * scale, agent_grads)
-            
-            # Vmap over the agent dimension (axis 0 of each leaf)
-            clipped_updates = jax.vmap(clip_single_agent)(updates)
-            return clipped_updates, state
-        
-        return optax.GradientTransformation(init_fn, update_fn)
 
     use_reduced_action_space = config.get("USE_REDUCED_ACTION_SPACE", False)
     action_mask_while_dead = config.get("ACTION_MASK_WHILE_DEAD", False)
@@ -399,25 +376,31 @@ def make_train(config, env):
 
     noop_policy_action_idx = 0
 
+    def global_obs(obs_dict):
+        """Concatenate per-agent observations into the global vector.
+
+        obs_dict[agent]: (num_envs, obs_dim) -> (num_envs, num_agents * obs_dim)
+        """
+        return jnp.concatenate([obs_dict[a] for a in env.agents], axis=-1)
+
     def compute_alive_mask(env_state):
-        return jnp.swapaxes(env_state.env_state.player_alive, 0, 1)
+        """player_alive is (num_envs, num_agents) after the env vmap."""
+        return env_state.env_state.player_alive
 
     def apply_dead_action_mask(logits, alive_mask):
-        """Force dead agents to use NOOP by masking out all other actions."""
+        """Force dead agents' action heads to NOOP by masking out all other actions.
+
+        logits:     (..., num_agents, action_dim)
+        alive_mask: (..., num_agents)
+        """
         dead_only_noop_logits = jnp.full_like(logits, -1e9)
         dead_only_noop_logits = dead_only_noop_logits.at[..., noop_policy_action_idx].set(0.0)
         return jnp.where(alive_mask[..., None], logits, dead_only_noop_logits)
 
-    # -- Sequence-model selection: GRU carry / transformer window / AGaLiTe state --
+    # ── Sequence-model selection: GRU carry vs transformer window ──
     policy_arch = str(config.get("POLICY_ARCH", "gru")).lower()
-    if policy_arch not in ("gru", "transformer", "agalite"):
-        raise ValueError(
-            f'POLICY_ARCH must be "gru", "transformer" or "agalite", got {policy_arch!r}'
-        )
-    _ag_hp = None
-    if policy_arch == "agalite":
-        _ag_hp = agp.hparams_from_config(config)
-        print(agp.describe(_ag_hp, int(config["FC_DIM_SIZE"]), int(config["GRU_HIDDEN_DIM"])))
+    if policy_arch not in ("gru", "transformer"):
+        raise ValueError(f'POLICY_ARCH must be "gru" or "transformer", got {policy_arch!r}')
     if policy_arch == "transformer":
         _tf_hp = tfp.hparams_from_config(config)
         # Write the resolved values back so the printed report, the checkpoint
@@ -430,60 +413,44 @@ def make_train(config, env):
         _tf_hp = None
 
     def zero_hstate(batch_size):
-        """Zero carry for ONE agent under the active sequence model.
+        """Zero carry for the active sequence model.
 
         gru         -> (batch_size, GRU_HIDDEN_DIM)
         transformer -> (batch_size, TF_MAX_HISTORY, TF_D_MODEL + 1)
-        agalite     -> (batch_size, agp.carry_size(_ag_hp))
         """
         if policy_arch == "transformer":
             return tfp.ScannedTransformer.initialize_carry(
                 batch_size, _tf_hp["max_history"], _tf_hp["d_model"]
             )
-        if policy_arch == "agalite":
-            return agp.ScannedAGaLiTe.initialize_carry(batch_size, agp.carry_size(_ag_hp))
         return ScannedRNN.initialize_carry(batch_size, config["GRU_HIDDEN_DIM"])
 
-    def zero_hstate_all_agents(batch_size):
-        """Per-agent carry stacked on a leading agent axis: (num_agents, batch, ...)."""
-        carry = zero_hstate(batch_size)
-        return jnp.tile(carry[np.newaxis], (env.num_agents,) + (1,) * carry.ndim)
-
     def train(rng):
-        # INIT NETWORK - separate params per agent
-        network = ActorCriticRNN(action_dim, config=config)
+        # INIT NETWORK — a single parameter set, no agent dimension anywhere
+        network = CentralizedActorCriticRNN(
+            action_dim=action_dim, num_agents=num_agents, config=config
+        )
         rng, _rng = jax.random.split(rng)
-        
+
         init_x = (
-            jnp.zeros((1, config["NUM_ENVS"], env.observation_space(env.agents[0]).shape[0])),
+            jnp.zeros((1, config["NUM_ENVS"], global_obs_dim)),
             jnp.zeros((1, config["NUM_ENVS"])),
         )
         init_hstate = zero_hstate(config["NUM_ENVS"])
-        
-        # Initialize separate params for each agent using vmap
-        agent_rngs = jax.random.split(_rng, env.num_agents)
-        
-        def init_single_agent(agent_rng):
-            return network.init(agent_rng, init_hstate, init_x)
-        
-        # Stacked network variables: leading dim is num_agents
-        stacked_network_variables = jax.vmap(init_single_agent)(agent_rngs)
-        # Extract only params (network.init returns {"params": ...})
-        stacked_network_params = stacked_network_variables["params"]
-        
+        network_params = network.init(_rng, init_hstate, init_x)["params"]
+
         if config["ANNEAL_LR"]:
             tx = optax.chain(
-                per_agent_clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(learning_rate=linear_schedule, eps=1e-5),
             )
         else:
             tx = optax.chain(
-                per_agent_clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(config["LR"], eps=1e-5),
             )
         train_state = TrainState.create(
             apply_fn=network.apply,
-            params=stacked_network_params,  # (num_agents, ...) - only params, not full variables
+            params=network_params,
             tx=tx,
         )
 
@@ -491,13 +458,11 @@ def make_train(config, env):
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env_train.reset, in_axes=(0,))(reset_rng)
-        # Hidden state shape: (num_agents, num_envs, hidden_dim) for the GRU, or
-        # (num_agents, num_envs, TF_MAX_HISTORY, TF_D_MODEL + 1) for the transformer
-        init_hstate = zero_hstate_all_agents(config["NUM_ENVS"])
-        # Initial done flags as dict (will be converted to array in _env_step)
-        # Must include "__all__" key to match structure returned by env.step
-        init_done = {a: jnp.zeros((config["NUM_ENVS"],), dtype=bool) for a in env.agents}
-        init_done["__all__"] = jnp.zeros((config["NUM_ENVS"],), dtype=bool)
+        # ONE hidden state: (num_envs, hidden_dim) for the GRU, or one attention
+        # window (num_envs, TF_MAX_HISTORY, TF_D_MODEL + 1) for the transformer
+        init_hstate = zero_hstate(config["NUM_ENVS"])
+        # ONE done flag per env (the environment terminates globally)
+        init_done = jnp.zeros((config["NUM_ENVS"],), dtype=bool)
 
         # Override effective_max_timesteps in every vmapped env_state. Must be
         # re-applied after env.step, because world_gen resets the cap to its
@@ -510,11 +475,18 @@ def make_train(config, env):
             patched_inner = env_state.env_state.replace(effective_max_timesteps=patched_caps)
             return env_state.replace(env_state=patched_inner)
 
+        def forward(params, hstate, obs, done):
+            """Single forward pass of the centralized network.
+
+            obs: (T, num_envs, global_obs_dim), done: (T, num_envs)
+            """
+            return network.apply({"params": params}, hstate, (obs, done))
+
         # TRAIN LOOP
         # detailed_logging: when True, extra per-step fields (hidden_state, entropy,
         # log_prob, deltas, etc.) are added to info for CSV logging.  When False
-        # (training path), these fields are omitted to save ~256 MB+ GPU memory
-        # per update that would otherwise be accumulated by jax.lax.scan.
+        # (training path), these fields are omitted to save GPU memory that would
+        # otherwise be accumulated by jax.lax.scan.
         # Use functools.partial to set the flag at compile time so JAX can
         # eliminate the dead code path entirely.
 
@@ -523,53 +495,44 @@ def make_train(config, env):
 
             # SELECT ACTION
             rng, _rng = jax.random.split(rng)
-            # obs_batch shape: (num_agents, num_envs, obs_dim)
-            obs_batch = batchify(last_obs, env.agents)
-            # done_batch shape: (num_agents, num_envs)
-            # last_done is a dict from env, convert to array
-            done_batch_in = batchify(last_done, env.agents)
-            alive_batch = compute_alive_mask(env_state)
+            obs_batch = global_obs(last_obs)          # (num_envs, global_obs_dim)
+            alive_batch = compute_alive_mask(env_state)  # (num_envs, num_agents)
 
-            # Forward pass for each agent with their own params
-            # ac_in: (1, num_envs, obs_dim), (1, num_envs)
-            # hstate: (num_agents, num_envs, hidden_dim)
-            def forward_single_agent(params, hs, obs, done):
-                ac_in = (obs[np.newaxis, :], done[np.newaxis, :])
-                return network.apply({"params": params}, hs, ac_in)
-
-            hstate, pi, value, aux_pred = jax.vmap(forward_single_agent)(
-                train_state.params,  # (num_agents, ...)
-                hstate,              # (num_agents, num_envs, hidden_dim)
-                obs_batch,           # (num_agents, num_envs, obs_dim)
-                done_batch_in,       # (num_agents, num_envs)
+            hstate, pi, value, aux_pred = forward(
+                train_state.params,
+                hstate,                        # (num_envs, hidden_dim)
+                obs_batch[np.newaxis, :],      # (1, num_envs, global_obs_dim)
+                last_done[np.newaxis, :],      # (1, num_envs)
             )
-            # pi.logits shape: (num_agents, 1, num_envs, action_dim)
-            # value shape: (num_agents, 1, num_envs)
-            # aux_pred shape: (num_agents, 1, num_envs, AUX_OUTPUT_DIM)
+            # pi.logits: (1, num_envs, num_agents, action_dim)
+            # value:     (1, num_envs)
+            # aux_pred:  (1, num_envs, AUX_OUTPUT_DIM)
 
             if action_mask_while_dead:
-                masked_logits = apply_dead_action_mask(pi.logits, alive_batch[:, None, :])
+                masked_logits = apply_dead_action_mask(pi.logits, alive_batch[np.newaxis, :])
                 pi = distrax.Categorical(logits=masked_logits)
 
-            # Sample actions - distrax is batch-aware, sample directly
-            # pi.logits: (num_agents, 1, num_envs, action_dim)
-            action = pi.sample(seed=_rng)  # (num_agents, 1, num_envs)
-            log_prob = pi.log_prob(action)  # (num_agents, 1, num_envs)
+            action = pi.sample(seed=_rng)             # (1, num_envs, num_agents)
+            log_prob_per_agent = pi.log_prob(action)  # (1, num_envs, num_agents)
+            entropy_per_agent = pi.entropy()          # (1, num_envs, num_agents)
 
-            action = action.squeeze(axis=1)      # (num_agents, num_envs)
-            log_prob = log_prob.squeeze(axis=1)  # (num_agents, num_envs)
-            value = value.squeeze(axis=1)        # (num_agents, num_envs)
+            action = action.squeeze(axis=0)                          # (num_envs, num_agents)
+            log_prob_per_agent = log_prob_per_agent.squeeze(axis=0)  # (num_envs, num_agents)
+            entropy_per_agent = entropy_per_agent.squeeze(axis=0)    # (num_envs, num_agents)
+            value = value.squeeze(axis=0)                            # (num_envs,)
+            # JOINT log-probability of the concatenated action
+            log_prob = log_prob_per_agent.sum(axis=-1)               # (num_envs,)
 
-            env_action = policy_action_to_env_action(action)
-            env_act = unbatchify(env_action, env.agents)
-            env_act = {k: v.squeeze() for k, v in env_act.items()}
+            env_action = policy_action_to_env_action(action)  # (num_envs, num_agents)
+            # Index instead of squeeze so NUM_ENVS == 1 (video rollout) keeps its batch dim
+            env_act = {a: env_action[:, i] for i, a in enumerate(env.agents)}
 
             # STEP ENV
             # Use env_log (with VideoPlotWrapper) only during logging to get CSV fields
             # (health, food, mob distances, etc.). During training, use env_train
             # (LogWrapper only) to skip expensive mob distance calculations.
             rng, _rng = jax.random.split(rng)
-            rng_step = jax.random.split(_rng, config["NUM_ENVS"])
+            rng_step = jax.random.split(_rng, obs_batch.shape[0])
             step_fn = env_log.step if detailed_logging else env_train.step
             obsv, env_state, reward, done, info = jax.vmap(
                 step_fn, in_axes=(0, 0, 0)
@@ -580,81 +543,61 @@ def make_train(config, env):
             if effective_cap is not None:
                 env_state = _patch_episode_cap(env_state, effective_cap)
 
-            done_batch = batchify(done, env.agents)  # (num_agents, num_envs)
-            reward_batch = batchify(reward, env.agents)  # (num_agents, num_envs)
+            done_global = done["__all__"]  # (num_envs,)
 
-            # Auxiliary task targets (computed AFTER env.step so targets use position at t+1)
-            # all_pos / all_spawn: (num_envs, num_agents, 2)
-            all_pos = env_state.env_state.player_position
-            all_spawn = env_state.env_state.player_spawn_position
-            self_delta = all_pos - all_spawn  # (num_envs, N, 2)
-
-            if _use_teammate_aux:
-                # For each agent i, predict team-local positions at t+1:
-                #   slot k (k == self_team_idx): self displacement from spawn
-                #   slot k (k != self_team_idx): teammate k's position relative to self
-                team_pos = all_pos[:, _team_indices, :]  # (num_envs, N, agents_per_team, 2)
-                rel_pos = team_pos - all_pos[:, :, None, :]  # (num_envs, N, agents_per_team, 2)
-                aux_targets = jnp.where(_eye_team_4d, jnp.expand_dims(self_delta, 2), rel_pos)
-                # (num_envs, N, apt, 2) -> (num_envs, N, apt*2) -> (N, num_envs, apt*2)
-                deltas_to_start = jnp.transpose(
-                    aux_targets.reshape(aux_targets.shape[0], _n, _agents_per_team * 2),
-                    (1, 0, 2)
-                )
+            # Aggregate the per-agent rewards into ONE team reward
+            reward_stacked = jnp.stack([reward[a] for a in env.agents], axis=-1)  # (num_envs, num_agents)
+            if reward_aggregation == "sum":
+                reward_central = reward_stacked.sum(axis=-1)
             else:
-                # Self-only: predict own displacement from spawn at t+1
-                # (num_envs, N, 2) -> (N, num_envs, 2)
-                deltas_to_start = jnp.transpose(self_delta, (1, 0, 2))
+                reward_central = reward_stacked.mean(axis=-1)
+
+            # Auxiliary targets (computed AFTER env.step so targets use position at t+1):
+            # every agent's displacement from its spawn point.
+            all_pos = env_state.env_state.player_position        # (num_envs, num_agents, 2)
+            all_spawn = env_state.env_state.player_spawn_position
+            self_delta = all_pos - all_spawn                     # (num_envs, num_agents, 2)
+            aux_targets = self_delta.reshape(self_delta.shape[0], _aux_output_dim)
 
             transition = Transition(
-                jnp.tile(done["__all__"][np.newaxis, :], (env.num_agents, 1)),  # (num_agents, num_envs)
-                done_batch_in,   # (num_agents, num_envs)
-                alive_batch,     # (num_agents, num_envs)
-                action,          # (num_agents, num_envs)
-                value,           # (num_agents, num_envs)
-                reward_batch,    # (num_agents, num_envs)
-                log_prob,        # (num_agents, num_envs)
-                obs_batch,       # (num_agents, num_envs, obs_dim)
-                deltas_to_start, # (num_agents, num_envs, AUX_OUTPUT_DIM)
+                done_global,      # (num_envs,)
+                last_done,        # (num_envs,)
+                alive_batch,      # (num_envs, num_agents)
+                action,           # (num_envs, num_agents)
+                value,            # (num_envs,)
+                reward_central,   # (num_envs,)
+                log_prob,         # (num_envs,)
+                obs_batch,        # (num_envs, global_obs_dim)
+                aux_targets,      # (num_envs, num_agents * 2)
                 info,
             )
 
-            # Extra per-step fields for CSV logging — only computed in logging iterations
+            # Extra per-step fields for CSV logging — only computed in logging iterations.
+            # CSV helpers expect per-agent fields as (num_agents, num_envs), so transpose.
             if detailed_logging:
-                info['action'] = env_action       # (num_agents, num_envs)
-                info['done'] = done_batch         # (num_agents, num_envs)
-                info['value'] = value             # (num_agents, num_envs)
-                info['hidden_state'] = hstate     # (num_agents, num_envs, hidden_dim)
-                # pi.entropy() returns (num_agents, 1, num_envs) - squeeze axis 1
-                info['entropy'] = pi.entropy().squeeze(1)  # (num_agents, num_envs)
-                info['log_prob'] = log_prob       # (num_agents, num_envs)
-                # Auxiliary predictions and ground truth for CSV logging
-                # aux_pred: (num_agents, 1, num_envs, AUX_OUTPUT_DIM) -> squeeze
-                aux_pred_squeezed = aux_pred.squeeze(axis=1)  # (num_agents, num_envs, AUX_OUTPUT_DIM)
-                if _use_teammate_aux:
-                    # deltas_to_start: (num_agents, num_envs, agents_per_team*2)
-                    # Self-delta is at team-local slot _self_team_idx_arr[i]
-                    _aidx = jnp.arange(env.num_agents)
-                    _stidx = jnp.array(_self_team_idx_arr)
-                    info['delta_x'] = deltas_to_start[_aidx, :, _stidx * 2]            # (num_agents, num_envs)
-                    info['delta_y'] = deltas_to_start[_aidx, :, _stidx * 2 + 1]        # (num_agents, num_envs)
-                    info['pred_delta_x'] = aux_pred_squeezed[_aidx, :, _stidx * 2]     # (num_agents, num_envs)
-                    info['pred_delta_y'] = aux_pred_squeezed[_aidx, :, _stidx * 2 + 1] # (num_agents, num_envs)
-                    # Per team-local slot logging
-                    for _j in range(_agents_per_team):
-                        info[f'delta_x_{_j}'] = deltas_to_start[:, :, _j * 2]              # (num_agents, num_envs)
-                        info[f'delta_y_{_j}'] = deltas_to_start[:, :, _j * 2 + 1]          # (num_agents, num_envs)
-                        info[f'pred_delta_x_{_j}'] = aux_pred_squeezed[:, :, _j * 2]       # (num_agents, num_envs)
-                        info[f'pred_delta_y_{_j}'] = aux_pred_squeezed[:, :, _j * 2 + 1]   # (num_agents, num_envs)
-                else:
-                    # deltas_to_start: (num_agents, num_envs, 2) — self-only
-                    info['delta_x'] = deltas_to_start[:, :, 0]        # (num_agents, num_envs)
-                    info['delta_y'] = deltas_to_start[:, :, 1]        # (num_agents, num_envs)
-                    info['pred_delta_x'] = aux_pred_squeezed[:, :, 0] # (num_agents, num_envs)
-                    info['pred_delta_y'] = aux_pred_squeezed[:, :, 1] # (num_agents, num_envs)
+                aux_pred_squeezed = aux_pred.squeeze(axis=0)  # (num_envs, AUX_OUTPUT_DIM)
+                aux_pred_xy = aux_pred_squeezed.reshape(-1, num_agents, 2)  # (num_envs, N, 2)
+                info['action'] = env_action.T                     # (num_agents, num_envs)
+                # done is global; replicate per agent to keep the CSV schema unchanged
+                info['done'] = jnp.broadcast_to(
+                    done_global[np.newaxis, :], (num_agents, done_global.shape[0])
+                )
+                # ONE global value, repeated per agent (there are no per-agent critics)
+                info['value'] = jnp.broadcast_to(
+                    value[np.newaxis, :], (num_agents, value.shape[0])
+                )
+                info['hidden_state'] = hstate                    # (num_envs, hidden_dim) — shared
+                info['entropy'] = entropy_per_agent.T            # (num_agents, num_envs)
+                info['log_prob'] = log_prob_per_agent.T          # (num_agents, num_envs)
+                info['joint_log_prob'] = jnp.broadcast_to(
+                    log_prob[np.newaxis, :], (num_agents, log_prob.shape[0])
+                )
+                info['delta_x'] = self_delta[:, :, 0].T          # (num_agents, num_envs)
+                info['delta_y'] = self_delta[:, :, 1].T
+                info['pred_delta_x'] = aux_pred_xy[:, :, 0].T
+                info['pred_delta_y'] = aux_pred_xy[:, :, 1].T
 
-            # Keep done as dict for next iteration (env returns dict)
-            runner_state = (train_state, env_state, obsv, done, hstate, rng)
+            runner_state = (train_state, env_state, obsv, done_global, hstate, rng)
             return runner_state, transition
 
         _early_episode_cap = config.get("EARLY_EPISODE_CAP", 0)
@@ -695,25 +638,21 @@ def make_train(config, env):
             else:
                 scan_step_fn = _env_step
 
-            # Save initial hidden state BEFORE rollout for PPO rerun
-            initial_hstate = runner_state[4]  # hstate before rollout
+            # Save initial hidden state BEFORE rollout for the PPO rerun
+            initial_hstate = runner_state[4]
             runner_state, traj_batch = jax.lax.scan(
                 scan_step_fn, runner_state, None, config["NUM_STEPS"]
             )
 
-            # CALCULATE ADVANTAGE
+            # CALCULATE ADVANTAGE — one bootstrap value per env
             train_state, env_state, last_obs, last_done, hstate, rng = runner_state
-            last_obs_batch = batchify(last_obs, env.agents)
-            last_done_batch = batchify(last_done, env.agents)  # last_done is dict from env
-            
-            def forward_single_agent(params, hs, obs, done):
-                ac_in = (obs[np.newaxis, :], done[np.newaxis, :])
-                return network.apply({"params": params}, hs, ac_in)
-            
-            _, _, last_val, _ = jax.vmap(forward_single_agent)(
-                train_state.params, hstate, last_obs_batch, last_done_batch
+            _, _, last_val, _ = forward(
+                train_state.params,
+                hstate,
+                global_obs(last_obs)[np.newaxis, :],
+                last_done[np.newaxis, :],
             )
-            last_val = last_val.squeeze(axis=1)  # (num_agents, num_envs)
+            last_val = last_val.squeeze(axis=0)  # (num_envs,)
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -740,7 +679,7 @@ def make_train(config, env):
                 return advantages, advantages + traj_batch.value
 
             advantages, targets = _calculate_gae(traj_batch, last_val)
-            
+
             # Extract TrainBatch without info for minibatching
             train_batch = TrainBatch(
                 global_done=traj_batch.global_done,
@@ -751,7 +690,7 @@ def make_train(config, env):
                 reward=traj_batch.reward,
                 log_prob=traj_batch.log_prob,
                 obs=traj_batch.obs,
-                deltas_to_start=traj_batch.deltas_to_start,
+                aux_targets=traj_batch.aux_targets,
             )
             # Keep info separate for logging
             traj_info = traj_batch.info
@@ -762,64 +701,38 @@ def make_train(config, env):
                     init_hstate, train_batch, advantages, targets = batch_info
 
                     def _loss_fn(params, init_hstate, train_batch, gae, targets):
-                        # RERUN NETWORK for each agent
-                        # init_hstate: (num_agents, num_envs_minibatch, hidden_dim)
-                        # traj_batch.obs: (num_steps, num_agents, num_envs_minibatch, obs_dim)
-                        
-                        def forward_single_agent(p, hs, obs, done):
-                            # obs: (num_steps, num_envs_minibatch, obs_dim)
-                            # done: (num_steps, num_envs_minibatch)
-                            return network.apply({"params": p}, hs, (obs, done))
-                        
-                        # Transpose train_batch for per-agent processing
-                        obs_per_agent = jnp.transpose(train_batch.obs, (1, 0, 2, 3))  # (num_agents, num_steps, num_envs, obs_dim)
-                        done_per_agent = jnp.transpose(train_batch.done, (1, 0, 2))   # (num_agents, num_steps, num_envs)
-                        alive_per_agent = jnp.transpose(train_batch.alive, (1, 0, 2)) # (num_agents, num_steps, num_envs)
-                        action_per_agent = jnp.transpose(train_batch.action, (1, 0, 2))  # (num_agents, num_steps, num_envs)
-                        
-                        _, pi, value, aux = jax.vmap(forward_single_agent)(
-                            params,          # (num_agents, ...)
-                            init_hstate,     # (num_agents, num_envs_minibatch, hidden_dim)
-                            obs_per_agent,   # (num_agents, num_steps, num_envs_minibatch, obs_dim)
-                            done_per_agent,  # (num_agents, num_steps, num_envs_minibatch)
+                        # RERUN NETWORK
+                        # init_hstate:      (num_envs_mb, hidden_dim)
+                        # train_batch.obs:  (num_steps, num_envs_mb, global_obs_dim)
+                        _, pi, value, aux = forward(
+                            params, init_hstate, train_batch.obs, train_batch.done
                         )
-                        # pi.logits: (num_agents, num_steps, num_envs_minibatch, action_dim)
-                        # value: (num_agents, num_steps, num_envs_minibatch)
+                        # pi.logits: (num_steps, num_envs_mb, num_agents, action_dim)
+                        # value:     (num_steps, num_envs_mb)
+                        # aux:       (num_steps, num_envs_mb, AUX_OUTPUT_DIM)
 
                         if action_mask_while_dead:
-                            masked_logits = apply_dead_action_mask(pi.logits, alive_per_agent)
+                            masked_logits = apply_dead_action_mask(pi.logits, train_batch.alive)
                             pi = distrax.Categorical(logits=masked_logits)
-                        
-                        # Use distrax batch operations directly (no vmap over distribution objects)
-                        log_prob = pi.log_prob(action_per_agent)
-                        # log_prob: (num_agents, num_steps, num_envs_minibatch)
-                        
-                        # Transpose back to (num_steps, num_agents, num_envs_minibatch)
-                        log_prob = jnp.transpose(log_prob, (1, 0, 2))
-                        value = jnp.transpose(value, (1, 0, 2))
-                        aux = jnp.transpose(aux, (1, 0, 2, 3))  # (num_steps, num_agents, num_envs_minibatch, AUX_OUTPUT_DIM)
-                        
-                        # CALCULATE VALUE LOSS
-                        # Shape: (num_steps, num_agents, num_envs_minibatch)
+
+                        # JOINT log-probability of the concatenated action
+                        log_prob = pi.log_prob(train_batch.action).sum(axis=-1)  # (T, mb)
+
+                        # CALCULATE VALUE LOSS — single critic
                         value_pred_clipped = train_batch.value + (
                             value - train_batch.value
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
                         value_losses = jnp.square(value - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss_per_elem = 0.5 * jnp.maximum(value_losses, value_losses_clipped)
-                        # Per-agent value loss: mean over time (0) and envs (2), keep agents (1)
-                        value_loss_per_agent = value_loss_per_elem.mean(axis=(0, 2))  # (num_agents,)
-                        value_loss = value_loss_per_agent.mean()  # scalar for gradient
+                        value_loss = 0.5 * jnp.maximum(
+                            value_losses, value_losses_clipped
+                        ).mean()
 
-                        # CALCULATE ACTOR LOSS
+                        # CALCULATE ACTOR LOSS — one ratio per (step, env)
                         logratio = log_prob - train_batch.log_prob
                         ratio = jnp.exp(logratio)
-                        # Normalize advantages PER AGENT (no coupling between agents)
-                        # gae shape: (num_steps, num_agents, num_envs_minibatch)
-                        # Normalize over time (axis 0) and envs (axis 2), independently for each agent
-                        gae_mean = gae.mean(axis=(0, 2), keepdims=True)
-                        gae_std = gae.std(axis=(0, 2), keepdims=True)
-                        gae = (gae - gae_mean) / (gae_std + 1e-8)
+                        # Single controller -> normalize the advantage globally
+                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -829,39 +742,29 @@ def make_train(config, env):
                             )
                             * gae
                         )
-                        loss_actor_per_elem = -jnp.minimum(loss_actor1, loss_actor2)
-                        # Per-agent actor loss: mean over time (0) and envs (2), keep agents (1)
-                        loss_actor_per_agent = loss_actor_per_elem.mean(axis=(0, 2))  # (num_agents,)
-                        loss_actor = loss_actor_per_agent.mean()  # scalar for gradient
-                        
-                        # Entropy: use distrax directly (batch-aware)
-                        # pi.entropy() returns (num_agents, num_steps, num_envs_minibatch)
-                        entropy_per_elem = pi.entropy()  # (num_agents, num_steps, num_envs)
-                        entropy_per_agent = entropy_per_elem.mean(axis=(1, 2))  # (num_agents,)
-                        entropy = entropy_per_agent.mean()  # scalar for gradient
+                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
+                        loss_actor = loss_actor.mean()
 
-                        # Calculate auxiliary loss (predict self-displacement + optionally teammate positions)
-                        # aux, train_batch.deltas_to_start: (num_steps, num_agents, num_envs_minibatch, AUX_OUTPUT_DIM)
-                        # aux_weight_mask: (num_agents, AUX_OUTPUT_DIM) -> broadcast (1, num_agents, 1, AUX_OUTPUT_DIM)
-                        aux_loss_per_elem = jnp.square(aux - train_batch.deltas_to_start) * aux_weight_mask[None, :, None, :]
-                        aux_loss_per_agent = aux_loss_per_elem.mean(axis=(0, 2, 3))  # (num_agents,)
-                        aux_loss = aux_loss_per_agent.mean()  # scalar for gradient
+                        # Entropy of the joint (factored) policy = sum over action heads
+                        entropy_heads = pi.entropy()                      # (T, mb, num_agents)
+                        entropy_per_agent = entropy_heads.mean(axis=(0, 1))  # (num_agents,) logging only
+                        entropy = entropy_heads.sum(axis=-1).mean()
 
-                        # debug - per agent
-                        approx_kl_per_agent = ((ratio - 1) - logratio).mean(axis=(0, 2))  # (num_agents,)
-                        clip_frac_per_agent = (jnp.abs(ratio - 1) > config["CLIP_EPS"]).mean(axis=(0, 2))  # (num_agents,)
-                        approx_kl = approx_kl_per_agent.mean()
-                        clip_frac = clip_frac_per_agent.mean()
+                        # Auxiliary loss: predict every agent's displacement from spawn
+                        aux_loss = _aux_self_w * jnp.square(
+                            aux - train_batch.aux_targets
+                        ).mean()
 
-                        total_loss_per_agent = (
-                            loss_actor_per_agent
-                            + config["VF_COEF"] * value_loss_per_agent
-                            - config["ENT_COEF"] * entropy_per_agent
-                            + config["AUX_COEF"] * aux_loss_per_agent
-                        )  # (num_agents,)
-                        total_loss = total_loss_per_agent.mean()  # scalar for gradient
-                        
-                        # Return both scalar losses (for gradient) and per-agent losses (for logging)
+                        # debug
+                        approx_kl = ((ratio - 1) - logratio).mean()
+                        clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
+
+                        total_loss = (
+                            loss_actor
+                            + config["VF_COEF"] * value_loss
+                            - config["ENT_COEF"] * entropy
+                            + config["AUX_COEF"] * aux_loss
+                        )
                         return total_loss, LossAux(
                             value_loss=value_loss,
                             loss_actor=loss_actor,
@@ -870,11 +773,7 @@ def make_train(config, env):
                             approx_kl=approx_kl,
                             clip_frac=clip_frac,
                             aux_loss=aux_loss,
-                            total_loss_per_agent=total_loss_per_agent,
-                            value_loss_per_agent=value_loss_per_agent,
-                            loss_actor_per_agent=loss_actor_per_agent,
                             entropy_per_agent=entropy_per_agent,
-                            aux_loss_per_agent=aux_loss_per_agent,
                         )
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
@@ -894,80 +793,44 @@ def make_train(config, env):
                 ) = update_state
                 rng, _rng = jax.random.split(rng)
 
-                # Prepare batch for minibatching
-                # init_hstate: (num_agents, num_envs, hidden_dim)
-                # train_batch shapes: (num_steps, num_agents, num_envs, ...)
-                # advantages/targets: (num_steps, num_agents, num_envs)
-                
-                # Permute over num_envs dimension
+                # Every array is (num_steps, num_envs, ...) except init_hstate,
+                # which is (num_envs, hidden_dim) -> shuffle/minibatch over envs.
                 permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
 
-                # Shuffle init_hstate: (num_agents, num_envs, hidden_dim) -> axis 1
-                init_hstate_shuffled = jnp.take(init_hstate, permutation, axis=1)
-                
-                # Shuffle train_batch components: (num_steps, num_agents, num_envs, ...) -> axis 2
-                def shuffle_batch(x):
-                    return jnp.take(x, permutation, axis=2)
-                
-                train_batch_shuffled = TrainBatch(
-                    global_done=shuffle_batch(train_batch.global_done),
-                    done=shuffle_batch(train_batch.done),
-                    alive=shuffle_batch(train_batch.alive),
-                    action=shuffle_batch(train_batch.action),
-                    value=shuffle_batch(train_batch.value),
-                    reward=shuffle_batch(train_batch.reward),
-                    log_prob=shuffle_batch(train_batch.log_prob),
-                    obs=shuffle_batch(train_batch.obs),
-                    deltas_to_start=shuffle_batch(train_batch.deltas_to_start),
+                init_hstate_shuffled = jnp.take(init_hstate, permutation, axis=0)
+                train_batch_shuffled = jax.tree.map(
+                    lambda x: jnp.take(x, permutation, axis=1), train_batch
                 )
-                
-                # Shuffle advantages/targets: (num_steps, num_agents, num_envs) -> axis 2
-                advantages_shuffled = jnp.take(advantages, permutation, axis=2)
-                targets_shuffled = jnp.take(targets, permutation, axis=2)
-                
-                # Create minibatches
+                advantages_shuffled = jnp.take(advantages, permutation, axis=1)
+                targets_shuffled = jnp.take(targets, permutation, axis=1)
+
                 def minibatch_hstate(x):
-                    # Carry is agent-major with no time axis:
-                    #   gru         (num_agents, num_envs, hidden_dim)
-                    #   transformer (num_agents, num_envs, max_history, d_model + 1)
-                    # -> (num_minibatches, num_agents, minibatch_size, *carry_dims)
-                    num_agents, num_envs = x.shape[:2]
-                    carry_dims = x.shape[2:]
+                    # Carry is env-major with no time axis:
+                    #   gru         (num_envs, hidden_dim)
+                    #   transformer (num_envs, max_history, d_model + 1)
+                    # -> (num_minibatches, minibatch_size, *carry_dims)
+                    num_envs = x.shape[0]
                     minibatch_size = num_envs // config["NUM_MINIBATCHES"]
                     return x.reshape(
-                        (num_agents, config["NUM_MINIBATCHES"], minibatch_size) + carry_dims
-                    ).swapaxes(0, 1)
-                
+                        (config["NUM_MINIBATCHES"], minibatch_size) + x.shape[1:]
+                    )
+
                 def minibatch_array(x):
-                    # x: (num_steps, num_agents, num_envs, ...) 
-                    # -> (num_minibatches, num_steps, num_agents, minibatch_size, ...)
-                    shape = list(x.shape)
-                    num_steps, num_agents, num_envs = shape[:3]
-                    rest = shape[3:]
+                    # (num_steps, num_envs, ...) -> (num_minibatches, num_steps, minibatch_size, ...)
+                    num_steps, num_envs = x.shape[:2]
+                    rest = list(x.shape[2:])
                     minibatch_size = num_envs // config["NUM_MINIBATCHES"]
-                    new_shape = [num_steps, num_agents, config["NUM_MINIBATCHES"], minibatch_size] + rest
-                    reshaped = x.reshape(new_shape)
-                    # Move minibatch axis to front
-                    return jnp.moveaxis(reshaped, 2, 0)
-                
-                init_hstate_mb = minibatch_hstate(init_hstate_shuffled)
-                
-                train_batch_mb = TrainBatch(
-                    global_done=minibatch_array(train_batch_shuffled.global_done),
-                    done=minibatch_array(train_batch_shuffled.done),
-                    alive=minibatch_array(train_batch_shuffled.alive),
-                    action=minibatch_array(train_batch_shuffled.action),
-                    value=minibatch_array(train_batch_shuffled.value),
-                    reward=minibatch_array(train_batch_shuffled.reward),
-                    log_prob=minibatch_array(train_batch_shuffled.log_prob),
-                    obs=minibatch_array(train_batch_shuffled.obs),
-                    deltas_to_start=minibatch_array(train_batch_shuffled.deltas_to_start),
+                    reshaped = x.reshape(
+                        [num_steps, config["NUM_MINIBATCHES"], minibatch_size] + rest
+                    )
+                    return jnp.moveaxis(reshaped, 1, 0)
+
+                minibatches = (
+                    minibatch_hstate(init_hstate_shuffled),
+                    jax.tree.map(minibatch_array, train_batch_shuffled),
+                    minibatch_array(advantages_shuffled),
+                    minibatch_array(targets_shuffled),
                 )
-                
-                advantages_mb = minibatch_array(advantages_shuffled)
-                targets_mb = minibatch_array(targets_shuffled)
-                
-                minibatches = (init_hstate_mb, train_batch_mb, advantages_mb, targets_mb)
 
                 train_state, total_loss = jax.lax.scan(
                     _update_minbatch, train_state, minibatches
@@ -994,22 +857,14 @@ def make_train(config, env):
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
             )
             train_state = update_state[0]
-            
-            # traj_info is a FrozenDict from LogWrapper - create new dict to avoid mutation issues
+
             loss_aux = loss_info[1]  # LossAux with fields stacked (num_epochs, num_minibatches, ...)
-            # ratio_0: get before mean reduction (like original)
+            # ratio_0: get before mean reduction (like the original)
             ratio_0 = loss_aux.ratio.at[0, 0].get().mean()
 
-            # Per-agent losses are returned directly from loss_fn.
-            # Shape after scan: (num_epochs, num_minibatches, num_agents)
-            # Mean over epochs and minibatches to get (num_agents,)
-            total_loss_per_agent = loss_aux.total_loss_per_agent.mean(axis=(0, 1))
-            value_loss_per_agent = loss_aux.value_loss_per_agent.mean(axis=(0, 1))
-            actor_loss_per_agent = loss_aux.loss_actor_per_agent.mean(axis=(0, 1))
+            # Per-head entropy for diagnostics: (num_epochs, num_minibatches, num_agents) -> (num_agents,)
             entropy_per_agent = loss_aux.entropy_per_agent.mean(axis=(0, 1))
-            aux_loss_per_agent = loss_aux.aux_loss_per_agent.mean(axis=(0, 1))
 
-            # Global mean for backward compatibility
             loss_info_mean = jax.tree.map(lambda x: x.mean(), loss_info)
             loss_aux_mean = loss_info_mean[1]
 
@@ -1017,6 +872,7 @@ def make_train(config, env):
             metric = {
                 **dict(traj_info),  # Convert FrozenDict to regular dict
                 "update_steps": update_steps,
+                "central_reward": traj_batch.reward.mean(),
                 "loss": {
                     "total_loss": loss_info_mean[0],
                     "value_loss": loss_aux_mean.value_loss,
@@ -1028,13 +884,7 @@ def make_train(config, env):
                     "clip_frac": loss_aux_mean.clip_frac,
                     "aux_loss": loss_aux_mean.aux_loss,
                 },
-                "loss_per_agent": {
-                    "total_loss": total_loss_per_agent,      # (num_agents,)
-                    "value_loss": value_loss_per_agent,      # (num_agents,)
-                    "actor_loss": actor_loss_per_agent,      # (num_agents,)
-                    "entropy": entropy_per_agent,            # (num_agents,)
-                    "aux_loss": aux_loss_per_agent,          # (num_agents,)
-                },
+                "entropy_per_agent": entropy_per_agent,  # (num_agents,)
             }
 
             rng = update_state[-1]
@@ -1055,7 +905,7 @@ def make_train(config, env):
                 configured_agents_per_team = max(1, len(configured_comp))
 
                 # Derive agent count from runtime tensors (safer than config-only math).
-                num_agents = int(np.asarray(metrics["loss_per_agent"]["total_loss"]).shape[0])
+                num_agents = int(np.asarray(metrics["entropy_per_agent"]).shape[0])
 
                 # Team count is configuration-driven for stable logging layout.
                 num_teams = max(1, configured_num_teams)
@@ -1078,21 +928,22 @@ def make_train(config, env):
                     _steps_taken = _current_env_step - _sps_state["last_env_step"]
                     if _elapsed > 0:
                         to_log["overview/sps"] = _steps_taken/_elapsed
-                
+
                 _sps_state["last_time"] = _now
                 _sps_state["last_env_step"] = _current_env_step
 
                 # ── overview/ ──
                 to_log["overview/env_step"] = env_step
-                # ML global metrics
+                # ML global metrics — one policy, one critic, so these are THE losses
                 for k in ["total_loss", "value_loss", "actor_loss", "entropy",
                            "ratio", "ratio_0", "approx_kl", "clip_frac", "aux_loss"]:
                     to_log[f"overview/{k}"] = metrics["loss"][k]
+                # Mean per-step aggregated reward actually optimized by the critic
+                to_log["overview/central_step_reward"] = np.asarray(metrics["central_reward"]).item()
 
-                # ── agent_{i}/ ML losses ──
+                # ── agent_{i}/ per-action-head entropy (diagnostic only) ──
                 for i in range(num_agents):
-                    for k in ["total_loss", "value_loss", "actor_loss", "entropy", "aux_loss"]:
-                        to_log[f"agent_{i}/{k}"] = np.asarray(metrics["loss_per_agent"][k][i]).item()
+                    to_log[f"agent_{i}/entropy"] = np.asarray(metrics["entropy_per_agent"][i]).item()
 
                 # ── Episode-level metrics (only when episodes returned) ──
                 if metrics["returned_episode"].any():
@@ -1163,6 +1014,12 @@ def make_train(config, env):
                         to_log["overview/shared_reward"] = mean_return
                         # Backward-compatible alias for older dashboards.
                         to_log["overview/avg_reward"] = mean_return
+                        # The quantity the centralized critic actually predicts.
+                        to_log["overview/central_episode_return"] = (
+                            float(np.sum(all_agent_returns))
+                            if reward_aggregation == "sum"
+                            else mean_return
+                        )
 
                     # Per-agent and overview movement (mean walking distance over returned episodes)
                     all_walk = []
@@ -1283,7 +1140,8 @@ def make_train(config, env):
 
 
         # Do one "step" of logging, writing the result to a file.
-        # Several steps can be run in series using --logging_steps_per_viz to do long rollouts without hitting memory limits
+        # Several steps can be run in series using LOGGING_NUM_CALLS to do long
+        # rollouts without hitting memory limits.
         def _logging_step(carry, unused, logging_threads, update_step, effective_cap=None):
             runner_state, episode_count = carry
             runner_state = _apply_episode_cap_to_runner_state(runner_state, effective_cap)
@@ -1299,14 +1157,13 @@ def make_train(config, env):
 
             save_hstates = config.get("SAVE_HIDDEN_STATES", False)
             if save_hstates:
+                # ONE shared hidden state: (T, NUM_ENVS, hidden_dim)
                 hidden_states = traj_batch.info['hidden_state']
-                # In seperate_ippo_rnn, hidden_states already has shape (T, num_agents, NUM_ENVS, hidden_dim)
-                # No reshape needed - it's already in the correct format
             # Null this for memory savings
             traj_batch.info['hidden_state'] = None
 
             # Compute a pseudo episode_id from cumulative done flags
-            # done shape: (T, num_agents, NUM_ENVS)  (network output field)
+            # done shape: (T, num_agents, NUM_ENVS)  (replicated global done)
             # episode_count shape: (num_agents, NUM_ENVS) — carried across logging steps
             # Shift by 1 so the done step itself still belongs to the old episode
             done_shifted = jnp.concatenate([
@@ -1318,7 +1175,10 @@ def make_train(config, env):
             # Update episode_count for next logging step: add total dones in this chunk
             episode_count = episode_count + traj_batch.info['done'].sum(axis=0).astype(episode_count.dtype)
 
-            # Add new logging fields here
+            # Add new logging fields here.
+            # NOTE: `value` is the single global V(s) repeated per agent, and
+            # `log_prob` / `entropy` are that agent's action-head marginals;
+            # `joint_log_prob` is the log-probability of the full joint action.
             fields_to_log = ['health', 'food', 'drink', 'energy', 'done', 'is_sleeping', 'is_resting',
                              'player_position_x',
                              'player_position_y', 'recover', 'hunger', 'thirst', 'fatigue', 'light_level',
@@ -1329,46 +1189,14 @@ def make_train(config, env):
                              'trade_give_partner_id', 'trade_receive_partner_id',
                              'revive_as_reviver', 'revive_as_revived', 'revive_partner_id', 'auto_respawned',
                              'delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y',
-                             ] + ([f'{k}_{j}' for j in range(_agents_per_team)
-                                   for k in ('delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y')]
-                                  if _use_teammate_aux else []) + [
                              'num_monsters_killed',
                              'has_sword', 'has_pick', 'bow', 'arrows', 'held_iron', 'value',
-                             'entropy', 'log_prob', 'episode_id',
+                             'entropy', 'log_prob', 'joint_log_prob', 'episode_id',
                             ]
 
-            # Callback function for logging hidden states
-            def write_rnn_hstate(hstate, scalars, increment=0, agent_n=0):
-                # This agent's carry over the logged steps.
-                #   gru         (T, num_envs, hidden_dim)          -> one row per step
-                #   transformer (T, num_envs, max_history, d_model + 1)
-                # The transformer window is flattened row-major into a single wide
-                # row per step: slot-major, oldest slot first, each slot's last
-                # column being its validity flag.
-                if hstate is not None:
-                    hstate = np.asarray(hstate)
-                    if hstate.ndim > 3:
-                        hstate = hstate.reshape(hstate.shape[0], hstate.shape[1], -1)
+            header_field_names = list(fields_to_log)
 
-                header_field_names = ['health', 'food', 'drink', 'energy', 'done', 'is_sleeping', 'is_resting',
-                                      'player_position_x',
-                                      'player_position_y', 'recover', 'hunger', 'thirst', 'fatigue', 'light_level',
-                                      'dist_to_melee_l1',
-                                      'melee_on_screen', 'dist_to_passive_l1', 'passive_on_screen', 'dist_to_ranged_l1',
-                                      'ranged_on_screen', 'num_melee_nearby', 'num_passives_nearby',
-                                      'num_ranged_nearby',
-                                      'trade_give', 'trade_receive', 'trade_give_material_id', 'trade_receive_material_id',
-                                      'trade_give_partner_id', 'trade_receive_partner_id',
-                                      'revive_as_reviver', 'revive_as_revived', 'revive_partner_id', 'auto_respawned',
-                                      'delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y',
-                                      ] + ([f'{k}_{j}' for j in range(_agents_per_team)
-                                            for k in ('delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y')]
-                                           if _use_teammate_aux else []) + [
-                                      'num_monsters_killed',
-                                      'has_sword',
-                                      'has_pick', 'bow', 'arrows', 'held_iron', 'value', 'entropy', 'log_prob', 'episode_id',
-                                        ]
-
+            def write_scalars(scalars, increment=0, agent_n=0):
                 run_out_path = get_run_output_dir()
                 os.makedirs(run_out_path, exist_ok=True)
                 temp_dir = os.path.join(run_out_path, '.tmp')
@@ -1381,22 +1209,6 @@ def make_train(config, env):
                 # Keep temp files local to this run so different runs can share an
                 # OUTPUT_DIR root without colliding.
                 for i in range(logging_threads):
-                    # Only save hidden states if enabled (they are very large)
-                    if hstate is not None:
-                        out_filename_hstates = os.path.join(run_out_path, 'hstates_{}_{}_{}.csv'.format(increment, agent_n, i))
-                        with tempfile.NamedTemporaryFile(mode='w+', dir=temp_dir, suffix='.csv', delete=False) as temp_handle:
-                            temp_filename = temp_handle.name
-                        try:
-                            np.savetxt(temp_filename,
-                                       hstate[:, i, :], delimiter=',')
-                            with open(temp_filename, 'r', encoding='utf-8') as temp_file, open(out_filename_hstates, 'a+', encoding='utf-8') as out_file_hstates:
-                                out_file_hstates.write(temp_file.read())
-                        finally:
-                            if os.path.exists(temp_filename):
-                                os.remove(temp_filename)
-                        print('Writing log file', out_filename_hstates)
-
-                    # Always save scalars
                     out_filename_scalars = os.path.join(run_out_path, 'scalars_{}_{}_{}.csv'.format(increment, agent_n, i))
                     with tempfile.NamedTemporaryFile(mode='w+', dir=temp_dir, suffix='.csv', delete=False) as temp_handle:
                         temp_filename = temp_handle.name
@@ -1412,16 +1224,44 @@ def make_train(config, env):
                             os.remove(temp_filename)
                     print('Writing log file', out_filename_scalars)
 
-            # Add the specified field to the logging array
-            # In seperate_ippo_rnn:
-            # - Network outputs (action, done, value, entropy, log_prob) have shape (T, num_agents, NUM_ENVS)
-            # - Environment fields (health, food, etc.) have shape (T, NUM_ENVS, num_agents)
-            network_output_fields = {'value', 'entropy', 'log_prob', 'done', 'action', 'episode_id',
-                                     'delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y'} | (
-                                     {f'{k}_{j}' for j in range(_agents_per_team)
-                                      for k in ('delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y')}
-                                     if _use_teammate_aux else set())
-            
+            def write_hstates(hstate, increment=0):
+                """The recurrent state is shared by the whole team, so it is written
+                once per logged env rather than once per agent.
+
+                GRU carry is (T, num_envs, hidden_dim) -> one row per step.  The
+                transformer carry is (T, num_envs, max_history, d_model + 1), so
+                the window is flattened row-major into a single wide row per step:
+                slot-major, oldest slot first, each slot's last column being its
+                validity flag.
+                """
+                hstate = np.asarray(hstate)
+                if hstate.ndim > 3:
+                    hstate = hstate.reshape(hstate.shape[0], hstate.shape[1], -1)
+                run_out_path = get_run_output_dir()
+                os.makedirs(run_out_path, exist_ok=True)
+                temp_dir = os.path.join(run_out_path, '.tmp')
+                os.makedirs(temp_dir, exist_ok=True)
+                for i in range(logging_threads):
+                    out_filename_hstates = os.path.join(run_out_path, 'hstates_{}_central_{}.csv'.format(increment, i))
+                    with tempfile.NamedTemporaryFile(mode='w+', dir=temp_dir, suffix='.csv', delete=False) as temp_handle:
+                        temp_filename = temp_handle.name
+                    try:
+                        np.savetxt(temp_filename, hstate[:, i, :], delimiter=',')
+                        with open(temp_filename, 'r', encoding='utf-8') as temp_file, open(out_filename_hstates, 'a+', encoding='utf-8') as out_file_hstates:
+                            out_file_hstates.write(temp_file.read())
+                    finally:
+                        if os.path.exists(temp_filename):
+                            os.remove(temp_filename)
+                    print('Writing log file', out_filename_hstates)
+
+            # Add the specified field to the logging array.
+            # Network outputs (action, done, value, entropy, log_prob, ...) have
+            # shape (T, num_agents, NUM_ENVS); environment fields coming from the
+            # wrappers have shape (T, NUM_ENVS, num_agents).
+            network_output_fields = {'value', 'entropy', 'log_prob', 'joint_log_prob', 'done',
+                                     'action', 'episode_id',
+                                     'delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y'}
+
             def add_field_to_log_array(info_dict, log_array, field_key, agent_to_log):
                 field_value = info_dict[field_key]
                 # Select the current agent if this is a per-agent field
@@ -1439,9 +1279,7 @@ def make_train(config, env):
 
                 return log_array
 
-            # Assemble logging variable array
-            # In seperate_ippo_rnn, network outputs already have shape (T, num_agents, NUM_ENVS)
-            # No reshape needed - shapes are already correct
+            # Assemble logging variable array — one CSV per agent, as before
             for agent_n in range(env.num_agents):
                 # Network outputs have shape (T, num_agents, NUM_ENVS) - extract agent_n -> (T, NUM_ENVS)
                 log_array = traj_batch.info['action'][:, agent_n, :].reshape((traj_batch.info['action'].shape[0], config['NUM_ENVS'], 1))
@@ -1449,13 +1287,13 @@ def make_train(config, env):
                 for field_to_log in fields_to_log:
                     log_array = add_field_to_log_array(traj_batch.info, log_array, field_to_log, agent_n)
 
-                # Extract hidden states only for this agent if saving is enabled
-                if save_hstates:
-                    agent_hidden_states = hidden_states[:, agent_n]
-                else:
-                    agent_hidden_states = None
                 jax.experimental.io_callback(
-                    write_rnn_hstate, None, agent_hidden_states, log_array, update_step, agent_n, ordered=True
+                    write_scalars, None, log_array, update_step, agent_n, ordered=True
+                )
+
+            if save_hstates:
+                jax.experimental.io_callback(
+                    write_hstates, None, hidden_states, update_step, ordered=True
                 )
 
             return (runner_state, episode_count), None
@@ -1486,38 +1324,33 @@ def make_train(config, env):
             """One env step for a single environment for video recording.
 
             Uses only 1 env instead of NUM_ENVS.  Rendered frames are streamed
-            to the host via jax.debug.callback so that jax.lax.scan does NOT
+            to the host via io_callback so that jax.lax.scan does NOT
             accumulate them in GPU memory (saves several GB).
             """
             train_state, env_state, last_obs, last_done, hstate, rng = runner_state
 
             # SELECT ACTION
             rng, _rng = jax.random.split(rng)
-            obs_batch = batchify(last_obs, env.agents)       # (num_agents, 1, obs_dim)
-            done_batch_in = batchify(last_done, env.agents)  # (num_agents, 1)
+            obs_batch = global_obs(last_obs)  # (1, global_obs_dim)
 
-            def forward_single_agent(params, hs, obs, done):
-                ac_in = (obs[np.newaxis, :], done[np.newaxis, :])
-                return network.apply({"params": params}, hs, ac_in)
-
-            hstate, pi, value, aux_pred = jax.vmap(forward_single_agent)(
+            hstate, pi, value, aux_pred = forward(
                 train_state.params,
-                hstate,          # (num_agents, 1, hidden_dim)
-                obs_batch,       # (num_agents, 1, obs_dim)
-                done_batch_in,   # (num_agents, 1)
+                hstate,                    # (1, hidden_dim)
+                obs_batch[np.newaxis, :],  # (1, 1, global_obs_dim)
+                last_done[np.newaxis, :],  # (1, 1)
             )
 
             if action_mask_while_dead:
-                alive_batch = compute_alive_mask(env_state)
-                masked_logits = apply_dead_action_mask(pi.logits, alive_batch[:, None, :])
+                alive_batch = compute_alive_mask(env_state)  # (1, num_agents)
+                masked_logits = apply_dead_action_mask(pi.logits, alive_batch[np.newaxis, :])
                 pi = distrax.Categorical(logits=masked_logits)
 
-            action = pi.sample(seed=_rng)    # (num_agents, 1, 1)
-            action = action.squeeze(axis=1)  # (num_agents, 1)
+            action = pi.sample(seed=_rng)    # (1, 1, num_agents)
+            action = action.squeeze(axis=0)  # (1, num_agents)
 
-            # Note: no extra squeeze on env_act values — keeps the (1,) batch dim for vmap
+            # Index instead of squeeze — keeps the (1,) batch dim for vmap
             env_action = policy_action_to_env_action(action)
-            env_act = unbatchify(env_action, env.agents)  # {agent: (1,)}
+            env_act = {a: env_action[:, i] for i, a in enumerate(env.agents)}
 
             # STEP 1 env (use env_train — video doesn't need CSV fields)
             rng, _rng = jax.random.split(rng)
@@ -1550,7 +1383,7 @@ def make_train(config, env):
             # io_callback guarantees execution order and is not optimised away
             jax.experimental.io_callback(_collect_video_frame, None, ego_frame, full_map_frame, ordered=True)
 
-            runner_state = (train_state, env_state, obsv, done, hstate, rng)
+            runner_state = (train_state, env_state, obsv, done["__all__"], hstate, rng)
             return runner_state, None
 
         def _update_plot(runner_state, unused):
@@ -1591,10 +1424,9 @@ def make_train(config, env):
                 if effective_cap is not None:
                     video_env_state = _patch_episode_cap(video_env_state, effective_cap)
 
-                # Fresh hidden state (1 env) and done flags
-                video_hstate = zero_hstate_all_agents(1)
-                video_done = {a: jnp.zeros((1,), dtype=bool) for a in env.agents}
-                video_done["__all__"] = jnp.zeros((1,), dtype=bool)
+                # Fresh hidden state / attention window (1 env) and done flag
+                video_hstate = zero_hstate(1)
+                video_done = jnp.zeros((1,), dtype=bool)
 
                 # Build video runner state (uses current policy weights)
                 rng_video2, _ = jax.random.split(rng_video)
@@ -1658,31 +1490,6 @@ def make_train(config, env):
 
             runner_state = (state, update_steps)
 
-            # Log model weights
-            def save_weights_callback(weights, iter):
-                weights_flat = jax.tree.flatten(weights)
-                run_out_path = get_run_output_dir()
-                os.makedirs(run_out_path, exist_ok=True)
-                weight_filename = os.path.join(run_out_path, 'weights_{}.csv'.format(iter))
-                weight_file = open(weight_filename, 'w')
-                weights_params = weights['params']
-
-                def save_weight_dict(curr_value, key_string=''):
-                    if type(curr_value) != dict:
-                        np.savetxt(weight_file, np.transpose(curr_value), delimiter=',', fmt='%f', header=key_string)
-                        return True
-                    else:
-                        for key in curr_value.keys():
-                            save_weight_dict(curr_value[key], key_string + '/' + key)
-                    return True
-
-                save_weight_dict(weights_params)
-
-                print('Saving weights in file', weight_filename)
-
-            # TODO make weight saving work
-            #jax.debug.callback(save_weights_callback, runner_state[0].params, runner_state[-1])
-
             # Then, update (training)
             runner_state, metric = jax.lax.scan(
                 _update_step, runner_state, None, config["LOGGING_UPDATES_INTERVAL"]
@@ -1695,7 +1502,7 @@ def make_train(config, env):
             train_state,
             env_state,
             obsv,
-            init_done,  # Keep as dict for consistency with env.step output
+            init_done,
             init_hstate,
             _rng,
         )
@@ -1834,13 +1641,13 @@ def build_env(config):
 
 
 def single_run(config):
-    alg_name = config.get("ALG_NAME", "seperate-ippo-rnn")
+    alg_name = config.get("ALG_NAME", "central-ippo-rnn")
     env_name = config.get("ENV_NAME", "Craftax-Coop-Symbolic")
     env = build_env(config)
 
     if config["NUM_SEEDS"] != 1:
         raise ValueError(
-            "seperate_ippo_rnn currently supports NUM_SEEDS == 1 for reliable logging/video callbacks."
+            "central_ippo_rnn currently supports NUM_SEEDS == 1 for reliable logging/video callbacks."
         )
 
     checkpointing = config.get("CHECKPOINTING", True)

@@ -1,0 +1,159 @@
+# Central (single policy + single critic) counterpart of predators_20_moving.yaml.
+#
+# Every environment / rollout / optimizer key is IDENTICAL to the separate run so
+# the two are directly comparable:
+#   python baselines/seperate_ippo_rnn.py --config_file predators_20_moving.yaml
+#   python baselines/central_ippo_rnn.py  --config_file predators_20_moving_central.yaml
+#
+# Deliberate differences, and only these:
+#   RUN_NAME / ALG_NAME  — separate wandb run + separate checkpoint dir
+#                          (CHECKPOINT_DIR: "" -> ./<RUN_NAME>/checkpoints, so the
+#                          two runs must not share a RUN_NAME)
+#   ENT_COEF             — 0.01 -> 0.0025, see note below
+#   dropped              — USE_TEAMMATE_AUXILIARY_LOSS / AUX_TEAMMATE_WEIGHT
+#                          (meaningless for a controller that observes everything;
+#                          central_ippo_rnn ignores them and warns)
+#   added                — CENTRAL_REWARD_AGGREGATION, AUX_SELF_WEIGHT
+
+# Weights & Biases configuration
+WANDB_MODE: "online"
+ENTITY: ""
+PROJECT: "ForageWorld"
+RUN_NAME: "20 Predators grid - moving passives - CENTRAL"
+DESCRIPTION: "20 Predators.Moving Passives. Fully centralized (single policy + single critic)"
+OUTPUT_DIR: ""
+
+# Environment configuration
+ENV_NAME: "Craftax-Coop-Symbolic"
+MAX_PASSIVE_MOBS: 131
+MAX_MELEE_MOBS: 20
+MAX_RANGED_MOBS: 0
+
+DISABLE_REVIVE: false
+REVIVING_COOLDOWN_STEPS: 50
+ACTION_MASK_WHILE_DEAD: true
+
+SHARED_REWARD: true
+
+TEAMMATE_ALIVE_BONUS: 0.05
+ALL_TEAM_ALIVE_BONUS: 0.2
+DEAD_SELF_PENALTY_WEIGHT: 0.2
+ONE_TIME_DEATH_PENALTY_SHARED: 0.0
+ONE_TIME_DEATH_PENALTY_INDIVIDUAL: 0.0
+WARRIOR_MELEE_KILL_REWARD: 7.5
+FORAGER_MELEE_KILL_REWARD: 0.0  # only warriors rewarded for kills
+WARRIOR_PASSIVE_FOOD_GAIN: 2
+FORAGER_PASSIVE_FOOD_GAIN: 3  # 3 food per eat
+FORAGER_FOOD_CAPACITY: 18  # 18 max food
+FORAGER_PREDATOR_DAMAGE_MULTIPLIER: 1.0  # equal damage to predators on foragers & warriors
+FORAGER_TO_WARRIOR_FOOD_TRADE_REWARD: 1.0
+FORAGER_TO_WARRIOR_DRINK_TRADE_REWARD: 1.0
+
+TRADE_REWARD_REQUIRES_BOTH_OUTSIDE_STARTER_ROOM: true  # No trade reward in starter rooms
+
+ENABLE_AUTO_RESPAWNING: false
+AUTO_RESPAWN_STEPS: 50
+RESTRICT_AUTO_RESPAWNING_TO_SPAWN_ROOM: true
+INITIAL_PREDATORS_SPAWN_IN_WARRIOR_ROOMS_ONLY: true  # Predators start where warrior is
+NON_FORAGER_ALWAYS_IN_LONE_ROOM: true  # Warrior always in lone room, never shares with forager
+PASSIVE_MOBS_STATIC: false #snails do not move if true. boosts sps
+
+
+TRADE_RADIUS: 15
+TRADE_RADIUS_SHAPE: "circle"
+
+EARLY_EPISODE_CAP: 3000
+EARLY_EPISODE_CAP_UNTIL: 25000
+GENERAL_EPISODE_CAP: 9000
+TERMINATE_ON_ANY_DEATH: false
+TERMINATE_ON_ANY_DEATH_OFFSET: 800
+
+NUM_TEAMS: 1
+TEAM_COMPOSITION: [1, 1, 2]
+USE_REDUCED_ACTION_SPACE: true
+
+# Centralization
+# How the 4 per-agent rewards collapse into the single scalar the critic predicts.
+# SHARED_REWARD is true here, so all per-agent rewards are identical and "mean"
+# reproduces the shared reward exactly — the return scale therefore matches the
+# separate run and overview/shared_reward is comparable across the two.
+CENTRAL_REWARD_AGGREGATION: "mean"
+
+# Model parameters
+ALG_NAME: "central-ippo-rnn"
+GRU_HIDDEN_DIM: 512
+FC_DIM_SIZE: 128
+ACTIVATION: "tanh"
+
+# ── Sequence model ──
+# POLICY_ARCH: "gru" (default) or "transformer".
+POLICY_ARCH: "gru"
+
+# Transformer policy hyperparameters (used only when POLICY_ARCH: "transformer").
+# Parameter-matched to the GRU core: with FC_DIM_SIZE=128 / GRU_HIDDEN_DIM=512 the
+# GRU core is 985,088 params and these defaults give 1,016,768 (1.032x).
+TF_MAX_HISTORY: 16        # attention window, in env steps. The carry holds this
+                          #   many past token embeddings; older steps are dropped.
+TF_D_MODEL: 192           # residual stream width. "auto" solves for the width
+                          #   that best matches the GRU parameter count.
+TF_N_LAYERS: 2            # transformer blocks
+TF_N_HEADS: 4             # attention heads; must divide TF_D_MODEL (192/4 = 48)
+TF_MLP_RATIO: 4.0         # FFN hidden width = ratio * TF_D_MODEL (= 768)
+TF_OUT_DIM: null          # output width; null -> GRU_HIDDEN_DIM, so the actor /
+                          #   critic / aux heads are unchanged vs the GRU
+TF_ACTIVATION: "gelu"     # "gelu" | "relu" | "swish"
+TF_NORM_PLACEMENT: "pre"  # "pre" (pre-LN, stable) | "post"
+TF_POS_ENCODING: "learned"  # "learned" | "sinusoidal" | "none"; relative by
+                          #   construction, since the window shifts every step
+TF_QKV_BIAS: true         # bias on the q/k/v/out projections
+TF_ATTN_DROPOUT: 0.0      # must stay 0.0 (no rng plumbing; PPO ratio exactness)
+TF_RESID_DROPOUT: 0.0     # must stay 0.0 (same reason)
+TF_INIT_SCALE: 1.0        # orthogonal gain on the in/out projections
+
+
+# Training parameters
+TOTAL_TIMESTEPS: 2000000000
+NUM_ENVS: 512
+NUM_STEPS: 64
+NUM_MINIBATCHES: 8
+UPDATE_EPOCHS: 4
+GAE_LAMBDA: 0.8
+GAMMA: 0.99
+CLIP_EPS: 0.2
+SCALE_CLIP_EPS: false
+# Joint entropy = sum over the 4 action heads, i.e. ~4x the per-agent entropy the
+# separate runner regularizes. 0.01 / 4 keeps the per-head exploration pressure
+# equal to predators_20_moving.yaml.
+ENT_COEF: 0.0025
+VF_COEF: 0.5
+AUX_COEF: 0.1
+AUX_SELF_WEIGHT: 1.0
+ANNEAL_LR: true
+LR: 0.0002
+MAX_GRAD_NORM: 1.0
+LR_WARMUP: 0.0
+REW_SHAPING_HORIZON: 1000000
+
+# Seed configuration
+NUM_SEEDS: 1
+SEED: 4
+
+# Logging configuration
+LOGGING_UPDATES_INTERVAL: 4000
+LOGGING_NUM_CALLS: 20
+LOGGING_STEPS_PER_CALL: 1024
+LOGGING_THREADS: 1
+
+# Video recording parameters
+SAVE_VIDEO: true
+VIDEO_LENGTH: 1000
+VIDEO_PIXEL_SIZE: 16
+SAVE_HIDDEN_STATES: false
+
+#Checkpointing parameters
+CHECKPOINTING: true
+CHECKPOINT_DIR: ""
+CHECKPOINT_INTERVAL_BLOCKS: 1
+CHECKPOINT_MAX_TO_KEEP: 3
+RESUME: "auto"
+MAX_BLOCKS_THIS_RUN: 0

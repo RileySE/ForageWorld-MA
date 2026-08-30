@@ -1,8 +1,13 @@
+# Tiny smoke-test config for baselines/central_ippo_rnn.py.
+# Mirrors test_seperate_ippo_rnn.yaml so the two runners can be smoke-tested
+# side by side. Exercises the update path, CSV logging, hidden-state saving and
+# video recording in a few seconds.
+
 # Weights & Biases configuration
-WANDB_MODE: "online" # Change to "online" for logging and include appropriate ENTITY and PROJECT arguments
+WANDB_MODE: "disabled" # Change to "online" for logging and include appropriate ENTITY and PROJECT arguments
 ENTITY: ""
 PROJECT: ""
-RUN_NAME: "Test-Seperate-IPPO-RNN"  # Optional run name. Run files go to <OUTPUT_DIR or .>/<RUN_NAME>/<timestamp>_<wandb_run_id>/
+RUN_NAME: "Test-Central-IPPO-Transformer"  # Optional run name. Run files go to <OUTPUT_DIR or .>/<RUN_NAME>/<timestamp>_<wandb_run_id>/
 OUTPUT_DIR: ""  # Optional artifact root. Run files go to <OUTPUT_DIR or .>/<RUN_NAME>/<timestamp>_<wandb_run_id>/
 
 # Environment configuration
@@ -13,7 +18,7 @@ MAX_RANGED_MOBS: 0  # Maximum number of ranged predator mobs allocated/spawnable
 
 DISABLE_REVIVE: false
 REVIVING_COOLDOWN_STEPS: 50
-ACTION_MASK_WHILE_DEAD: false
+ACTION_MASK_WHILE_DEAD: true
 
 SHARED_REWARD: true
 
@@ -46,23 +51,24 @@ NUM_TEAMS: 1
 TEAM_COMPOSITION: [1, 1, 2]  # [FORAGER, FORAGER, WARRIOR] # Specialization values: FORAGER=1, WARRIOR=2, MINER=3
 USE_REDUCED_ACTION_SPACE: true  # If true, use actions 0-24 plus team-local GIVE target actions
 
+# Centralization
+CENTRAL_REWARD_AGGREGATION: "mean"  # "mean" or "sum"
+
 # Model parameters
-ALG_NAME: "seperate-ippo-rnn"
+ALG_NAME: "central-ippo-rnn"
 GRU_HIDDEN_DIM: 16
 FC_DIM_SIZE: 8
 ACTIVATION: "tanh"
 
 # ── Sequence model ──
 # POLICY_ARCH: "gru" (default) or "transformer".
-POLICY_ARCH: "gru"
+POLICY_ARCH: "transformer"
 
 # Transformer policy hyperparameters (used only when POLICY_ARCH: "transformer").
-# These are PER AGENT, and parameter-matched to the per-agent GRU core: with
-# FC_DIM_SIZE=128 / GRU_HIDDEN_DIM=512 the GRU core is 985,088 params and these
-# defaults give 1,016,768 (1.032x).
-TF_MAX_HISTORY: 16        # attention window, in env steps. Each agent's carry
-                          #   holds this many of its own past token embeddings;
-                          #   older steps are dropped.
+# Parameter-matched to the GRU core: with FC_DIM_SIZE=128 / GRU_HIDDEN_DIM=512 the
+# GRU core is 985,088 params and these defaults give 1,016,768 (1.032x).
+TF_MAX_HISTORY: 16        # attention window, in env steps. The carry holds this
+                          #   many past token embeddings; older steps are dropped.
 TF_D_MODEL: 192           # residual stream width. "auto" solves for the width
                           #   that best matches the GRU parameter count.
 TF_N_LAYERS: 2            # transformer blocks
@@ -90,11 +96,10 @@ GAE_LAMBDA: 0.8
 GAMMA: 0.99
 CLIP_EPS: 0.2
 SCALE_CLIP_EPS: false
-ENT_COEF: 0.01
+ENT_COEF: 0.0025  # joint entropy (sum over action heads) -> scaled down vs per-agent runners
 VF_COEF: 0.5
 AUX_COEF: 0.1
-USE_TEAMMATE_AUXILIARY_LOSS: true
-AUX_TEAMMATE_WEIGHT: 0.3333
+AUX_SELF_WEIGHT: 1.0
 ANNEAL_LR: true
 LR: 0.0002
 MAX_GRAD_NORM: 1.0
@@ -108,11 +113,21 @@ LOGGING_STEPS_PER_CALL: 20  # Number of env steps per logging_step call
 LOGGING_THREADS: 1  # Number of env threads to log (must be <= NUM_ENVS) -> set to 1 for less computing time
 
 # Video recording parameters
-SAVE_VIDEO: true             # Whether to record and save videos during logging
+SAVE_VIDEO: false             # Whether to record and save videos during logging
 VIDEO_LENGTH: 20  # Number of env steps per video (rollout continues from current state)
 VIDEO_PIXEL_SIZE: 16  # Pixel size for rendering (7=agent, 16=medium, 64=large)
-SAVE_HIDDEN_STATES: false     # Whether to save hidden state CSVs during logging (large files!)
+SAVE_HIDDEN_STATES: true      # Exercise the hidden-state CSV path in the smoke test
 
 # Seed configuration
 NUM_SEEDS: 1
 SEED: 0
+
+# Checkpointing configuration
+# Off by default so repeated smoke tests don't resume each other. Flip to true
+# (or copy config/test_checkpointing.yaml) to exercise the checkpoint path.
+CHECKPOINTING: false
+CHECKPOINT_DIR: ""
+CHECKPOINT_INTERVAL_BLOCKS: 1
+CHECKPOINT_MAX_TO_KEEP: 3
+RESUME: "auto"
+MAX_BLOCKS_THIS_RUN: 0

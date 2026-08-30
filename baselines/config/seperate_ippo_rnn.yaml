@@ -60,6 +60,34 @@ GRU_HIDDEN_DIM: 512
 FC_DIM_SIZE: 128
 ACTIVATION: "tanh"
 
+# ── Sequence model ──
+# POLICY_ARCH: "gru" (default) or "transformer".
+POLICY_ARCH: "gru"
+
+# Transformer policy hyperparameters (used only when POLICY_ARCH: "transformer").
+# These are PER AGENT, and parameter-matched to the per-agent GRU core: with
+# FC_DIM_SIZE=128 / GRU_HIDDEN_DIM=512 the GRU core is 985,088 params and these
+# defaults give 1,016,768 (1.032x).
+TF_MAX_HISTORY: 16        # attention window, in env steps. Each agent's carry
+                          #   holds this many of its own past token embeddings;
+                          #   older steps are dropped.
+TF_D_MODEL: 192           # residual stream width. "auto" solves for the width
+                          #   that best matches the GRU parameter count.
+TF_N_LAYERS: 2            # transformer blocks
+TF_N_HEADS: 4             # attention heads; must divide TF_D_MODEL (192/4 = 48)
+TF_MLP_RATIO: 4.0         # FFN hidden width = ratio * TF_D_MODEL (= 768)
+TF_OUT_DIM: null          # output width; null -> GRU_HIDDEN_DIM, so the actor /
+                          #   critic / aux heads are unchanged vs the GRU
+TF_ACTIVATION: "gelu"     # "gelu" | "relu" | "swish"
+TF_NORM_PLACEMENT: "pre"  # "pre" (pre-LN, stable) | "post"
+TF_POS_ENCODING: "learned"  # "learned" | "sinusoidal" | "none"; relative by
+                          #   construction, since the window shifts every step
+TF_QKV_BIAS: true         # bias on the q/k/v/out projections
+TF_ATTN_DROPOUT: 0.0      # must stay 0.0 (no rng plumbing; PPO ratio exactness)
+TF_RESID_DROPOUT: 0.0     # must stay 0.0 (same reason)
+TF_INIT_SCALE: 1.0        # orthogonal gain on the in/out projections
+
+
 # Training parameters
 TOTAL_TIMESTEPS: 4000000000
 NUM_ENVS: 512

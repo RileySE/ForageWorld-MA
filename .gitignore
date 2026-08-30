@@ -10,3 +10,4 @@ wandb
 *.mp4
 *.csv
 *.png
+.vscode/**

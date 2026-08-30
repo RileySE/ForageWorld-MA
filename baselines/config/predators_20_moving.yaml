@@ -1,0 +1,168 @@
+# Weights & Biases configuration
+WANDB_MODE: "online"
+ENTITY: ""
+PROJECT: "ForageWorld"
+RUN_NAME: "20 Predators grid - moving passives"
+DESCRIPTION: "20 Predators.Moving Passives"
+OUTPUT_DIR: ""
+
+# Environment configuration
+ENV_NAME: "Craftax-Coop-Symbolic"
+MAX_PASSIVE_MOBS: 131
+MAX_MELEE_MOBS: 20
+MAX_RANGED_MOBS: 0
+
+DISABLE_REVIVE: false
+REVIVING_COOLDOWN_STEPS: 50
+ACTION_MASK_WHILE_DEAD: true
+
+SHARED_REWARD: true
+
+TEAMMATE_ALIVE_BONUS: 0.05
+ALL_TEAM_ALIVE_BONUS: 0.2
+DEAD_SELF_PENALTY_WEIGHT: 0.2
+ONE_TIME_DEATH_PENALTY_SHARED: 0.0
+ONE_TIME_DEATH_PENALTY_INDIVIDUAL: 0.0
+WARRIOR_MELEE_KILL_REWARD: 7.5
+FORAGER_MELEE_KILL_REWARD: 0.0  # only warriors rewarded for kills
+WARRIOR_PASSIVE_FOOD_GAIN: 2
+FORAGER_PASSIVE_FOOD_GAIN: 3  # 3 food per eat
+FORAGER_FOOD_CAPACITY: 18  # 18 max food
+FORAGER_PREDATOR_DAMAGE_MULTIPLIER: 1.0  # equal damage to predators on foragers & warriors
+FORAGER_TO_WARRIOR_FOOD_TRADE_REWARD: 1.0
+FORAGER_TO_WARRIOR_DRINK_TRADE_REWARD: 1.0
+
+TRADE_REWARD_REQUIRES_BOTH_OUTSIDE_STARTER_ROOM: true  # No trade reward in starter rooms
+
+ENABLE_AUTO_RESPAWNING: false
+AUTO_RESPAWN_STEPS: 50
+RESTRICT_AUTO_RESPAWNING_TO_SPAWN_ROOM: true
+INITIAL_PREDATORS_SPAWN_IN_WARRIOR_ROOMS_ONLY: true  # Predators start where warrior is
+NON_FORAGER_ALWAYS_IN_LONE_ROOM: true  # Warrior always in lone room, never shares with forager
+PASSIVE_MOBS_STATIC: false #snails do not move if true. boosts sps
+
+
+TRADE_RADIUS: 15
+TRADE_RADIUS_SHAPE: "circle"
+
+EARLY_EPISODE_CAP: 3000
+EARLY_EPISODE_CAP_UNTIL: 25000
+GENERAL_EPISODE_CAP: 9000
+TERMINATE_ON_ANY_DEATH: false
+TERMINATE_ON_ANY_DEATH_OFFSET: 800
+
+NUM_TEAMS: 1
+TEAM_COMPOSITION: [1, 1, 2]
+USE_REDUCED_ACTION_SPACE: true
+
+# Model parameters
+ALG_NAME: "ippo-rnn"
+GRU_HIDDEN_DIM: 512
+FC_DIM_SIZE: 128
+ACTIVATION: "tanh"
+
+# ── Sequence model ──
+# POLICY_ARCH: "gru" (default), "transformer", or "agalite".
+POLICY_ARCH: "gru"
+
+# Transformer policy hyperparameters (used only when POLICY_ARCH: "transformer").
+# These are PER AGENT, and parameter-matched to the per-agent GRU core: with
+# FC_DIM_SIZE=128 / GRU_HIDDEN_DIM=512 the GRU core is 985,088 params and these
+# defaults give 1,016,768 (1.032x).
+TF_MAX_HISTORY: 16        # attention window, in env steps. Each agent's carry
+                          #   holds this many of its own past token embeddings;
+                          #   older steps are dropped.
+TF_D_MODEL: 192           # residual stream width. "auto" solves for the width
+                          #   that best matches the GRU parameter count.
+TF_N_LAYERS: 2            # transformer blocks
+TF_N_HEADS: 4             # attention heads; must divide TF_D_MODEL (192/4 = 48)
+TF_MLP_RATIO: 4.0         # FFN hidden width = ratio * TF_D_MODEL (= 768)
+TF_OUT_DIM: null          # output width; null -> GRU_HIDDEN_DIM, so the actor /
+                          #   critic / aux heads are unchanged vs the GRU
+TF_ACTIVATION: "gelu"     # "gelu" | "relu" | "swish"
+TF_NORM_PLACEMENT: "pre"  # "pre" (pre-LN, stable) | "post"
+TF_POS_ENCODING: "learned"  # "learned" | "sinusoidal" | "none"; relative by
+                          #   construction, since the window shifts every step
+TF_QKV_BIAS: true         # bias on the q/k/v/out projections
+TF_ATTN_DROPOUT: 0.0      # must stay 0.0 (no rng plumbing; PPO ratio exactness)
+TF_RESID_DROPOUT: 0.0     # must stay 0.0 (same reason)
+TF_INIT_SCALE: 1.0        # orthogonal gain on the in/out projections
+
+# AGaLiTe policy hyperparameters (used only when POLICY_ARCH: "agalite").
+# These are the paper's Craftax architecture -- Pramanik, Elelimy, Machado &
+# White, "AGaLiTe: Approximate Gated Linear Transformers for Online RL", TMLR
+# 10/2024, Table 4 (AGaLiTe column) + Section 5 "Craftax" -- which is also
+# exactly what the authors' released config_pure/craftax/arelit.yaml runs.
+# These are PER AGENT.  Unlike the transformer there is NO context window: the
+# carry summarises the agent's whole episode at fixed size.
+AG_N_LAYERS: 4       # L: GTrXL-style blocks
+AG_D_MODEL: 128      # d: residual stream width
+AG_D_HEAD: 64        # dh: per-head dim (independent of AG_D_MODEL)
+AG_N_HEADS: 4        # attention heads
+AG_D_FFC: 128        # FFN hidden width (the paper's config uses d, not 4*d)
+AG_ETA: 8            # eta: feature-map factor -> key/query dim = eta*dh = 512.
+                     #   AG_ETA: 4 is the paper's other value; it halves the carry.
+AG_R: 2              # number of cosine terms in the low-rank state approximation.
+                     #   This follows the AUTHORS' CODE, where r counts the
+                     #   vectors; the paper's Algorithm 4 runs i = 0..r, i.e.
+                     #   r + 1 vectors.  So AG_R: 2 IS the paper's r = 1.
+AG_GRU_BIAS: 2.0     # b_g init for the two GTrXL gates per block
+AG_RESET_ON_TERMINATE: true  # zero the recurrent state on an episode boundary
+AG_OUT_DIM: null     # null -> the stack emits AG_D_MODEL (128), like the
+                     #   reference.  Set 512 to project up to GRU_HIDDEN_DIM so
+                     #   the actor / critic / aux heads see the GRU's width.
+AG_EPS: 1.0e-5       # floor on the 2*r*(s.q) denominator
+AG_STABLE_PHASE: true  # evaluate cos(w t) by folding the phase into [0, 2pi).
+                     #   Identical in exact arithmetic, and float32-exact for
+                     #   AG_R: 2 at the t ~ 4e6 a 2e9-step run reaches, where the
+                     #   reference's cos(t*w) has lost the phase completely.
+                     #   false = bit-for-bit reference behaviour.
+# Memory note: the per-env carry is 26,625 floats vs the GRU's 512, so
+# init_hstate is ~218 MB at NUM_ENVS: 512 x 4 agents (the GRU's is ~4 MB), and
+# it is held in a few copies during the PPO update.  AG_ETA: 4 halves it.
+
+
+# Training parameters
+TOTAL_TIMESTEPS: 2000000000
+NUM_ENVS: 512
+NUM_STEPS: 64
+NUM_MINIBATCHES: 8
+UPDATE_EPOCHS: 4
+GAE_LAMBDA: 0.8
+GAMMA: 0.99
+CLIP_EPS: 0.2
+SCALE_CLIP_EPS: false
+ENT_COEF: 0.01
+VF_COEF: 0.5
+AUX_COEF: 0.1
+USE_TEAMMATE_AUXILIARY_LOSS: false
+AUX_TEAMMATE_WEIGHT: 0.3333
+ANNEAL_LR: true
+LR: 0.0002
+MAX_GRAD_NORM: 1.0
+LR_WARMUP: 0.0
+REW_SHAPING_HORIZON: 1000000
+
+# Seed configuration
+NUM_SEEDS: 1
+SEED: 4
+
+# Logging configuration
+LOGGING_UPDATES_INTERVAL: 4000
+LOGGING_NUM_CALLS: 20
+LOGGING_STEPS_PER_CALL: 1024
+LOGGING_THREADS: 1
+
+# Video recording parameters
+SAVE_VIDEO: true
+VIDEO_LENGTH: 1000
+VIDEO_PIXEL_SIZE: 16
+SAVE_HIDDEN_STATES: false
+
+#Checkpointing parameters
+CHECKPOINTING: true
+CHECKPOINT_DIR: ""
+CHECKPOINT_INTERVAL_BLOCKS: 1
+CHECKPOINT_MAX_TO_KEEP: 3
+RESUME: "auto"
+MAX_BLOCKS_THIS_RUN: 0
