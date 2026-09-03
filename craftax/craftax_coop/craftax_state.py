@@ -233,6 +233,9 @@ class EnvParams:
 @struct.dataclass
 class StaticEnvParams:
     map_size: Tuple[int, int] = (96, 96)
+    num_rooms: int = 24
+    min_room_size: int = 5
+    max_room_size: int = 10
     num_levels: int = 9
     player_count: int = 6
 
