@@ -4296,55 +4296,15 @@ def craftax_step(
     dead_self_penalty = params.dead_self_penalty_weight * jnp.logical_not(player_alive).astype(shared_reward.dtype)
     shared_reward = shared_reward - dead_self_penalty
 
-    # One-time death penalties: detect alive->dead transition since last step.
-    just_died = jnp.logical_and(state.player_alive, jnp.logical_not(player_alive))
-
-    # Shared variant: each team member pays the penalty once per teammate that died this step.
-    team_just_died_count = jnp.where(team_mask, just_died[None, :], False).sum(axis=1)
-    shared_reward = shared_reward - (
-        params.one_time_death_penalty_shared
-        * team_just_died_count.astype(shared_reward.dtype)
-    )
-
-    # Individual variant: only the dead agent gets hit (applied to shared path too so dead agent is penalized regardless of sharing mode).
-    one_time_death_penalty_self = (
-        params.one_time_death_penalty_individual
-        * just_died.astype(shared_reward.dtype)
-    )
-    shared_reward = shared_reward - one_time_death_penalty_self
-
-    # Old behavior (global sharing across all agents):
-    # shared_reward = individual_reward.sum().repeat(static_params.player_count)
-
-    # Apply team-level shaping also to individual reward path
-    individual_reward_shaped = individual_reward
-    individual_reward_shaped = individual_reward_shaped + (
-        params.teammate_alive_bonus
-        * extra_alive_teammates.astype(individual_reward_shaped.dtype)
-    )
-    individual_reward_shaped = individual_reward_shaped + params.all_team_alive_bonus * team_all_alive.astype(individual_reward_shaped.dtype)
-    dead_self_penalty_ind = params.dead_self_penalty_weight * jnp.logical_not(player_alive).astype(individual_reward_shaped.dtype)
-    individual_reward_shaped = individual_reward_shaped - dead_self_penalty_ind
-    individual_reward_shaped = individual_reward_shaped - one_time_death_penalty_self.astype(individual_reward_shaped.dtype)
-
-    reward = jax.lax.select(
-        params.shared_reward,
-        shared_reward,
-        individual_reward_shaped
-    )
-
-    # Track cumulative individual reward path and dead streaks.
-    new_individual_reward_return = state.individual_reward_return + individual_reward_shaped.astype(jnp.float32)
     new_consecutive_dead_steps = jnp.where(
         player_alive,
         jnp.zeros_like(state.consecutive_dead_steps),
         state.consecutive_dead_steps + 1,
     )
-
     # Auto-respawn: if an agent stayed dead for auto_respawn_steps, revive it in
-    # place with full stats. If restrict_auto_respawning_to_spawn_room is True,
-    # the agent must be inside its own assigned spawn room for the auto-respawn
-    # to trigger.
+    # place. Food/drink match manual revive (+2, capped); health and energy full.
+    # If restrict_auto_respawning_to_spawn_room is True, the agent must be inside
+    # its own assigned spawn room for the auto-respawn to trigger.
     pos = state.player_position  # (player_count, 2)
     in_own_spawn_room = jnp.logical_and(
         (pos >= state.player_spawn_room_min).all(axis=-1),
@@ -4370,6 +4330,60 @@ def craftax_step(
         ),
     )
 
+    # One-time death penalties: detect alive->dead transition since last step.
+    just_died = jnp.logical_and(state.player_alive, jnp.logical_not(player_alive))
+
+    # Shared variant: each team member pays the penalty once per teammate that died this step.
+    team_just_died_count = jnp.where(team_mask, just_died[None, :], False).sum(axis=1)
+    shared_reward = shared_reward - (
+        params.one_time_death_penalty_shared
+        * team_just_died_count.astype(shared_reward.dtype)
+    )
+
+    # Team penalty for auto-respawns this step (mirrors one-time death penalty).
+    team_auto_respawn_count = jnp.where(team_mask, should_auto_respawn[None, :], False).sum(axis=1)
+    shared_reward = shared_reward - (
+        params.auto_respawn_team_penalty
+        * team_auto_respawn_count.astype(shared_reward.dtype)
+    )
+
+    # Individual variant: only the dead agent gets hit (applied to shared path too so dead agent is penalized regardless of sharing mode).
+    one_time_death_penalty_self = (
+        params.one_time_death_penalty_individual
+        * just_died.astype(shared_reward.dtype)
+    )
+    shared_reward = shared_reward - one_time_death_penalty_self
+
+    # Old behavior (global sharing across all agents):
+    # shared_reward = individual_reward.sum().repeat(static_params.player_count)
+
+    # Apply team-level shaping also to individual reward path
+    individual_reward_shaped = individual_reward
+    individual_reward_shaped = individual_reward_shaped + (
+        params.teammate_alive_bonus
+        * extra_alive_teammates.astype(individual_reward_shaped.dtype)
+    )
+    individual_reward_shaped = individual_reward_shaped + params.all_team_alive_bonus * team_all_alive.astype(individual_reward_shaped.dtype)
+    dead_self_penalty_ind = params.dead_self_penalty_weight * jnp.logical_not(player_alive).astype(individual_reward_shaped.dtype)
+    individual_reward_shaped = individual_reward_shaped - dead_self_penalty_ind
+    individual_reward_shaped = individual_reward_shaped - one_time_death_penalty_self.astype(individual_reward_shaped.dtype)
+    individual_reward_shaped = individual_reward_shaped - (
+        params.auto_respawn_team_penalty
+        * team_auto_respawn_count.astype(individual_reward_shaped.dtype)
+    )
+
+    reward = jax.lax.select(
+        params.shared_reward,
+        shared_reward,
+        individual_reward_shaped
+    )
+
+    # Track cumulative individual reward path and dead streaks.
+    new_individual_reward_return = state.individual_reward_return + individual_reward_shaped.astype(jnp.float32)
+
+    revive_food_amount = jnp.asarray(2, dtype=state.player_food.dtype)
+    revive_drink_amount = jnp.asarray(2, dtype=state.player_drink.dtype)
+
     new_player_health = jnp.where(
         should_auto_respawn,
         get_max_health(state).astype(state.player_health.dtype),
@@ -4377,12 +4391,16 @@ def craftax_step(
     )
     new_player_food = jnp.where(
         should_auto_respawn,
-        get_max_food(state, params).astype(state.player_food.dtype),
+        jnp.minimum(
+            state.player_food + revive_food_amount, get_max_food(state, params)
+        ).astype(state.player_food.dtype),
         state.player_food,
     )
     new_player_drink = jnp.where(
         should_auto_respawn,
-        get_max_drink(state).astype(state.player_drink.dtype),
+        jnp.minimum(
+            state.player_drink + revive_drink_amount, get_max_drink(state)
+        ).astype(state.player_drink.dtype),
         state.player_drink,
     )
     new_player_energy = jnp.where(
