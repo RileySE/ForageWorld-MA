@@ -59,18 +59,21 @@ def generate_dungeon(rng, static_params, config):
     chunk_size = 16
     world_chunk_width = static_params.map_size[0] // chunk_size
     world_chunk_height = static_params.map_size[1] // chunk_size
+    num_rooms = static_params.num_rooms
+    min_room_size = static_params.min_room_size
+    max_room_size = static_params.max_room_size
     room_occupancy_chunks = jnp.ones(world_chunk_width * world_chunk_height)
 
     rng, _rng, __rng = jax.random.split(rng, 3)
     room_sizes = jax.random.randint(
-        __rng, shape=(NUM_ROOMS, 2), minval=MIN_ROOM_SIZE, maxval=MAX_ROOM_SIZE
+        __rng, shape=(num_rooms, 2), minval=min_room_size, maxval=max_room_size
     )
 
     map = jnp.ones(static_params.map_size, dtype=jnp.int32) * BlockType.WALL.value
-    padded_map = jnp.pad(map, MAX_ROOM_SIZE, constant_values=0)
+    padded_map = jnp.pad(map, max_room_size, constant_values=0)
 
     item_map = jnp.zeros(static_params.map_size, dtype=jnp.int32)
-    padded_item_map = jnp.pad(item_map, MAX_ROOM_SIZE, constant_values=0)
+    padded_item_map = jnp.pad(item_map, max_room_size, constant_values=0)
 
     def _add_room(carry, room_index):
         block_map, item_map, room_occupancy_chunks, rng = carry
@@ -88,20 +91,20 @@ def generate_dungeon(rng, static_params, config):
                 (room_chunk % world_chunk_height) * chunk_size,
                 (room_chunk // world_chunk_height) * chunk_size,
             ]
-        ) + jnp.array([MAX_ROOM_SIZE, MAX_ROOM_SIZE])
+        ) + jnp.array([max_room_size, max_room_size])
         rng, _rng = jax.random.split(rng)
         room_position += jax.random.randint(
-            _rng, (2,), minval=0, maxval=chunk_size - MIN_ROOM_SIZE
+            _rng, (2,), minval=0, maxval=chunk_size - min_room_size
         )
 
         slice = jax.lax.dynamic_slice(
-            block_map, room_position, (MAX_ROOM_SIZE, MAX_ROOM_SIZE)
+            block_map, room_position, (max_room_size, max_room_size)
         )
-        xs = jnp.expand_dims(jnp.arange(MAX_ROOM_SIZE), axis=-1).repeat(
-            MAX_ROOM_SIZE, axis=-1
+        xs = jnp.expand_dims(jnp.arange(max_room_size), axis=-1).repeat(
+            max_room_size, axis=-1
         )
-        ys = jnp.expand_dims(jnp.arange(MAX_ROOM_SIZE), axis=0).repeat(
-            MAX_ROOM_SIZE, axis=0
+        ys = jnp.expand_dims(jnp.arange(max_room_size), axis=0).repeat(
+            max_room_size, axis=0
         )
 
         room_mask = jnp.logical_and(
@@ -171,7 +174,7 @@ def generate_dungeon(rng, static_params, config):
     (padded_map, padded_item_map, _, _), room_positions = jax.lax.scan(
         _add_room,
         (padded_map, padded_item_map, room_occupancy_chunks, _rng),
-        jnp.arange(NUM_ROOMS),
+        jnp.arange(num_rooms),
     )
 
     corridor_width = static_params.corridor_width
@@ -183,7 +186,7 @@ def generate_dungeon(rng, static_params, config):
 
         rng, _rng = jax.random.split(rng)
         sink_index = jax.random.choice(
-            _rng, jnp.arange(NUM_ROOMS), p=included_rooms_mask
+            _rng, jnp.arange(num_rooms), p=included_rooms_mask
         )
         path_sink = room_positions[sink_index]
 
@@ -258,12 +261,12 @@ def generate_dungeon(rng, static_params, config):
         return (cmap, included_rooms_mask, _rng), None
 
     rng, _rng = jax.random.split(rng)
-    included_rooms_mask = jnp.zeros(NUM_ROOMS, dtype=bool).at[-1].set(True)
+    included_rooms_mask = jnp.zeros(num_rooms, dtype=bool).at[-1].set(True)
     (
         (padded_map, _, _),
         _,
     ) = jax.lax.scan(
-        _add_path, (padded_map, included_rooms_mask, _rng), jnp.arange(0, NUM_ROOMS)
+        _add_path, (padded_map, included_rooms_mask, _rng), jnp.arange(0, num_rooms)
     )
 
     # Place special block in a random room
@@ -272,9 +275,9 @@ def generate_dungeon(rng, static_params, config):
         special_block_position[0], special_block_position[1]
     ].set(config.special_block)
 
-    map = padded_map[MAX_ROOM_SIZE:-MAX_ROOM_SIZE, MAX_ROOM_SIZE:-MAX_ROOM_SIZE]
+    map = padded_map[max_room_size:-max_room_size, max_room_size:-max_room_size]
     item_map = padded_item_map[
-        MAX_ROOM_SIZE:-MAX_ROOM_SIZE, MAX_ROOM_SIZE:-MAX_ROOM_SIZE
+        max_room_size:-max_room_size, max_room_size:-max_room_size
     ]
 
     # Visual stuff
@@ -312,10 +315,10 @@ def generate_dungeon(rng, static_params, config):
     # Place SNAIL_SPAWN tiles per room with configured probability.
     # Each selected room gets exactly one inner PATH tile converted to SNAIL_SPAWN.
     rng, _rng = jax.random.split(rng)
-    room_snail_rolls = jax.random.uniform(_rng, shape=(NUM_ROOMS,))
+    room_snail_rolls = jax.random.uniform(_rng, shape=(num_rooms,))
     room_has_snail = room_snail_rolls < config.snail_spawn_room_probability
     # Unpad room positions to map coordinates
-    unpadded_positions = room_positions - MAX_ROOM_SIZE
+    unpadded_positions = room_positions - max_room_size
 
     def _mark_room_snail(carry, room_index):
         current_map, room_rng = carry
@@ -356,7 +359,7 @@ def generate_dungeon(rng, static_params, config):
         current_map = current_map.at[tile_r, tile_c].set(new_val)
         return (current_map, room_rng), None
 
-    (map, _), _ = jax.lax.scan(_mark_room_snail, (map, rng), jnp.arange(NUM_ROOMS))
+    (map, _), _ = jax.lax.scan(_mark_room_snail, (map, rng), jnp.arange(num_rooms))
 
     light_map = jnp.ones(static_params.map_size, dtype=jnp.float32)
 
@@ -368,7 +371,7 @@ def generate_dungeon(rng, static_params, config):
     ladders_up = get_ladder_positions(_rng, static_params, config, map)
 
     # Convert room positions from padded to unpadded coordinates
-    unpadded_room_positions = room_positions - MAX_ROOM_SIZE  # (NUM_ROOMS, 2)
+    unpadded_room_positions = room_positions - max_room_size  # (num_rooms, 2)
 
     return map, item_map, light_map, ladders_down, ladders_up, unpadded_room_positions, room_sizes
 
@@ -554,6 +557,7 @@ def generate_world(rng, params, static_params):
     # proximity maps to push water/mountains away).  Place it at map centre;
     # the real spawn will be chosen after map generation from PATH tiles.
     map_h, map_w = static_params.map_size[0], static_params.map_size[1]
+    num_rooms = static_params.num_rooms
     temp_center = jnp.array([map_h // 2, map_w // 2])
     temp_player_position = jnp.tile(temp_center, (static_params.player_count, 1))
 
@@ -591,12 +595,12 @@ def generate_world(rng, params, static_params):
     required_spawn_rooms = (
         3 if has_non_forager_lone_room else 2
     ) * static_params.num_teams
-    if required_spawn_rooms > NUM_ROOMS:
+    if required_spawn_rooms > num_rooms:
         rooms_per_team = 3 if has_non_forager_lone_room else 2
         raise ValueError(
             f"spawn layout requires {required_spawn_rooms} rooms "
             f"({rooms_per_team} per team for {static_params.num_teams} teams), "
-            f"but only {NUM_ROOMS} rooms are available."
+            f"but only {num_rooms} rooms are available."
         )
 
     # Fix player specializations from team_composition config
@@ -642,8 +646,8 @@ def generate_world(rng, params, static_params):
     # dungeon_results = (maps, item_maps, light_maps, ladders_down, ladders_up, room_positions, room_sizes)
     d_maps, d_item_maps, d_light_maps, d_ladders_down, d_ladders_up, dungeon_room_positions, dungeon_room_sizes = dungeon_results
     dungeons = (d_maps, d_item_maps, d_light_maps, d_ladders_down, d_ladders_up)
-    # dungeon_room_positions: (3, NUM_ROOMS, 2) top-left corner of each room (unpadded)
-    # dungeon_room_sizes:     (3, NUM_ROOMS, 2) (height, width) of each room
+    # dungeon_room_positions: (3, num_rooms, 2) top-left corner of each room (unpadded)
+    # dungeon_room_sizes:     (3, num_rooms, 2) (height, width) of each room
 
     # Returns stacked versions of the map, item_map, light_map and ladders
     # 9 elements in each of these stacks representing each of the levels.
@@ -658,11 +662,11 @@ def generate_world(rng, params, static_params):
 
     # --- Phase 2: Pick team spawn positions inside ROOMS on the start level ---
     START_LEVEL = 2  # First dungeon level (dungeon index 0)
-    start_room_positions = dungeon_room_positions[0]  # (NUM_ROOMS, 2) top-left corners
-    start_room_sizes = dungeon_room_sizes[0]          # (NUM_ROOMS, 2) (h, w)
+    start_room_positions = dungeon_room_positions[0]  # (num_rooms, 2) top-left corners
+    start_room_sizes = dungeon_room_sizes[0]          # (num_rooms, 2) (h, w)
 
     # Compute room centers
-    room_centers = start_room_positions + start_room_sizes // 2  # (NUM_ROOMS, 2)
+    room_centers = start_room_positions + start_room_sizes // 2  # (num_rooms, 2)
 
     # Pick two forager rooms per team, plus an optional third lone room for
     # non-foragers. All chosen rooms are kept far from one another and from
@@ -672,7 +676,7 @@ def generate_world(rng, params, static_params):
     # Pairwise room distances (computed once, used inside the scan closure)
     all_dists = jnp.sqrt(
         ((room_centers[:, None, :] - room_centers[None, :, :]).astype(jnp.float32) ** 2).sum(axis=-1)
-    )  # (NUM_ROOMS, NUM_ROOMS)
+    )  # (num_rooms, num_rooms)
 
     def _pick_spawn_room(rng_choice, used_mask):
         min_dist_to_used = jnp.where(
@@ -690,7 +694,7 @@ def generate_world(rng, params, static_params):
             unused.astype(jnp.float32),
         )
         probs = probs / jnp.maximum(probs.sum(), 1.0)
-        room_idx = jax.random.choice(rng_choice, NUM_ROOMS, p=probs)
+        room_idx = jax.random.choice(rng_choice, num_rooms, p=probs)
         return used_mask.at[room_idx].set(True), room_idx
 
     rng, _rng_ra, _rng_rb, _rng_rc, _rng_non_forager = jax.random.split(rng, 5)
@@ -714,7 +718,7 @@ def generate_world(rng, params, static_params):
     )
 
     def _pick_team_rooms(carry, team_idx):
-        used_mask = carry  # (NUM_ROOMS,) bool: rooms already taken
+        used_mask = carry  # (num_rooms,) bool: rooms already taken
         rng_a = team_rngs_a[team_idx]
         rng_b = team_rngs_b[team_idx]
         rng_c = team_rngs_c[team_idx]
@@ -728,7 +732,7 @@ def generate_world(rng, params, static_params):
 
         return used_with_ab, jnp.stack([room_idx_a, room_idx_b, room_idx_b])
 
-    init_used = jnp.zeros(NUM_ROOMS, dtype=bool)
+    init_used = jnp.zeros(num_rooms, dtype=bool)
     _, team_room_groups = jax.lax.scan(_pick_team_rooms, init_used, jnp.arange(num_teams))
     # team_room_groups: (num_teams, 3) — [room_A_idx, room_B_idx, room_C_idx]
     # room C is the lone non-forager room when enabled; otherwise it mirrors room B.

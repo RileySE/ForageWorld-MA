@@ -1659,12 +1659,19 @@ def build_env(config):
     auto_respawn_steps = int(config.get("AUTO_RESPAWN_STEPS", 50))
     restrict_auto_respawning_to_spawn_room = config.get("RESTRICT_AUTO_RESPAWNING_TO_SPAWN_ROOM", True)
     auto_respawn_team_penalty = config.get("AUTO_RESPAWN_TEAM_PENALTY", 0.0)
+    num_rooms = config.get("NUM_ROOMS", 24)
+    min_room_size = config.get("MIN_ROOM_SIZE", 5)
+    max_room_size = config.get("MAX_ROOM_SIZE", 10)
     initial_predators_spawn_in_warrior_rooms_only = config.get("INITIAL_PREDATORS_SPAWN_IN_WARRIOR_ROOMS_ONLY", False)
     non_forager_always_in_lone_room = config.get("NON_FORAGER_ALWAYS_IN_LONE_ROOM", False)
     spread_non_foragers_across_rooms = config.get("SPREAD_NON_FORAGERS_ACROSS_ROOMS", False)
     trade_radius = int(config.get("TRADE_RADIUS", 18))
     trade_radius_shape = str(config.get("TRADE_RADIUS_SHAPE", "square")).lower()
     shared_reward = config.get("SHARED_REWARD", True)
+    _max_rooms = (96 // 16) * (96 // 16)  # 36 chunks at 96x96 map
+    assert num_rooms <= _max_rooms, f"NUM_ROOMS ({num_rooms}) exceeds available chunks ({_max_rooms})"
+    assert min_room_size < max_room_size, f"MIN_ROOM_SIZE ({min_room_size}) must be < MAX_ROOM_SIZE ({max_room_size})"
+
     if trade_radius < 0:
         raise ValueError(f"TRADE_RADIUS must be >= 0, got {trade_radius}.")
     if trade_radius_shape not in {"square", "circle"}:
@@ -1702,6 +1709,9 @@ def build_env(config):
         "max_melee_mobs": max_melee_mobs,
         "max_passive_mobs": max_passive_mobs,
         "max_ranged_mobs": max_ranged_mobs,
+        "num_rooms": num_rooms,
+        "min_room_size": min_room_size,
+        "max_room_size": max_room_size,
     }
     env_params_kwargs = {
         "disable_revive": disable_revive,
