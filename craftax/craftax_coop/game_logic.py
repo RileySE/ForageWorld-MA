@@ -4279,7 +4279,24 @@ def craftax_step(
         jnp.expand_dims(individual_reward, axis=0),  # Share this agent's reward with team
         0.0
     )
+    # Social reward: 1 if any same-team teammate is within this agent's FOV window (both alive).
+    _half_h = OBS_DIM[0] // 2
+    _half_w = OBS_DIM[1] // 2
+    _pos = state.player_position  # (N, 2)
+    _drow = jnp.abs(_pos[:, None, 0] - _pos[None, :, 0])
+    _dcol = jnp.abs(_pos[:, None, 1] - _pos[None, :, 1])
+    _in_fov = (_drow <= _half_h) & (_dcol <= _half_w)          # j in i's view box
+    _not_self = jnp.logical_not(jnp.eye(static_params.player_count, dtype=bool))
+    _teammate_visible = (
+        _in_fov
+        & team_mask
+        & _not_self
+        & player_alive[:, None]      # viewer alive
+        & player_alive[None, :]      # teammate alive
+    )
     shared_reward = team_rewards.sum(axis=1)  # Sum rewards within each agent's team
+
+    teammate_in_fov = _teammate_visible.any(axis=1).astype(shared_reward.dtype)  # per-agent: any teammate visible
 
     # Add team-level shaping only after reward sharing, so it stays a true shared objective.
     team_alive_count = jnp.where(team_mask, player_alive[None, :], False).sum(axis=1)
@@ -4291,6 +4308,7 @@ def craftax_step(
 
     team_all_alive = jnp.where(team_mask, player_alive[None, :], True).all(axis=1)
     shared_reward = shared_reward + params.all_team_alive_bonus * team_all_alive.astype(shared_reward.dtype)
+    shared_reward = shared_reward + params.teammate_in_fov_reward * teammate_in_fov
 
     # Apply a self-only penalty to dead agents after reward sharing so it does not punish teammates.
     dead_self_penalty = params.dead_self_penalty_weight * jnp.logical_not(player_alive).astype(shared_reward.dtype)
@@ -4371,6 +4389,7 @@ def craftax_step(
         params.auto_respawn_team_penalty
         * team_auto_respawn_count.astype(individual_reward_shaped.dtype)
     )
+    individual_reward_shaped = individual_reward_shaped + params.teammate_in_fov_reward * teammate_in_fov.astype(individual_reward_shaped.dtype)
 
     reward = jax.lax.select(
         params.shared_reward,
