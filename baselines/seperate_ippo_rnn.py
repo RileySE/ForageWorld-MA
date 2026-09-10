@@ -181,7 +181,7 @@ def unbatchify(x: jnp.ndarray, agent_list):
 # ===========================
 # Training Function
 # ===========================
-def make_train(config, env):
+def make_train(config, env, wandb_start_step=-1):
     run_output_dir = None
 
     def sanitize_path_component(value: str, fallback: str = "run") -> str:
@@ -1198,8 +1198,9 @@ def make_train(config, env):
                             if v is not None:
                                 to_log[f"{tp}/{short_name}"] = v
 
-                to_log["overview/lr"] = config["LR"] * max(0.0, 1.0 - metrics["update_steps"] / _lr_anneal_updates)
-                wandb.log(to_log, step=metrics["update_steps"])
+                if metrics["update_steps"] > wandb_start_step:
+                    to_log["overview/lr"] = config["LR"] * max(0.0, 1.0 - metrics["update_steps"] / _lr_anneal_updates)
+                    wandb.log(to_log, step=metrics["update_steps"])
 
             jax.experimental.io_callback(callback, None, metric, update_steps, ordered=True)
             update_steps = update_steps + 1
@@ -1566,7 +1567,8 @@ def make_train(config, env):
 
                     # Log all videos to wandb in one call
                     if wandb_videos:
-                        wandb.log(wandb_videos, step=step_int)
+                        if step_int > wandb_start_step:
+                            wandb.log(wandb_videos, step=step_int)
                     _clear_video_buffer()
 
                 jax.experimental.io_callback(save_video_from_buffer, None, update_steps, ordered=True)
@@ -1807,9 +1809,11 @@ def single_run(config):
         mode=config["WANDB_MODE"],
     )
     wandb_run_id = getattr(wandb.run, "id", None) if wandb.run is not None else None
+    wandb_start_step = wandb.run.step if (resuming and wandb.run is not None) else -1
+    print(f"[wandb] resume floor step = {wandb_start_step}")
 
     rng = jax.random.PRNGKey(config["SEED"])
-    train_fn = make_train(config, env)
+    train_fn = make_train(config, env, wandb_start_step=wandb_start_step)
     init_carry, update_plot_fn, update_step_fn = train_fn(rng)
     # Donate the carry so each per-block call reuses the input buffers for its
     # output instead of transiently holding two full copies of the training
