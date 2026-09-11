@@ -196,6 +196,7 @@ class EnvParams:
     terminate_on_any_death_offset: int = 200  # Dead-step threshold used when terminate_on_any_death is enabled.
     reviving_cooldown_steps: int = 0  # Steps a revived agent must wait before they can be revived again.
     teammate_alive_bonus: float = 0.0  # Shared bonus per additional alive team member beyond the first alive member.
+    teammate_in_fov_reward: float = 0.0  # social reward for having a teammate in FOV (presence, not count)
     all_team_alive_bonus: float = 0.0  # Bonus added to shared_reward when all members of an agent's team are alive.
     dead_self_penalty_weight: float = 0.0  # Per-agent penalty applied only to dead agents after shared reward aggregation.
     one_time_death_penalty_shared: float = 0.0  # One-time penalty per death, distributed to the whole team via shared reward.
