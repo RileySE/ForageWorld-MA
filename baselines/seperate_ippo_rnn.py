@@ -1656,6 +1656,7 @@ def build_env(config):
     warrior_to_warrior_drink_trade_reward = config.get("WARRIOR_TO_WARRIOR_DRINK_TRADE_REWARD", 0.0)
     trade_reward_requires_both_outside_starter_room = config.get("TRADE_REWARD_REQUIRES_BOTH_OUTSIDE_STARTER_ROOM", False)
     teammate_in_fov_reward = config.get("TEAMMATE_IN_FOV_REWARD", 0.0)
+    teammate_fov_reward_count = config.get("TEAMMATE_FOV_REWARD_COUNT", False)
     melee_mobs_despawn_when_far = config.get("MELEE_MOBS_DESPAWN_WHEN_FAR", False)
     melee_mob_despawn_distance = int(config.get("MELEE_MOB_DESPAWN_DISTANCE", 14))
     passive_mobs_static = config.get("PASSIVE_MOBS_STATIC", False)
@@ -1743,6 +1744,7 @@ def build_env(config):
         "enable_warrior_to_warrior_trading": enable_warrior_to_warrior_trading,
         "trade_reward_requires_both_outside_starter_room": trade_reward_requires_both_outside_starter_room,
         "teammate_in_fov_reward": teammate_in_fov_reward,
+        "teammate_fov_reward_count": teammate_fov_reward_count,
         "enable_auto_respawning": enable_auto_respawning,
         "auto_respawn_steps": auto_respawn_steps,
         "auto_respawn_team_penalty": auto_respawn_team_penalty,

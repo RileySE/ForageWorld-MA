@@ -4313,7 +4313,11 @@ def craftax_step(
     )
     shared_reward = team_rewards.sum(axis=1)  # Sum rewards within each agent's team
 
-    teammate_in_fov = _teammate_visible.any(axis=1).astype(shared_reward.dtype)  # per-agent: any teammate visible
+    teammate_in_fov = jnp.where(
+        params.teammate_fov_reward_count,
+        _teammate_visible.sum(axis=1).astype(shared_reward.dtype),
+        _teammate_visible.any(axis=1).astype(shared_reward.dtype),
+    )
 
     # Add team-level shaping only after reward sharing, so it stays a true shared objective.
     team_alive_count = jnp.where(team_mask, player_alive[None, :], False).sum(axis=1)
