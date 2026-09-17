@@ -152,6 +152,9 @@ def interplayer_interaction(state, block_position, is_doing_action, env_params, 
         death_caused_by_opposite_team, has_killer_attacker
     ).astype(jnp.int32)
     new_team_kills = new_team_kills.at[killer_teams].add(kill_counts)
+    log_enemy_kills = jnp.zeros(static_params.player_count, dtype=jnp.int32).at[killer_attacker_idx].add(
+        jnp.logical_and(death_caused_by_opposite_team, has_killer_attacker).astype(jnp.int32)
+    )
        
     # Track damage dealt to other teams per attacker team
     # attacker_damage is per-attacker, attacker's team is state.player_sc[attacker_idx]
@@ -190,6 +193,7 @@ def interplayer_interaction(state, block_position, is_doing_action, env_params, 
         revives=state.revives+is_player_being_revived.sum(),
         revive_cooldown_until=new_revive_cooldown_until,
         team_kills=new_team_kills,
+        log_enemy_kills=log_enemy_kills,
         damage_taken_ff=state.damage_taken_ff + damage_taken,
         damage_dealt_to_other_team=new_damage_dealt_to_other_team,
         log_revive_as_reviver=revive_as_reviver,
@@ -4073,6 +4077,7 @@ def craftax_step(
         log_revive_as_revived=jnp.zeros((static_params.player_count,), dtype=jnp.int32),
         log_revive_partner_id=jnp.full((static_params.player_count,), -1, dtype=jnp.int32),
         log_melee_kills=jnp.zeros((static_params.player_count,), dtype=jnp.int32),
+        log_enemy_kills=jnp.zeros((static_params.player_count,), dtype=jnp.int32),
         log_predator_hit=jnp.zeros((static_params.player_count,), dtype=jnp.int32),
         log_auto_respawned=jnp.zeros((static_params.player_count,), dtype=jnp.int32),
     )
@@ -4204,6 +4209,16 @@ def craftax_step(
         * state.log_melee_kills.astype(individual_reward.dtype)
         * (state.player_specialization == Specialization.FORAGER.value).astype(individual_reward.dtype)
     )
+    warrior_enemy_kill_bonus = (
+        params.warrior_inter_team_kill_reward
+        * state.log_enemy_kills.astype(individual_reward.dtype)
+        * (state.player_specialization == Specialization.WARRIOR.value).astype(individual_reward.dtype)
+    )
+    forager_enemy_kill_bonus = (
+        params.forager_inter_team_kill_reward
+        * state.log_enemy_kills.astype(individual_reward.dtype)
+        * (state.player_specialization == Specialization.FORAGER.value).astype(individual_reward.dtype)
+    )
     trade_receiver = jnp.maximum(state.log_trade_give_partner_id, 0)
     giver_in_starter_room = jnp.logical_and(
         (state.player_position >= state.player_spawn_room_min).all(axis=1),
@@ -4262,6 +4277,8 @@ def craftax_step(
         individual_reward
         + warrior_melee_kill_bonus
         + forager_melee_kill_bonus
+        + warrior_enemy_kill_bonus
+        + forager_enemy_kill_bonus
         + forager_to_warrior_food_trade_bonus
         + forager_to_warrior_drink_trade_bonus
         + warrior_to_warrior_drink_trade_bonus

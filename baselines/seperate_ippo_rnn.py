@@ -1644,6 +1644,8 @@ def build_env(config):
     one_time_death_penalty_individual = config.get("ONE_TIME_DEATH_PENALTY_INDIVIDUAL", 0.0)
     warrior_melee_kill_reward = config.get("WARRIOR_MELEE_KILL_REWARD", 0.0)
     forager_melee_kill_reward = config.get("FORAGER_MELEE_KILL_REWARD", 0.0)
+    warrior_inter_team_kill_reward = config.get("WARRIOR_INTER_TEAM_KILL_REWARD", 0.0)
+    forager_inter_team_kill_reward = config.get("FORAGER_INTER_TEAM_KILL_REWARD", 0.0)
     warrior_passive_food_gain = int(config.get("WARRIOR_PASSIVE_FOOD_GAIN", 1))
     forager_passive_food_gain = int(config.get("FORAGER_PASSIVE_FOOD_GAIN", 3))
     forager_food_capacity = int(config.get("FORAGER_FOOD_CAPACITY", 27))
@@ -1728,6 +1730,8 @@ def build_env(config):
         "one_time_death_penalty_individual": one_time_death_penalty_individual,
         "warrior_melee_kill_reward": warrior_melee_kill_reward,
         "forager_melee_kill_reward": forager_melee_kill_reward,
+        "warrior_inter_team_kill_reward": warrior_inter_team_kill_reward,
+        "forager_inter_team_kill_reward": forager_inter_team_kill_reward,
         "warrior_passive_food_gain": warrior_passive_food_gain,
         "forager_passive_food_gain": forager_passive_food_gain,
         "forager_food_capacity": forager_food_capacity,
