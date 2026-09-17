@@ -153,6 +153,7 @@ class EnvState:
     log_revive_as_revived: jnp.ndarray  # (player_count,) 1 if agent was revived this step, else 0
     log_revive_partner_id: jnp.ndarray  # (player_count,) counterpart agent id for revive event, -1 if none
     log_melee_kills: jnp.ndarray  # (player_count,) melee mob kills credited to each agent during the current step
+    log_enemy_kills: jnp.ndarray  # (player_count,) enemy-team players killed by each agent this step
     log_predator_hit: jnp.ndarray  # (player_count,) 1 if agent was hit by a predator this step, else 0
     log_auto_respawned: jnp.ndarray  # (player_count,) 1 if agent auto-respawned this step, else 0
 
@@ -203,6 +204,8 @@ class EnvParams:
     one_time_death_penalty_individual: float = 0.0  # One-time penalty per death, applied only to the dead agent (in both reward modes).
     warrior_melee_kill_reward: float = 0.0  # Bonus given to warriors per credited melee-mob kill.
     forager_melee_kill_reward: float = 0.0  # Bonus given to foragers per credited melee-mob kill.
+    warrior_inter_team_kill_reward: float = 0.0
+    forager_inter_team_kill_reward: float = 0.0
     warrior_passive_food_gain: int = 1  # Food a warrior gains when eating a killed passive mob.
     forager_passive_food_gain: int = 3  # Food a forager gains when eating a killed passive mob.
     forager_food_capacity: int = 27  # Maximum food capacity for foragers.
