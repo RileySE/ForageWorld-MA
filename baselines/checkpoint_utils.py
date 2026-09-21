@@ -8,6 +8,8 @@ import warnings
 import jax
 import orbax.checkpoint as ocp
 
+import pruning_utils
+
 
 _STOP = {"requested": False}
 
@@ -100,8 +102,8 @@ def check_compatibility(meta, fingerprint, config):
         raise ValueError(
             "Cannot resume: checkpoint pytree structure does not match the current "
             f"config. Saved fingerprint {saved_fp}, current {fingerprint}. This means "
-            "network size, agent count, or env dimensions changed. Start a fresh run "
-            "or restore the original config."
+            "network size, agent count, or env dimensions changed, or pruning (SPARSE_ALG) "
+            "was switched on or off. Start a fresh run or restore the original config."
         )
     saved_lui = meta.get("logging_updates_interval")
     if saved_lui is not None and saved_lui != config["LOGGING_UPDATES_INTERVAL"]:
@@ -109,6 +111,13 @@ def check_compatibility(meta, fingerprint, config):
             "Cannot resume: LOGGING_UPDATES_INTERVAL changed from "
             f"{saved_lui} to {config['LOGGING_UPDATES_INTERVAL']}, which breaks the "
             "block-to-update-step mapping used to resume."
+        )
+    if "pruning" in meta and meta["pruning"] != pruning_utils.pruning_settings(config):
+        raise ValueError(
+            "Cannot resume: pruning settings changed from "
+            f"{meta['pruning']} to {pruning_utils.pruning_settings(config)}. Pruning "
+            "happens once at a fixed step, so SPARSE_ALG, SPARSITY and PRUNE_STEP "
+            "must stay the same for the whole run."
         )
     saved_nu = meta.get("num_updates")
     if saved_nu is not None and saved_nu != config["NUM_UPDATES"]:
@@ -140,6 +149,7 @@ def save_checkpoint(mngr, carry, blocks_done, ckpt_dir, wandb_run_id, fingerprin
             "update_steps": step,
             "logging_updates_interval": config["LOGGING_UPDATES_INTERVAL"],
             "num_updates": config["NUM_UPDATES"],
+            "pruning": pruning_utils.pruning_settings(config),
             "final": bool(final),
         },
     )

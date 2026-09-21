@@ -14,4 +14,5 @@ chex==0.1.90
 matplotlib==3.11.0
 imageio[ffmpeg]==2.37.3
 jaxmarl==0.0.2
+jaxpruner @ git+https://github.com/google-research/jaxpruner.git@e7af4e4e4748782d6bc433249e359f74ffb845ba
 seaborn==0.13.2

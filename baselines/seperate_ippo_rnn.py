@@ -50,6 +50,7 @@ from craftax.custom_rendering.ego_rendering import render_ego_perspective
 from craftax.custom_rendering.full_map_rendering import render_full_map
 
 import checkpoint_utils as ckpt
+import pruning_utils as pruning
 
 # ===========================
 # Model Definitions
@@ -236,6 +237,8 @@ def make_train(config, env, wandb_start_step=-1):
     # Note: In separate IPPO, minibatching is done over NUM_ENVS per agent
     # Each minibatch has shape (num_steps, num_agents, num_envs // NUM_MINIBATCHES, ...)
     config["MINIBATCH_SIZE"] = config["NUM_ENVS"] // config["NUM_MINIBATCHES"]
+    pruning.validate_config(config)
+    _prune = pruning.pruning_enabled(config)
 
     # Load rendering resources BEFORE wrapping (need base env's static_env_params)
     _video_env_name = config.get("ENV_NAME", "Craftax-Coop-Symbolic")
@@ -405,6 +408,11 @@ def make_train(config, env, wandb_start_step=-1):
             tx = optax.chain(
                 per_agent_clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(config["LR"], eps=1e-5),
+            )
+        if _prune:
+            # Each agent's network is pruned independently, all at the same step, once.
+            tx = pruning.wrap_optax_per_agent(
+                tx, pruning.make_updater(config), env.num_agents, pruning.prune_count(config), config["SEED"]
             )
         train_state = TrainState.create(
             apply_fn=network.apply,
@@ -825,6 +833,10 @@ def make_train(config, env, wandb_start_step=-1):
                         train_state.params, init_hstate, train_batch, advantages, targets
                     )
                     train_state = train_state.apply_gradients(grads=grads)
+                    if _prune:
+                        train_state = train_state.replace(
+                            params=pruning.apply_masks(train_state.params, train_state.opt_state.masks)
+                        )
                     return train_state, total_loss
 
                 (
@@ -974,6 +986,8 @@ def make_train(config, env, wandb_start_step=-1):
                     "aux_loss": aux_loss_per_agent,          # (num_agents,)
                 },
             }
+            if _prune:
+                metric["sparsity_per_agent"] = pruning.mask_sparsity(train_state.opt_state.masks)  # (num_agents,)
 
             rng = update_state[-1]
 
@@ -1031,6 +1045,13 @@ def make_train(config, env, wandb_start_step=-1):
                 for i in range(num_agents):
                     for k in ["total_loss", "value_loss", "actor_loss", "entropy", "aux_loss"]:
                         to_log[f"agent_{i}/{k}"] = np.asarray(metrics["loss_per_agent"][k][i]).item()
+
+                # ── Pruning: fraction of each agent's prunable weights that are pruned ──
+                if "sparsity_per_agent" in metrics:
+                    sparsity_per_agent = np.asarray(metrics["sparsity_per_agent"])
+                    for i in range(num_agents):
+                        to_log[f"agent_{i}/sparsity"] = sparsity_per_agent[i].item()
+                    to_log["overview/sparsity"] = sparsity_per_agent.mean().item()
 
                 # ── Episode-level metrics (only when episodes returned) ──
                 if metrics["returned_episode"].any():
@@ -1840,6 +1861,7 @@ def single_run(config):
                     "update_steps": 0,
                     "logging_updates_interval": config["LOGGING_UPDATES_INTERVAL"],
                     "num_updates": config["NUM_UPDATES"],
+                    "pruning": pruning.pruning_settings(config),
                     "final": False,
                 },
             )

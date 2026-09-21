@@ -81,6 +81,11 @@ MAX_GRAD_NORM: 1.0
 LR_WARMUP: 0.0
 REW_SHAPING_HORIZON: 1000000
 
+# Pruning configuration (jaxpruner). Each agent's network is pruned independently, all at PRUNE_STEP, once.
+SPARSE_ALG: "no_prune"  # "no_prune" (off), "magnitude", "random", "saliency", "global_magnitude" or "global_saliency"
+SPARSITY: 0.9           # Fraction of each agent's weight-matrix entries to prune (biases are never pruned), in (0, 1)
+PRUNE_STEP: 20000       # Training update step at which to prune; pruned weights then stay zero for the rest of training
+
 # Seed configuration
 NUM_SEEDS: 1 #careful with this > 1 - might break something in the logging code
 SEED: 0
