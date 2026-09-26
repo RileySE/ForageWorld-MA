@@ -1656,6 +1656,7 @@ def build_env(config):
     warrior_to_warrior_food_trade_reward = config.get("WARRIOR_TO_WARRIOR_FOOD_TRADE_REWARD", 0.0)
     warrior_to_warrior_drink_trade_reward = config.get("WARRIOR_TO_WARRIOR_DRINK_TRADE_REWARD", 0.0)
     trade_reward_requires_both_outside_starter_room = config.get("TRADE_REWARD_REQUIRES_BOTH_OUTSIDE_STARTER_ROOM", False)
+    use_teammate_direction = config.get("USE_TEAMMATE_DIRECTION", True)
     teammate_in_fov_reward = config.get("TEAMMATE_IN_FOV_REWARD", 0.0)
     teammate_fov_reward_count = config.get("TEAMMATE_FOV_REWARD_COUNT", False)
     melee_mobs_despawn_when_far = config.get("MELEE_MOBS_DESPAWN_WHEN_FAR", False)
@@ -1719,6 +1720,7 @@ def build_env(config):
         "num_rooms": num_rooms,
         "min_room_size": min_room_size,
         "max_room_size": max_room_size,
+        "use_teammate_direction": use_teammate_direction,
     }
     env_params_kwargs = {
         "disable_revive": disable_revive,

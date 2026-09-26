@@ -262,3 +262,5 @@ class StaticEnvParams:
 
     # Rate at which player hunger increases per tick (multiplied with base rate)
     hunger_increase_rate: float = 1.0
+
+    use_teammate_direction: bool = True   # False zeros the teammate-direction arrow in the obs (keeps shape)
