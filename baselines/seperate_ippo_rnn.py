@@ -1137,6 +1137,9 @@ def make_train(config, env, wandb_start_step=-1):
                             v = _agent_mean(f"Combat/{dk}", ai)
                             if v is not None:
                                 to_log[f"agent_{ai}/{dk}"] = v
+                        v = _agent_mean("killed_another_agent", ai)
+                        if v is not None:
+                            to_log[f"agent_{ai}/kills_per_1000_steps"] = v * 1000
 
                     # overview/ trades (broadcast scalars, take from agent 0)
                     for trade_key in ["total_trades", "food_trades", "drink_trades"]:
@@ -1202,6 +1205,13 @@ def make_train(config, env, wandb_start_step=-1):
                         v = _global_mean(f"Combat/team_{ti}_kills")
                         if v is not None:
                             to_log[f"{tp}/kills_against_other_team"] = v
+
+                        v = _global_mean(f"Combat/team_{ti}_kills")
+                        if v is not None:
+                            to_log[f"{tp}/kills_against_other_team"] = v
+                        v = _team_sum("killed_another_agent", ti)
+                        if v is not None:
+                            to_log[f"{tp}/kills_per_1000_steps"] = v * 1000
 
                     # ── team_achievements/team_{t}/ ──
                     for ti in range(num_teams):
