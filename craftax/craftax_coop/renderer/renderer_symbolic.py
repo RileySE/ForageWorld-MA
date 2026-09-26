@@ -164,9 +164,9 @@ def render_craftax_symbolic(state: EnvState, static_params: StaticEnvParams):
         teammate_directions = reorder_teammate_info(teammate_directions, player_index)
         return teammate_map, teammate_directions
     teammate_map, teammate_directions = jax.vmap(_add_teammate, in_axes=0)(jnp.arange(static_params.player_count))
+    teammate_directions = teammate_directions * static_params.use_teammate_direction
         # return teammate_map 
     # teammate_map  = jax.vmap(_add_teammate, in_axes=0)(jnp.arange(static_params.player_count))
-
     # Concat all maps
     all_map = jnp.concatenate(
         [map_view_one_hot, item_map_view_one_hot, mob_map, teammate_map], axis=-1
