@@ -66,6 +66,7 @@ class CraftaxCoopSymbolicEnv(MultiAgentEnv):
         info["user_info"] = compute_score(state, done, self.static_env_params)
         info["user_info"]["Reward/individual_reward_step"] = individual_reward
         info.update(compute_step_event_info(state))
+        info["user_info"]["killed_another_agent"] = info["killed_another_agent"]
 
         # info["discount"] = self.discount(state, self.default_params)
         agent_rewards = {n: r for n,r in zip(self.agents, reward)}
