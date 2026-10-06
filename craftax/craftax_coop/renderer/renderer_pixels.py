@@ -996,7 +996,7 @@ def render_craftax_pixels(state, block_pixel_size, static_params, player_specifi
         on_screen = jnp.logical_and(
             local_position >= 0, local_position < obs_dim_array
         ).all(axis=-1)  
-        render_direction = jnp.logical_not(on_screen)
+        render_direction = jnp.logical_not(on_screen) * static_params.use_teammate_direction
 
         direction_index_2d = jnp.where(
             local_position < 0, 0,
