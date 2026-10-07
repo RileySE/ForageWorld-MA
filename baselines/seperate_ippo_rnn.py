@@ -41,10 +41,9 @@ import wandb
 
 import imageio
 
-from jaxmarl.wrappers.baselines import LogWrapper
 from craftax.craftax_env import make_craftax_env_from_name
 from craftax.craftax_coop.constants import reduced_action_ids
-from craftax.environment_base.wrappers import VideoPlotWrapper
+from craftax.environment_base.wrappers import SelectiveResetVecEnvWrapper, add_logging_fields
 from craftax.custom_rendering.base_rendering import load_rendering_resources
 from craftax.custom_rendering.ego_rendering import render_ego_perspective
 from craftax.custom_rendering.full_map_rendering import render_full_map
@@ -265,13 +264,12 @@ def make_train(config, env, wandb_start_step=-1):
         print(f"Run artifacts will be written to: {run_output_dir}")
         return run_output_dir
 
-    # Two env references to avoid VideoPlotWrapper overhead during training:
-    # env_train: LogWrapper only — used for training steps (no mob distance calculations)
-    # env_log:   LogWrapper + VideoPlotWrapper — used for CSV logging steps (adds health, food, mob distances etc.)
-    # Both share the same state structure (VideoPlotWrapper is a pass-through for state).
-    env_train = LogWrapper(env)
-    env_log = VideoPlotWrapper(env_train, os.path.join(get_run_output_dir(), 'debug_output'), 256, False)
-    env = env_log  # default reference for property access (agents, num_agents, action_space, etc.)
+    # vec_env steps all NUM_ENVS envs at once and only regenerates worlds for envs whose episode
+    # ended (bit-identical to vmapping jaxmarl's LogWrapper.step, which regenerates every env's
+    # world every step). Logging iterations add the extra CSV fields with add_logging_fields.
+    vec_env = SelectiveResetVecEnvWrapper(env)
+    env = vec_env  # default reference for property access (agents, num_agents, action_space, etc.)
+    get_run_output_dir()  # pick (and print) the run output directory at startup
 
     # Auxiliary loss configuration
     _n = env.num_agents
@@ -415,7 +413,7 @@ def make_train(config, env, wandb_start_step=-1):
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env_train.reset, in_axes=(0,))(reset_rng)
+        obsv, env_state = vec_env.reset(reset_rng)
         # Hidden state shape: (num_agents, num_envs, hidden_dim)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
         init_hstate = jnp.tile(init_hstate[np.newaxis, :, :], (env.num_agents, 1, 1))
@@ -490,15 +488,12 @@ def make_train(config, env, wandb_start_step=-1):
             env_act = {k: v.squeeze() for k, v in env_act.items()}
 
             # STEP ENV
-            # Use env_log (with VideoPlotWrapper) only during logging to get CSV fields
-            # (health, food, mob distances, etc.). During training, use env_train
-            # (LogWrapper only) to skip expensive mob distance calculations.
             rng, _rng = jax.random.split(rng)
             rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-            step_fn = env_log.step if detailed_logging else env_train.step
-            obsv, env_state, reward, done, info = jax.vmap(
-                step_fn, in_axes=(0, 0, 0)
-            )(rng_step, env_state, env_act)
+            obsv, env_state, reward, done, info = vec_env.step(rng_step, env_state, env_act)
+            # CSV fields (health, food, mob distances, etc.) are only needed during logging.
+            if detailed_logging:
+                info = jax.vmap(add_logging_fields)(info, env_state.env_state)
 
             # Re-apply the episode cap: env.step may have reset an episode and
             # restored effective_max_timesteps to the default.
@@ -1436,12 +1431,10 @@ def make_train(config, env, wandb_start_step=-1):
             env_action = policy_action_to_env_action(action)
             env_act = unbatchify(env_action, env.agents)  # {agent: (1,)}
 
-            # STEP 1 env (use env_train — video doesn't need CSV fields)
+            # STEP 1 env (video doesn't need CSV fields)
             rng, _rng = jax.random.split(rng)
             rng_step = jax.random.split(_rng, 1)
-            obsv, env_state, reward, done, info = jax.vmap(
-                env_train.step, in_axes=(0, 0, 0)
-            )(rng_step, env_state, env_act)
+            obsv, env_state, reward, done, info = vec_env.step(rng_step, env_state, env_act)
             if effective_cap is not None:
                 env_state = _patch_episode_cap(env_state, effective_cap)
 
@@ -1504,7 +1497,7 @@ def make_train(config, env, wandb_start_step=-1):
 
                 # Reset only 1 env for video (saves ~NUM_ENVS × video_length env-state memory)
                 video_reset_rngs = jax.random.split(rng_video, 1)
-                video_obsv, video_env_state = jax.vmap(env_train.reset, in_axes=(0,))(video_reset_rngs)
+                video_obsv, video_env_state = vec_env.reset(video_reset_rngs)
                 if effective_cap is not None:
                     video_env_state = _patch_episode_cap(video_env_state, effective_cap)
 

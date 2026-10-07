@@ -8,6 +8,7 @@ from flax import struct
 from functools import partial
 from typing import Optional, Tuple, Union, Any
 from gymnax.environments import environment, spaces
+from jaxmarl.wrappers.baselines import LogWrapper as JaxMARLLogWrapper
 from matplotlib import pyplot as plt, animation
 
 
@@ -248,6 +249,99 @@ class LogWrapper(GymnaxWrapper):
         return obs, state, reward, done, info
 
 
+def add_logging_fields(info, env_state):
+    """Return `info` plus the per-step fields written to the logging CSVs (health, food, mob distances, ...).
+
+    `env_state` is a single env's (unbatched) state; vmap over envs for batched states.
+    """
+    info = dict(info)
+
+    # Add fields to be logged
+    #info['action'] = jnp.concatenate(list(action.values()), axis=0)
+    info['health'] = env_state.player_health
+    info['food'] = env_state.player_food
+    info['drink'] = env_state.player_drink
+    info['energy'] = env_state.player_energy
+    #info['done'] = done
+    info['is_sleeping'] = env_state.is_sleeping
+    info['is_resting'] = env_state.is_resting
+    info['player_position_x'] = env_state.player_position[:,0]
+    info['player_position_y'] = env_state.player_position[:,1]
+    info['recover'] = env_state.player_recover
+    info['hunger'] = env_state.player_hunger
+    info['thirst'] = env_state.player_thirst  # print("A " + str(type(log_state)))
+    info['fatigue'] = env_state.player_fatigue
+    info['light_level'] = env_state.light_level
+    # TODO why is this an array? It's supposed to be an int...
+    #info['episode_id'] = env_state.env_id.squeeze()
+
+    melee_pos = env_state.melee_mobs.position[env_state.player_level]
+    melee_mask = env_state.melee_mobs.mask[env_state.player_level]
+    passive_pos = env_state.passive_mobs.position[env_state.player_level]
+    passive_mask = env_state.passive_mobs.mask[env_state.player_level]
+    ranged_pos = env_state.ranged_mobs.position[env_state.player_level]
+    ranged_mask = env_state.ranged_mobs.mask[env_state.player_level]
+
+    # Per-player mob distance / count metrics (multi-agent adapted)
+    # player_position: (num_players, 2), mob_pos: (num_mobs, 2), mob_mask: (num_mobs,)
+    nearby_distance = 9
+
+    def _mob_metrics_single_player(player_pos, mob_pos, mob_mask):
+        """Compute closest-mob distance, on-screen flag, and nearby count for one player."""
+        if mob_pos.shape[0] == 0:
+            return (
+                jnp.asarray(jnp.inf, dtype=jnp.float32),
+                jnp.asarray(False),
+                jnp.asarray(0, dtype=jnp.int32),
+            )
+        dists = jnp.linalg.norm(player_pos - mob_pos, ord=1, axis=-1)  # (num_mobs,)
+        dists = jnp.where(mob_mask, dists, jnp.inf)
+        closest_idx = jnp.argmin(dists)
+        closest_dist_xy = player_pos - mob_pos[closest_idx]
+        on_screen = jnp.logical_and(jnp.abs(closest_dist_xy[0]) <= 5,
+                                    jnp.abs(closest_dist_xy[1]) <= 4)
+        on_screen = jnp.logical_and(on_screen, mob_mask[closest_idx])
+        dist = dists[closest_idx]
+        num_nearby = (dists <= nearby_distance).sum()
+        return dist, on_screen, num_nearby
+
+    # vmap over players: player_pos axis 0, mob arrays broadcast (None)
+    _mob_metrics_all_players = jax.vmap(_mob_metrics_single_player, in_axes=(0, None, None))
+
+    dist_to_melee, melee_on_screen, num_melee_nearby = _mob_metrics_all_players(
+        env_state.player_position, melee_pos, melee_mask)
+    dist_to_passive, passive_on_screen, num_passives_nearby = _mob_metrics_all_players(
+        env_state.player_position, passive_pos, passive_mask)
+    if ranged_pos.shape[0] > 0:
+        dist_to_ranged, ranged_on_screen, num_ranged_nearby = _mob_metrics_all_players(
+            env_state.player_position, ranged_pos, ranged_mask)
+    else:
+        num_players = env_state.player_position.shape[0]
+        dist_to_ranged = jnp.full((num_players,), jnp.inf)
+        ranged_on_screen = jnp.zeros((num_players,), dtype=bool)
+        num_ranged_nearby = jnp.zeros((num_players,), dtype=jnp.int32)
+
+    num_monsters_killed = env_state.monsters_killed[env_state.player_level]
+
+    info['dist_to_melee_l1'] = dist_to_melee
+    info['melee_on_screen'] = melee_on_screen.astype(jnp.float32)
+    info['dist_to_passive_l1'] = dist_to_passive
+    info['passive_on_screen'] = passive_on_screen.astype(jnp.float32)
+    info['dist_to_ranged_l1'] = dist_to_ranged.astype(jnp.float32)
+    info['ranged_on_screen'] = ranged_on_screen.astype(jnp.float32)
+    info['num_melee_nearby'] = num_melee_nearby.astype(jnp.float32)
+    info['num_passives_nearby'] = num_passives_nearby.astype(jnp.float32)
+    info['num_ranged_nearby'] = num_ranged_nearby.astype(jnp.float32)
+    info['num_monsters_killed'] = num_monsters_killed
+    info['has_sword'] = env_state.inventory.sword
+    info['has_pick'] = env_state.inventory.pickaxe
+    info['bow'] = env_state.inventory.bow
+    info['arrows'] = env_state.inventory.arrows
+    info['held_iron'] = env_state.inventory.iron
+
+    return info
+
+
 # Wrapper for plotting videos (every expensive op due to CPU latency, only run with this wrapper rarely!
 class VideoPlotWrapper(GymnaxWrapper):
     def __init__(self, env: environment.Environment, output_path='./', frames_per_file=500, do_videos=True):
@@ -277,98 +371,87 @@ class VideoPlotWrapper(GymnaxWrapper):
     ) -> Tuple[chex.Array, environment.EnvState, float, bool, dict]:
         obs, state, reward, done, info = self._env.step(key, state, action)
 
-        env_state = state.env_state
-
         # Video plotting stuff
         # This needs to leave the jax ecosystem so we use callback
         def callback_func(new_obs, t, done):
             #if self.do_videos:
             self.vis_renderer.add_frame(new_obs, t, done)
 
-        # Add fields to be logged
-        #info['action'] = jnp.concatenate(list(action.values()), axis=0)
-        info['health'] = env_state.player_health
-        info['food'] = env_state.player_food
-        info['drink'] = env_state.player_drink
-        info['energy'] = env_state.player_energy
-        #info['done'] = done
-        info['is_sleeping'] = env_state.is_sleeping
-        info['is_resting'] = env_state.is_resting
-        info['player_position_x'] = env_state.player_position[:,0]
-        info['player_position_y'] = env_state.player_position[:,1]
-        info['recover'] = env_state.player_recover
-        info['hunger'] = env_state.player_hunger
-        info['thirst'] = env_state.player_thirst  # print("A " + str(type(log_state)))
-        info['fatigue'] = env_state.player_fatigue
-        info['light_level'] = env_state.light_level
-        # TODO why is this an array? It's supposed to be an int...
-        #info['episode_id'] = env_state.env_id.squeeze()
-
-        melee_pos = env_state.melee_mobs.position[env_state.player_level]
-        melee_mask = env_state.melee_mobs.mask[env_state.player_level]
-        passive_pos = env_state.passive_mobs.position[env_state.player_level]
-        passive_mask = env_state.passive_mobs.mask[env_state.player_level]
-        ranged_pos = env_state.ranged_mobs.position[env_state.player_level]
-        ranged_mask = env_state.ranged_mobs.mask[env_state.player_level]
-
-        # Per-player mob distance / count metrics (multi-agent adapted)
-        # player_position: (num_players, 2), mob_pos: (num_mobs, 2), mob_mask: (num_mobs,)
-        nearby_distance = 9
-
-        def _mob_metrics_single_player(player_pos, mob_pos, mob_mask):
-            """Compute closest-mob distance, on-screen flag, and nearby count for one player."""
-            if mob_pos.shape[0] == 0:
-                return (
-                    jnp.asarray(jnp.inf, dtype=jnp.float32),
-                    jnp.asarray(False),
-                    jnp.asarray(0, dtype=jnp.int32),
-                )
-            dists = jnp.linalg.norm(player_pos - mob_pos, ord=1, axis=-1)  # (num_mobs,)
-            dists = jnp.where(mob_mask, dists, jnp.inf)
-            closest_idx = jnp.argmin(dists)
-            closest_dist_xy = player_pos - mob_pos[closest_idx]
-            on_screen = jnp.logical_and(jnp.abs(closest_dist_xy[0]) <= 5,
-                                        jnp.abs(closest_dist_xy[1]) <= 4)
-            on_screen = jnp.logical_and(on_screen, mob_mask[closest_idx])
-            dist = dists[closest_idx]
-            num_nearby = (dists <= nearby_distance).sum()
-            return dist, on_screen, num_nearby
-
-        # vmap over players: player_pos axis 0, mob arrays broadcast (None)
-        _mob_metrics_all_players = jax.vmap(_mob_metrics_single_player, in_axes=(0, None, None))
-
-        dist_to_melee, melee_on_screen, num_melee_nearby = _mob_metrics_all_players(
-            env_state.player_position, melee_pos, melee_mask)
-        dist_to_passive, passive_on_screen, num_passives_nearby = _mob_metrics_all_players(
-            env_state.player_position, passive_pos, passive_mask)
-        if ranged_pos.shape[0] > 0:
-            dist_to_ranged, ranged_on_screen, num_ranged_nearby = _mob_metrics_all_players(
-                env_state.player_position, ranged_pos, ranged_mask)
-        else:
-            num_players = env_state.player_position.shape[0]
-            dist_to_ranged = jnp.full((num_players,), jnp.inf)
-            ranged_on_screen = jnp.zeros((num_players,), dtype=bool)
-            num_ranged_nearby = jnp.zeros((num_players,), dtype=jnp.int32)
-
-        num_monsters_killed = env_state.monsters_killed[env_state.player_level]
-
-        info['dist_to_melee_l1'] = dist_to_melee
-        info['melee_on_screen'] = melee_on_screen.astype(jnp.float32)
-        info['dist_to_passive_l1'] = dist_to_passive
-        info['passive_on_screen'] = passive_on_screen.astype(jnp.float32)
-        info['dist_to_ranged_l1'] = dist_to_ranged.astype(jnp.float32)
-        info['ranged_on_screen'] = ranged_on_screen.astype(jnp.float32)
-        info['num_melee_nearby'] = num_melee_nearby.astype(jnp.float32)
-        info['num_passives_nearby'] = num_passives_nearby.astype(jnp.float32)
-        info['num_ranged_nearby'] = num_ranged_nearby.astype(jnp.float32)
-        info['num_monsters_killed'] = num_monsters_killed
-        info['has_sword'] = env_state.inventory.sword
-        info['has_pick'] = env_state.inventory.pickaxe
-        info['bow'] = env_state.inventory.bow
-        info['arrows'] = env_state.inventory.arrows
-        info['held_iron'] = env_state.inventory.iron
+        info = add_logging_fields(info, state.env_state)
 
         return obs, state, reward, done, info
+
+
+class _NoAutoResetEnv(object):
+    """Expose a jaxmarl env's step_env as `step`: the key is split exactly as in
+    MultiAgentEnv.step, but the unconditional auto-reset is skipped."""
+
+    def __init__(self, env):
+        self._env = env
+
+    def __getattr__(self, name):
+        return getattr(self._env, name)
+
+    def step(self, key, state, actions):
+        key, _ = jax.random.split(key)
+        return self._env.step_env(key, state, actions)
+
+
+class SelectiveResetVecEnvWrapper(object):
+    """Batched equivalent of jax.vmap(jaxmarl LogWrapper(env).step) that only resets finished envs.
+
+    jaxmarl's MultiAgentEnv.step generates a fresh world for every env on every step and then
+    discards it unless that env's episode just ended; for Craftax-Coop this world generation is
+    about half the cost of a step. This wrapper steps all envs without resetting, then resets only
+    the envs whose episode ended (at most `max_resets_per_step` per world-generation call), using
+    the same reset key MultiAgentEnv.step would have used. Outputs are bit-identical to the
+    vmapped original.
+
+    Keys, states, actions and outputs all carry a leading num_envs axis. Under an outer vmap
+    (e.g. over seeds) results stay correct, but the reset loop runs for every batch member.
+    """
+
+    def __init__(self, env, max_resets_per_step=8):
+        self._env = env
+        self._log_env = JaxMARLLogWrapper(_NoAutoResetEnv(env))
+        self.max_resets_per_step = max_resets_per_step
+
+    def __getattr__(self, name):
+        return getattr(self._env, name)
+
+    def reset(self, keys):
+        return jax.vmap(self._log_env.reset)(keys)
+
+    def step(self, keys, state, actions):
+        obs, state, reward, done, info = jax.vmap(self._log_env.step)(keys, state, actions)
+        # MultiAgentEnv.step resets with key_reset from `key, key_reset = jax.random.split(key)`.
+        reset_keys = jax.vmap(lambda key: jax.random.split(key)[1])(keys)
+        obs, env_state = self._reset_finished(reset_keys, done["__all__"], obs, state.env_state)
+        return obs, state.replace(env_state=env_state), reward, done, info
+
+    def _reset_finished(self, reset_keys, finished, obs, env_state):
+        num_envs = finished.shape[0]
+        chunk_size = min(self.max_resets_per_step, num_envs)
+
+        def has_pending(carry):
+            return carry[0].any()
+
+        def reset_chunk(carry):
+            pending, obs, env_state = carry
+            # Up to chunk_size pending env indices; padding points past the end and is dropped.
+            idx = jnp.nonzero(pending, size=chunk_size, fill_value=num_envs)[0]
+            new_obs, new_env_state = jax.vmap(self._env.reset)(
+                reset_keys[jnp.minimum(idx, num_envs - 1)]
+            )
+            put = lambda old, new: old.at[idx].set(new, mode="drop")
+            return (
+                pending.at[idx].set(False, mode="drop"),
+                jax.tree_util.tree_map(put, obs, new_obs),
+                jax.tree_util.tree_map(put, env_state, new_env_state),
+            )
+
+        _, obs, env_state = jax.lax.while_loop(has_pending, reset_chunk, (finished, obs, env_state))
+        return obs, env_state
 
 
 # Class to progressively render visualization frames during test rollouts.
