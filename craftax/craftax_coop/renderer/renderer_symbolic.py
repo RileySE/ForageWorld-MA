@@ -76,18 +76,21 @@ def render_craftax_symbolic(state: EnvState, static_params: StaticEnvParams):
             _add_mob_to_map,
             (mob_map, jax.tree_util.tree_map(lambda x: x[state.player_level], state.melee_mobs), 0),
             jnp.arange(state.melee_mobs.mask.shape[1]),
+            unroll=ENV_SCAN_UNROLL,
         )
     if state.passive_mobs.mask.shape[1] > 0:
         (mob_map, _, _), _ = jax.lax.scan(
             _add_mob_to_map,
             (mob_map, jax.tree_util.tree_map(lambda x: x[state.player_level], state.passive_mobs), 1),
             jnp.arange(state.passive_mobs.mask.shape[1]),
+            unroll=ENV_SCAN_UNROLL,
         )
     if state.ranged_mobs.mask.shape[1] > 0:
         (mob_map, _, _), _ = jax.lax.scan(
             _add_mob_to_map,
             (mob_map, jax.tree_util.tree_map(lambda x: x[state.player_level], state.ranged_mobs), 2),
             jnp.arange(state.ranged_mobs.mask.shape[1]),
+            unroll=ENV_SCAN_UNROLL,
         )
     if state.mob_projectiles.mask.shape[1] > 0:
         (mob_map, _, _), _ = jax.lax.scan(
@@ -98,6 +101,7 @@ def render_craftax_symbolic(state: EnvState, static_params: StaticEnvParams):
                 3,
             ),
             jnp.arange(state.mob_projectiles.mask.shape[1]),
+            unroll=ENV_SCAN_UNROLL,
         )
     if state.player_projectiles.mask.shape[1] > 0:
         (mob_map, _, _), _ = jax.lax.scan(
@@ -108,6 +112,7 @@ def render_craftax_symbolic(state: EnvState, static_params: StaticEnvParams):
                 4,
             ),
             jnp.arange(state.player_projectiles.mask.shape[1]),
+            unroll=ENV_SCAN_UNROLL,
         )
 
     def reorder_teammate_info(teammate_info, player_index):

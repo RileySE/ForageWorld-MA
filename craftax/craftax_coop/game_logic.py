@@ -1720,7 +1720,8 @@ def update_mobs(rng, state, params, env_params, static_params):
 
     rng, _rng = jax.random.split(rng)
     (rng, state), _ = jax.lax.scan(
-        _move_melee_mob, (rng, state), jnp.arange(static_params.max_melee_mobs)
+        _move_melee_mob, (rng, state), jnp.arange(static_params.max_melee_mobs),
+        unroll=ENV_SCAN_UNROLL,
     )
 
     # Move passive_mobs
@@ -1842,7 +1843,8 @@ def update_mobs(rng, state, params, env_params, static_params):
 
     rng, _rng = jax.random.split(rng)
     (rng, state), _ = jax.lax.scan(
-        _move_passive_mob, (rng, state), jnp.arange(static_params.max_passive_mobs)
+        _move_passive_mob, (rng, state), jnp.arange(static_params.max_passive_mobs),
+        unroll=ENV_SCAN_UNROLL,
     )
 
     # Move ranged_mobs
@@ -2066,6 +2068,7 @@ def update_mobs(rng, state, params, env_params, static_params):
             _move_ranged_mob,
             (rng, state),
             jnp.arange(static_params.max_ranged_mobs),
+            unroll=ENV_SCAN_UNROLL,
         )
 
     # Move projectiles
@@ -2177,6 +2180,7 @@ def update_mobs(rng, state, params, env_params, static_params):
         _move_mob_projectile,
         (rng, state),
         jnp.arange(static_params.max_mob_projectiles),
+        unroll=ENV_SCAN_UNROLL,
     )
 
     def _move_player_projectile(rng_and_state, projectile_index):
@@ -2353,6 +2357,7 @@ def update_mobs(rng, state, params, env_params, static_params):
         _move_player_projectile,
         (rng, state),
         jnp.arange(static_params.max_player_projectiles),
+        unroll=ENV_SCAN_UNROLL,
     )
 
     return state
@@ -2612,6 +2617,7 @@ def update_plants(state, static_params):
         _set_plant_block,
         state.map[0],
         jnp.arange(static_params.max_growing_plants),
+        unroll=ENV_SCAN_UNROLL,
     )
 
     new_whole_map = state.map.at[0].set(new_map)
