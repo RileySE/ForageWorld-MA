@@ -10,9 +10,9 @@ from environment_base.util import load_compressed_pickle, save_compressed_pickle
 from flax import struct
 from seaborn import husl_palette
 
-# Unroll factor for the per-mob, per-projectile and per-plant scans in the env step and observation.
-# Unrolling lets XLA fuse work across iterations and cuts per-iteration loop overhead (~15% faster
-# env step at 512 envs, bit-identical results) at the cost of longer compiles; 8 was slower than 4.
+# Unroll factor for the sequential melee/ranged-mob, projectile and plant scans in the env step.
+# Unrolling lets XLA fuse work across iterations and cuts per-iteration loop overhead (bit-identical
+# results) at the cost of longer compiles; 8 was slower than 4.
 ENV_SCAN_UNROLL = 4
 
 # GAME CONSTANTS

@@ -7,8 +7,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from craftax.craftax_env import make_craftax_env_from_name
-from craftax_coop.constants import DIRECTIONS_PASSIVE, MOB_TYPE_COLLISION_MAPPING
+from craftax_coop.constants import DIRECTIONS_PASSIVE, MOB_TYPE_COLLISION_MAPPING, OBS_DIM
+from craftax_coop.craftax_state import Mobs
 from craftax_coop.game_logic import move_passive_mobs
+from craftax_coop.renderer.renderer_symbolic import add_mobs_to_obs_mob_map
 from craftax_coop.util.game_logic_utils import (
     in_bounds,
     is_in_other_player,
@@ -152,3 +154,55 @@ def test_move_passive_mobs_matches_sequential_loop():
         )
         actual = jax.jit(jax.vmap(lambda r, s: move_passive_mobs(r, s, params, static_params)))(rngs, states)
         _assert_trees_equal(actual, expected)
+
+
+def _sequential_add_mobs_to_obs_mob_map(mob_map, mobs, mob_class_index, player_position):
+    """The original per-mob scan from render_craftax_symbolic."""
+    obs_dim_array = jnp.array([OBS_DIM[0], OBS_DIM[1]], dtype=jnp.int32)
+
+    def _add_mob_to_map(carry, mob_index):
+        mob_map, mobs, mob_class_index = carry
+        local_position = -1 * player_position + mobs.position[mob_index] + obs_dim_array // 2
+        on_screen = jnp.logical_and(local_position >= 0, local_position < obs_dim_array).all(axis=-1)
+        on_screen *= mobs.mask[mob_index]
+        mob_identifier = mob_class_index * 8 + mobs.type_id[mob_index]
+
+        def _set_mobs_on_map(mob_map, local_position, on_screen):
+            return mob_map.at[local_position[0], local_position[1], mob_identifier].set(
+                on_screen.astype(jnp.int32)
+            )
+
+        mob_map = jax.vmap(_set_mobs_on_map, in_axes=(0, 0, 0))(mob_map, local_position, on_screen)
+        return (mob_map, mobs, mob_class_index), None
+
+    (mob_map, _, _), _ = jax.lax.scan(
+        _add_mob_to_map, (mob_map, mobs, mob_class_index), jnp.arange(mobs.mask.shape[0])
+    )
+    return mob_map
+
+
+def test_obs_mob_map_matches_sequential_writes():
+    num_players, num_mobs = 3, 40
+
+    def random_case(key):
+        keys = jax.random.split(key, 5)
+        player_position = jax.random.randint(keys[0], (num_players, 2), 20, 76)
+        # Mobs on screen, in the band where negative local coordinates wrap, and further away.
+        position = player_position[0] + jax.random.randint(keys[1], (num_mobs, 2), -20, 21)
+        mobs = Mobs(
+            position=position,
+            health=jnp.ones(num_mobs),
+            mask=jax.random.uniform(keys[2], (num_mobs,)) < 0.7,
+            attack_cooldown=jnp.zeros(num_mobs, dtype=jnp.int32),
+            type_id=jax.random.randint(keys[3], (num_mobs,), 0, 8),
+        )
+        mob_map = jax.random.randint(keys[4], (num_players, *OBS_DIM, 40), 0, 2)
+        return mob_map, mobs, player_position
+
+    cases = jax.vmap(random_case)(jax.random.split(jax.random.PRNGKey(5), 32))
+    for mob_class_index in range(5):
+        expected = jax.vmap(
+            lambda m, mobs, p: _sequential_add_mobs_to_obs_mob_map(m, mobs, mob_class_index, p)
+        )(*cases)
+        actual = jax.vmap(lambda m, mobs, p: add_mobs_to_obs_mob_map(m, mobs, mob_class_index, p))(*cases)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))

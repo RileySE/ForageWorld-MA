@@ -6,6 +6,44 @@ from craftax_coop.craftax_state import EnvState, StaticEnvParams
 from craftax_coop.util.game_logic_utils import is_boss_vulnerable
 
 
+OBS_MOB_TYPES_PER_CLASS = 8
+
+
+def add_mobs_to_obs_mob_map(mob_map, mobs, mob_class_index, player_position):
+    """Same result as writing the mobs into mob_map one at a time in index order.
+
+    Each mob writes on_screen (0 or 1) into its class/type channel at its local cell in every
+    player's view, so per (player, cell, channel) the last mob that writes wins. Off-screen and
+    inactive mobs write 0, and negative local coordinates wrap around (numpy-style indexing),
+    so such a mob can clear a cell that an earlier mob set; this existing behaviour is kept.
+    """
+    obs_dim_array = jnp.array([OBS_DIM[0], OBS_DIM[1]], dtype=jnp.int32)
+    local_position = (
+        -1 * player_position[:, None, :]
+        + mobs.position[None, :, :]
+        + obs_dim_array // 2
+    )  # (num_players, num_mobs, 2)
+    on_screen = jnp.logical_and(
+        local_position >= 0, local_position < obs_dim_array
+    ).all(axis=-1)
+    on_screen = jnp.logical_and(on_screen, mobs.mask[None, :])
+
+    wrapped = jnp.where(local_position < 0, local_position + obs_dim_array, local_position)
+    writes = jnp.logical_and(wrapped >= 0, wrapped < obs_dim_array).all(axis=-1)
+    num_mobs = mobs.mask.shape[0]
+    # Odd stamps write 1, even stamps write 0; the highest stamp per cell is the last write.
+    stamp = jnp.where(writes, 2 * jnp.arange(num_mobs)[None, :] + on_screen, -1)
+    wrapped = jnp.clip(wrapped, 0, obs_dim_array - 1)
+    mob_identifier = mob_class_index * OBS_MOB_TYPES_PER_CLASS + mobs.type_id
+    last_write = jnp.full(mob_map.shape, -1, dtype=jnp.int32).at[
+        jnp.arange(mob_map.shape[0])[:, None],
+        wrapped[..., 0],
+        wrapped[..., 1],
+        mob_identifier[None, :],
+    ].max(stamp)
+    return jnp.where(last_write >= 0, last_write % 2, mob_map)
+
+
 def render_craftax_symbolic(state: EnvState, static_params: StaticEnvParams):
     map = state.map[state.player_level]
 
@@ -39,81 +77,25 @@ def render_craftax_symbolic(state: EnvState, static_params: StaticEnvParams):
     item_map_view_one_hot = jax.nn.one_hot(item_map_view, num_classes=len(ItemType))
 
     # Mobs
-    mob_types_per_class = 8
     mob_map = jnp.zeros(
-        (static_params.player_count, *OBS_DIM, 5 * mob_types_per_class), dtype=jnp.int32
+        (static_params.player_count, *OBS_DIM, 5 * OBS_MOB_TYPES_PER_CLASS), dtype=jnp.int32
     )  # 5 classes * 8 types
 
-    def _add_mob_to_map(carry, mob_index):
-        mob_map, mobs, mob_class_index = carry
-
-        local_position = (
-            -1 * state.player_position
-            + mobs.position[mob_index]
-            + obs_dim_array // 2
-        )
-
-        on_screen = jnp.logical_and(
-            local_position >= 0, local_position < obs_dim_array
-        ).all(axis=-1)
-        on_screen *= mobs.mask[mob_index]
-
-        mob_identifier = mob_class_index * mob_types_per_class + mobs.type_id[mob_index]
-
-        def _set_mobs_on_map(mob_map, local_position, on_screen):
-            return mob_map.at[local_position[0], local_position[1], mob_identifier].set(
-                on_screen.astype(jnp.int32)
+    mob_classes = [
+        state.melee_mobs,
+        state.passive_mobs,
+        state.ranged_mobs,
+        state.mob_projectiles,
+        state.player_projectiles,
+    ]
+    for mob_class_index, mobs in enumerate(mob_classes):
+        if mobs.mask.shape[1] > 0:
+            mob_map = add_mobs_to_obs_mob_map(
+                mob_map,
+                jax.tree_util.tree_map(lambda x: x[state.player_level], mobs),
+                mob_class_index,
+                state.player_position,
             )
-
-        mob_map = jax.vmap(_set_mobs_on_map, in_axes=(0, 0, 0))(
-            mob_map, local_position, on_screen
-        )
-
-        return (mob_map, mobs, mob_class_index), None
-
-    if state.melee_mobs.mask.shape[1] > 0:
-        (mob_map, _, _), _ = jax.lax.scan(
-            _add_mob_to_map,
-            (mob_map, jax.tree_util.tree_map(lambda x: x[state.player_level], state.melee_mobs), 0),
-            jnp.arange(state.melee_mobs.mask.shape[1]),
-            unroll=ENV_SCAN_UNROLL,
-        )
-    if state.passive_mobs.mask.shape[1] > 0:
-        (mob_map, _, _), _ = jax.lax.scan(
-            _add_mob_to_map,
-            (mob_map, jax.tree_util.tree_map(lambda x: x[state.player_level], state.passive_mobs), 1),
-            jnp.arange(state.passive_mobs.mask.shape[1]),
-            unroll=ENV_SCAN_UNROLL,
-        )
-    if state.ranged_mobs.mask.shape[1] > 0:
-        (mob_map, _, _), _ = jax.lax.scan(
-            _add_mob_to_map,
-            (mob_map, jax.tree_util.tree_map(lambda x: x[state.player_level], state.ranged_mobs), 2),
-            jnp.arange(state.ranged_mobs.mask.shape[1]),
-            unroll=ENV_SCAN_UNROLL,
-        )
-    if state.mob_projectiles.mask.shape[1] > 0:
-        (mob_map, _, _), _ = jax.lax.scan(
-            _add_mob_to_map,
-            (
-                mob_map,
-                jax.tree_util.tree_map(lambda x: x[state.player_level], state.mob_projectiles),
-                3,
-            ),
-            jnp.arange(state.mob_projectiles.mask.shape[1]),
-            unroll=ENV_SCAN_UNROLL,
-        )
-    if state.player_projectiles.mask.shape[1] > 0:
-        (mob_map, _, _), _ = jax.lax.scan(
-            _add_mob_to_map,
-            (
-                mob_map,
-                jax.tree_util.tree_map(lambda x: x[state.player_level], state.player_projectiles),
-                4,
-            ),
-            jnp.arange(state.player_projectiles.mask.shape[1]),
-            unroll=ENV_SCAN_UNROLL,
-        )
 
     def reorder_teammate_info(teammate_info, player_index):
         i1 = (jnp.arange(static_params.player_count) == 0) * player_index
