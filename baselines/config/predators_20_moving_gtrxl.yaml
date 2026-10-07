@@ -2,8 +2,8 @@
 WANDB_MODE: "online"
 ENTITY: ""
 PROJECT: "ForageWorld"
-RUN_NAME: "20 Predators grid - moving passives"
-DESCRIPTION: "20 Predators.Moving Passives"
+RUN_NAME: "20 Predators grid - moving passives - GTrXL-128"
+DESCRIPTION: "20 Predators.Moving Passives. GTrXL-128 sequence model (paper Craftax config: d=128, dh=64, 4 heads, 4 layers, M=128)"
 OUTPUT_DIR: ""
 
 # Environment configuration
@@ -63,7 +63,7 @@ ACTIVATION: "tanh"
 
 # ── Sequence model ──
 # POLICY_ARCH: "gru" (default), "transformer", "agalite", or "gtrxl".
-POLICY_ARCH: "gru"
+POLICY_ARCH: "gtrxl"
 
 # Transformer policy hyperparameters (used only when POLICY_ARCH: "transformer").
 # These are PER AGENT, and parameter-matched to the per-agent GRU core: with

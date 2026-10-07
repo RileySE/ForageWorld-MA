@@ -9,7 +9,7 @@
 #   RUN_NAME / ALG_NAME  — separate wandb run + separate checkpoint dir
 #                          (CHECKPOINT_DIR: "" -> ./<RUN_NAME>/checkpoints, so the
 #                          two runs must not share a RUN_NAME)
-#   ENT_COEF             — 0.01 -> 0.0025, see note below
+#   ENT_COEF             — 0.01 -> 0.00333, see note below
 #   dropped              — USE_TEAMMATE_AUXILIARY_LOSS / AUX_TEAMMATE_WEIGHT
 #                          (meaningless for a controller that observes everything;
 #                          central_ippo_rnn ignores them and warns)
@@ -73,7 +73,7 @@ TEAM_COMPOSITION: [1, 1, 2]
 USE_REDUCED_ACTION_SPACE: true
 
 # Centralization
-# How the 4 per-agent rewards collapse into the single scalar the critic predicts.
+# How the 3 per-agent rewards collapse into the single scalar the critic predicts.
 # SHARED_REWARD is true here, so all per-agent rewards are identical and "mean"
 # reproduces the shared reward exactly — the return scale therefore matches the
 # separate run and overview/shared_reward is comparable across the two.
@@ -121,10 +121,10 @@ GAE_LAMBDA: 0.8
 GAMMA: 0.99
 CLIP_EPS: 0.2
 SCALE_CLIP_EPS: false
-# Joint entropy = sum over the 4 action heads, i.e. ~4x the per-agent entropy the
-# separate runner regularizes. 0.01 / 4 keeps the per-head exploration pressure
+# Joint entropy = sum over the 3 action heads, i.e. ~3x the per-agent entropy the
+# separate runner regularizes. 0.01 / 3 keeps the per-head exploration pressure
 # equal to predators_20_moving.yaml.
-ENT_COEF: 0.0025
+ENT_COEF: 0.00333
 VF_COEF: 0.5
 AUX_COEF: 0.1
 AUX_SELF_WEIGHT: 1.0

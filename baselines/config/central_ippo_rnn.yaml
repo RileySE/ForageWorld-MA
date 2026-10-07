@@ -111,8 +111,8 @@ SCALE_CLIP_EPS: false
 # Entropy is the JOINT entropy (sum over the num_agents action heads), so it is
 # ~num_agents times larger than the per-agent entropy in seperate_ippo_rnn.
 # ENT_COEF is scaled down accordingly to keep the exploration pressure per head
-# comparable (0.01 / 4 agents).
-ENT_COEF: 0.0025
+# comparable (0.01 / 3 agents, i.e. num_agents = NUM_TEAMS * len(TEAM_COMPOSITION)).
+ENT_COEF: 0.00333
 VF_COEF: 0.5
 AUX_COEF: 0.1
 AUX_SELF_WEIGHT: 1.0

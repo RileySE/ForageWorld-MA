@@ -15,6 +15,13 @@ SEQUENCE MODEL — POLICY_ARCH selects what carries information across time:
     cut-off, and per-step cost is constant in episode length.  Cost of that:
     with the paper's Craftax architecture the carry is ~52x the GRU's and the
     core has ~1.8x the GRU's parameters.  See baselines/agalite_policy.py.
+  * "gtrxl": one GTrXL-M (gated Transformer-XL) per agent, carry
+    (num_agents, num_envs, (L+1)*M*d + M) — a per-layer cache of the last M
+    hidden states plus a slot mask.  Relative positions, GRU-gated residuals,
+    segment-level recurrence.  NOTE: unlike the other three, its rollout and
+    its PPO recompute are not the same computation (attention span depends on
+    where the segment boundary falls), so the epoch-0 ratio is not ~1.  See
+    "Recompute semantics" in baselines/gtrxl_policy.py.
   * "transformer": one causal, fixed-window transformer per agent, carry
     (num_agents, num_envs, TF_MAX_HISTORY, TF_D_MODEL + 1) — a per-agent ring
     buffer of that agent's last TF_MAX_HISTORY token embeddings plus a per-slot
@@ -72,6 +79,7 @@ from craftax.custom_rendering.full_map_rendering import render_full_map
 import checkpoint_utils as ckpt
 import transformer_policy as tfp
 import agalite_policy as agp
+import gtrxl_policy as gxp
 
 # ===========================
 # Model Definitions
@@ -107,17 +115,19 @@ class ActorCriticRNN(nn.Module):
     runner vmaps this module over the leading agent axis.
 
     The sequence model is selected by POLICY_ARCH ("gru" | "transformer" |
-    "agalite").  All three consume (embedding, resets) and emit one vector per
-    step, so the actor / critic / aux heads below are identical either way.
-    Per-agent carry:
+    "agalite" | "gtrxl").  All four consume (embedding, resets) and emit one
+    vector per step, so the actor / critic / aux heads below are identical
+    either way.  Per-agent carry:
         gru         (num_envs, GRU_HIDDEN_DIM)
         transformer (num_envs, TF_MAX_HISTORY, TF_D_MODEL + 1)
         agalite     (num_envs, agp.carry_size(hp))
-    Output width is GRU_HIDDEN_DIM for gru/transformer and AG_D_MODEL for
-    agalite (AG_OUT_DIM: 512 makes it GRU_HIDDEN_DIM there too).
+        gtrxl       (num_envs, gxp.carry_size(hp))
+    Output width is GRU_HIDDEN_DIM for gru/transformer, AG_D_MODEL for agalite
+    and GX_EMBEDDING_DIM for gtrxl (AG_OUT_DIM / GX_OUT_DIM: 512 make those
+    GRU_HIDDEN_DIM too).
     Each agent's sequence model sees only that agent's OWN egocentric
-    observation history -- a fixed window for "transformer", the whole episode
-    for "gru" and "agalite".  Nothing is shared across agents, so this stays
+    observation history -- a fixed window for "transformer", a per-layer
+    M-step memory for "gtrxl", the whole episode for "gru" and "agalite".  Nothing is shared across agents, so this stays
     decentralized either way.
     """
     action_dim: Sequence[int]
@@ -140,6 +150,10 @@ class ActorCriticRNN(nn.Module):
         elif arch == "agalite":
             hidden, embedding = agp.ScannedAGaLiTe(
                 **agp.hparams_from_config(self.config)
+            )(hidden, rnn_in)
+        elif arch == "gtrxl":
+            hidden, embedding = gxp.ScannedGTrXL(
+                **gxp.hparams_from_config(self.config)
             )(hidden, rnn_in)
         else:
             hidden, embedding = ScannedRNN()(hidden, rnn_in)
@@ -408,16 +422,20 @@ def make_train(config, env):
         dead_only_noop_logits = dead_only_noop_logits.at[..., noop_policy_action_idx].set(0.0)
         return jnp.where(alive_mask[..., None], logits, dead_only_noop_logits)
 
-    # -- Sequence-model selection: GRU carry / transformer window / AGaLiTe state --
+    # -- Sequence-model selection: GRU / transformer window / AGaLiTe state / GTrXL memory --
     policy_arch = str(config.get("POLICY_ARCH", "gru")).lower()
-    if policy_arch not in ("gru", "transformer", "agalite"):
+    if policy_arch not in ("gru", "transformer", "agalite", "gtrxl"):
         raise ValueError(
-            f'POLICY_ARCH must be "gru", "transformer" or "agalite", got {policy_arch!r}'
+            'POLICY_ARCH must be "gru", "transformer", "agalite" or "gtrxl", '
+            f"got {policy_arch!r}"
         )
-    _ag_hp = None
+    _ag_hp = _gx_hp = None
     if policy_arch == "agalite":
         _ag_hp = agp.hparams_from_config(config)
         print(agp.describe(_ag_hp, int(config["FC_DIM_SIZE"]), int(config["GRU_HIDDEN_DIM"])))
+    if policy_arch == "gtrxl":
+        _gx_hp = gxp.hparams_from_config(config)
+        print(gxp.describe(_gx_hp, int(config["FC_DIM_SIZE"]), int(config["GRU_HIDDEN_DIM"])))
     if policy_arch == "transformer":
         _tf_hp = tfp.hparams_from_config(config)
         # Write the resolved values back so the printed report, the checkpoint
@@ -435,6 +453,7 @@ def make_train(config, env):
         gru         -> (batch_size, GRU_HIDDEN_DIM)
         transformer -> (batch_size, TF_MAX_HISTORY, TF_D_MODEL + 1)
         agalite     -> (batch_size, agp.carry_size(_ag_hp))
+        gtrxl       -> (batch_size, gxp.carry_size(_gx_hp))
         """
         if policy_arch == "transformer":
             return tfp.ScannedTransformer.initialize_carry(
@@ -442,6 +461,10 @@ def make_train(config, env):
             )
         if policy_arch == "agalite":
             return agp.ScannedAGaLiTe.initialize_carry(batch_size, agp.carry_size(_ag_hp))
+        if policy_arch == "gtrxl":
+            return gxp.ScannedGTrXL.initialize_carry(
+                batch_size, gxp.carry_size(_gx_hp), _gx_hp["memory_len"]
+            )
         return ScannedRNN.initialize_carry(batch_size, config["GRU_HIDDEN_DIM"])
 
     def zero_hstate_all_agents(batch_size):
@@ -1966,14 +1989,63 @@ def single_run(config):
     wandb.finish()
 
 
+def apply_overrides(config, overrides):
+    """Apply command-line `KEY=VALUE` overrides to a loaded config.
+
+    Values are parsed as YAML, so `GX_MEMORY_LEN=32`, `LR=1e-4`,
+    `PASSIVE_MOBS_STATIC=true`, `TEAM_COMPOSITION=[1, 1, 2]` and
+    `AG_OUT_DIM=null` all give the type the YAML file would give.
+    A key must already exist in the config; prefix it with `+` to add a new one
+    (`+MY_NEW_KEY=1`), so that a typo is an error rather than a silently
+    ignored sweep parameter.
+    """
+    for override in overrides:
+        if "=" not in override:
+            raise ValueError(
+                f"Malformed override {override!r}: expected KEY=VALUE"
+            )
+        key, _, raw_value = override.partition("=")
+        key = key.strip()
+        allow_new = key.startswith("+")
+        if allow_new:
+            key = key[1:].strip()
+        if not key:
+            raise ValueError(f"Malformed override {override!r}: empty key")
+        if key not in config and not allow_new:
+            raise ValueError(
+                f"Unknown config key {key!r}. Use +{key}={raw_value} to add it."
+            )
+        try:
+            value = yaml.safe_load(raw_value)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Could not parse value of override {override!r}: {e}")
+        if isinstance(value, str):
+            # YAML 1.1 only reads exponents written as 1.0e-4, so `LR=1e-4`
+            # would otherwise stay a string and reach optax as one.
+            try:
+                value = float(value)
+            except ValueError:
+                pass
+        print(f"Config override: {key} = {config.get(key)!r} -> {value!r}")
+        config[key] = value
+    return config
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_file", help="Name of the config YAML file (in baselines/config/)")
-    args = parser.parse_args()
+    parser.add_argument(
+        "overrides",
+        nargs="*",
+        metavar="KEY=VALUE",
+        help="Config overrides, e.g. GX_MEMORY_LEN=32 LR=1e-4 (prefix with + to add a new key)",
+    )
+    args = parser.parse_intermixed_args()
 
     config_path = os.path.join(os.path.dirname(__file__), "config", args.config_file)
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
+    config = apply_overrides(config, args.overrides)
     single_run(config)
 
 

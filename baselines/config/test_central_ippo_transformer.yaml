@@ -96,7 +96,7 @@ GAE_LAMBDA: 0.8
 GAMMA: 0.99
 CLIP_EPS: 0.2
 SCALE_CLIP_EPS: false
-ENT_COEF: 0.0025  # joint entropy (sum over action heads) -> scaled down vs per-agent runners
+ENT_COEF: 0.00333  # joint entropy (sum over action heads) -> scaled down vs per-agent runners
 VF_COEF: 0.5
 AUX_COEF: 0.1
 AUX_SELF_WEIGHT: 1.0

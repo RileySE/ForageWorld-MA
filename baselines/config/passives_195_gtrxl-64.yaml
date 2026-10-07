@@ -2,13 +2,13 @@
 WANDB_MODE: "online"
 ENTITY: ""
 PROJECT: "ForageWorld"
-RUN_NAME: "20 Predators grid - moving passives"
-DESCRIPTION: "20 Predators.Moving Passives"
+RUN_NAME: "Passive grid search. 50 Percent Positive - GTrXL-64"
+DESCRIPTION: "195 Moving Snails. GTrXL-128 sequence model (paper Craftax config: d=128, dh=64, 4 heads, 4 layers, M=128)"
 OUTPUT_DIR: ""
 
 # Environment configuration
 ENV_NAME: "Craftax-Coop-Symbolic"
-MAX_PASSIVE_MOBS: 131
+MAX_PASSIVE_MOBS: 195
 MAX_MELEE_MOBS: 20
 MAX_RANGED_MOBS: 0
 
@@ -45,7 +45,7 @@ PASSIVE_MOBS_STATIC: false #snails do not move if true. boosts sps
 TRADE_RADIUS: 15
 TRADE_RADIUS_SHAPE: "circle"
 
-EARLY_EPISODE_CAP: 3000
+EARLY_EPISODE_CAP: 5000
 EARLY_EPISODE_CAP_UNTIL: 25000
 GENERAL_EPISODE_CAP: 9000
 TERMINATE_ON_ANY_DEATH: false
@@ -63,30 +63,9 @@ ACTIVATION: "tanh"
 
 # ── Sequence model ──
 # POLICY_ARCH: "gru" (default), "transformer", "agalite", or "gtrxl".
-POLICY_ARCH: "gru"
-
-# Transformer policy hyperparameters (used only when POLICY_ARCH: "transformer").
-# These are PER AGENT, and parameter-matched to the per-agent GRU core: with
-# FC_DIM_SIZE=128 / GRU_HIDDEN_DIM=512 the GRU core is 985,088 params and these
-# defaults give 1,016,768 (1.032x).
-TF_MAX_HISTORY: 16        # attention window, in env steps. Each agent's carry
-                          #   holds this many of its own past token embeddings;
-                          #   older steps are dropped.
-TF_D_MODEL: 192           # residual stream width. "auto" solves for the width
-                          #   that best matches the GRU parameter count.
-TF_N_LAYERS: 2            # transformer blocks
-TF_N_HEADS: 4             # attention heads; must divide TF_D_MODEL (192/4 = 48)
-TF_MLP_RATIO: 4.0         # FFN hidden width = ratio * TF_D_MODEL (= 768)
-TF_OUT_DIM: null          # output width; null -> GRU_HIDDEN_DIM, so the actor /
-                          #   critic / aux heads are unchanged vs the GRU
-TF_ACTIVATION: "gelu"     # "gelu" | "relu" | "swish"
-TF_NORM_PLACEMENT: "pre"  # "pre" (pre-LN, stable) | "post"
-TF_POS_ENCODING: "learned"  # "learned" | "sinusoidal" | "none"; relative by
-                          #   construction, since the window shifts every step
-TF_QKV_BIAS: true         # bias on the q/k/v/out projections
-TF_ATTN_DROPOUT: 0.0      # must stay 0.0 (no rng plumbing; PPO ratio exactness)
-TF_RESID_DROPOUT: 0.0     # must stay 0.0 (same reason)
-TF_INIT_SCALE: 1.0        # orthogonal gain on the in/out projections
+# Flip this back to "gru" for the GRU baseline; the AG_* block below is
+# inert unless POLICY_ARCH is "agalite".
+POLICY_ARCH: "gtrxl"
 
 # AGaLiTe policy hyperparameters (used only when POLICY_ARCH: "agalite").
 # These are the paper's Craftax architecture -- Pramanik, Elelimy, Machado &
@@ -130,7 +109,7 @@ GX_EMBEDDING_DIM: 128  # d: residual stream width
 GX_HEAD_DIM: 64        # d_h: per-head dim
 GX_HEAD_NUM: 4         # attention heads
 GX_MLP_NUM: 2          # Dense layers per block FFN (all d wide)
-GX_MEMORY_LEN: 128     # M: cached hidden states PER LAYER. This is the "128" in
+GX_MEMORY_LEN: 64     # M: cached hidden states PER LAYER. This is the "128" in
                        #   GTrXL-128, and the whole carry scales linearly with it.
                        #   Each layer attends M steps back, so the receptive
                        #   field compounds to ~L*M with depth.
@@ -149,7 +128,6 @@ GX_OUT_DIM: null       # null -> the stack emits GX_EMBEDDING_DIM (128), like th
 # an epoch-0 importance ratio of 1 +/- 1.1e-4 (0.055% of CLIP_EPS; AGaLiTe is
 # 4.8e-7, GRU is exactly 0).  Inherent to Transformer-XL segment recurrence and
 # matches the reference. See "Recompute semantics" in baselines/gtrxl_policy.py.
-
 
 # Training parameters
 TOTAL_TIMESTEPS: 2000000000
@@ -171,6 +149,7 @@ LR: 0.0002
 MAX_GRAD_NORM: 1.0
 LR_WARMUP: 0.0
 REW_SHAPING_HORIZON: 1000000
+LR_ANNEAL_UPDATES: 91553
 
 # Seed configuration
 NUM_SEEDS: 1

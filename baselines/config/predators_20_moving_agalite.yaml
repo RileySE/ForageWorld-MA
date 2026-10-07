@@ -62,7 +62,7 @@ FC_DIM_SIZE: 128
 ACTIVATION: "tanh"
 
 # ── Sequence model ──
-# POLICY_ARCH: "gru" (default), "transformer", or "agalite".
+# POLICY_ARCH: "gru" (default), "transformer", "agalite", or "gtrxl".
 POLICY_ARCH: "agalite"
 
 # Transformer policy hyperparameters (used only when POLICY_ARCH: "transformer").
@@ -120,6 +120,36 @@ AG_STABLE_PHASE: true  # evaluate cos(w t) by folding the phase into [0, 2pi).
 # Memory note: the per-env carry is 26,625 floats vs the GRU's 512, so
 # init_hstate is ~218 MB at NUM_ENVS: 512 x 4 agents (the GRU's is ~4 MB), and
 # it is held in a few copies during the PPO update.  AG_ETA: 4 halves it.
+
+# GTrXL policy hyperparameters (used only when POLICY_ARCH: "gtrxl").
+# These are the paper's "GTrXL-128" Craftax architecture -- Table 4, GTrXL
+# column with memory size M = 128 -- i.e. the authors' released
+# config_pure/craftax/gtrxl128.yaml.  PER AGENT.
+GX_LAYER_NUM: 4        # L: GTrXL blocks
+GX_EMBEDDING_DIM: 128  # d: residual stream width
+GX_HEAD_DIM: 64        # d_h: per-head dim
+GX_HEAD_NUM: 4         # attention heads
+GX_MLP_NUM: 2          # Dense layers per block FFN (all d wide)
+GX_MEMORY_LEN: 128     # M: cached hidden states PER LAYER. This is the "128" in
+                       #   GTrXL-128, and the whole carry scales linearly with it.
+                       #   Each layer attends M steps back, so the receptive
+                       #   field compounds to ~L*M with depth.
+GX_GRU_BIAS: 2.0       # b_g init for the two GRU gates per block
+GX_RESET_ON_TERMINATE: true  # sever attention across an episode boundary
+GX_OUT_DIM: null       # null -> the stack emits GX_EMBEDDING_DIM (128), like the
+                       #   reference.  Set 512 to project up to GRU_HIDDEN_DIM.
+# Memory note: the per-env carry is (L+1)*M*d + M = 82,048 floats -- 160x the
+# GRU's 512 and ~3x AGaLiTe's 26,625.  At NUM_ENVS: 512 x 3 agents that is
+# ~504 MB for init_hstate alone, held in a few copies during the PPO update.
+# GX_MEMORY_LEN: 64 halves it (and gives the paper's other sweep point, 256,
+# doubles it).
+# Caveat: GTrXL's rollout (T=1) and its PPO recompute (T=NUM_STEPS) are not the
+# same computation -- attention span depends on where the segment boundary
+# falls.  Measured at this shape: hidden states differ by up to 3.5e-2, giving
+# an epoch-0 importance ratio of 1 +/- 1.1e-4 (0.055% of CLIP_EPS; AGaLiTe is
+# 4.8e-7, GRU is exactly 0).  Inherent to Transformer-XL segment recurrence and
+# matches the reference. See "Recompute semantics" in baselines/gtrxl_policy.py.
+
 
 
 # Training parameters
