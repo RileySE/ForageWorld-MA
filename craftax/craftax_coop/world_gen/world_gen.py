@@ -12,6 +12,14 @@ from craftax_coop.world_gen.world_gen_configs import (
     ALL_SMOOTHGEN_CONFIGS,
 )
 
+# Episodes are played entirely on START_LEVEL (the first dungeon level); floor changes are
+# disabled. Only levels 0..START_LEVEL are kept in the env state: START_LEVEL is the playing
+# level and update_plants writes to level 0. Nothing reads the deeper levels, and storing all
+# static_params.num_levels (9) of them made each env step about twice as slow. num_levels
+# itself stays 9 because the boss/terminal checks use it as the logical number of levels.
+START_LEVEL = 2
+NUM_STORED_LEVELS = START_LEVEL + 1
+
 
 def get_new_empty_inventory(player_count):
     return Inventory(
@@ -649,19 +657,16 @@ def generate_world(rng, params, static_params):
     # dungeon_room_positions: (3, num_rooms, 2) top-left corner of each room (unpadded)
     # dungeon_room_sizes:     (3, num_rooms, 2) (height, width) of each room
 
-    # Returns stacked versions of the map, item_map, light_map and ladders
-    # 9 elements in each of these stacks representing each of the levels.
-    # Splice smoothgens and dungeons in order of levels
+    # Returns stacked versions of the map, item_map, light_map and ladders.
+    # The full level order is (x[0], x[1], y[0], y[1], y[2], x[2], x[3], x[4], x[5]);
+    # only the first NUM_STORED_LEVELS of them are kept (see NUM_STORED_LEVELS).
     map, item_map, light_map, ladders_down, ladders_up = jax.tree_util.tree_map(
-        lambda x, y: jnp.stack(
-            (x[0], x[1], y[0], y[1], y[2], x[2], x[3], x[4], x[5]), axis=0
-        ),
+        lambda x, y: jnp.stack((x[0], x[1], y[0]), axis=0),
         smoothgens,
         dungeons,
     )
 
     # --- Phase 2: Pick team spawn positions inside ROOMS on the start level ---
-    START_LEVEL = 2  # First dungeon level (dungeon index 0)
     start_room_positions = dungeon_room_positions[0]  # (num_rooms, 2) top-left corners
     start_room_sizes = dungeon_room_sizes[0]          # (num_rooms, 2) (h, w)
 
@@ -858,14 +863,14 @@ def generate_world(rng, params, static_params):
     def generate_empty_mobs(max_mobs):
         return Mobs(
             position=jnp.zeros(
-                (static_params.num_levels, max_mobs, 2), dtype=jnp.int32
+                (NUM_STORED_LEVELS, max_mobs, 2), dtype=jnp.int32
             ),
-            health=jnp.ones((static_params.num_levels, max_mobs), dtype=jnp.float32),
-            mask=jnp.zeros((static_params.num_levels, max_mobs), dtype=bool),
+            health=jnp.ones((NUM_STORED_LEVELS, max_mobs), dtype=jnp.float32),
+            mask=jnp.zeros((NUM_STORED_LEVELS, max_mobs), dtype=bool),
             attack_cooldown=jnp.zeros(
-                (static_params.num_levels, max_mobs), dtype=jnp.int32
+                (NUM_STORED_LEVELS, max_mobs), dtype=jnp.int32
             ),
-            type_id=jnp.zeros((static_params.num_levels, max_mobs), dtype=jnp.int32),
+            type_id=jnp.zeros((NUM_STORED_LEVELS, max_mobs), dtype=jnp.int32),
         )
 
     melee_mobs = generate_empty_mobs(
@@ -1086,11 +1091,11 @@ def generate_world(rng, params, static_params):
         projectiles = generate_empty_mobs(max_num)
 
         projectile_directions = jnp.ones(
-            (static_params.num_levels, max_num, 2), dtype=jnp.int32
+            (NUM_STORED_LEVELS, max_num, 2), dtype=jnp.int32
         )
 
         projectile_owners = jnp.zeros(
-            (static_params.num_levels, max_num), dtype=jnp.int32
+            (NUM_STORED_LEVELS, max_num), dtype=jnp.int32
         )
 
         return projectiles, projectile_directions, projectile_owners
@@ -1126,13 +1131,13 @@ def generate_world(rng, params, static_params):
         map=map,
         item_map=item_map,
         mob_map=jnp.zeros(
-            (static_params.num_levels, *static_params.map_size), dtype=bool
+            (NUM_STORED_LEVELS, *static_params.map_size), dtype=bool
         ),
         light_map=light_map,
         down_ladders=ladders_down,
         up_ladders=ladders_up,
-        chests_opened=jnp.zeros((static_params.num_levels, static_params.player_count), dtype=bool),
-        monsters_killed=jnp.zeros(static_params.num_levels, dtype=jnp.int32)
+        chests_opened=jnp.zeros((NUM_STORED_LEVELS, static_params.player_count), dtype=bool),
+        monsters_killed=jnp.zeros(NUM_STORED_LEVELS, dtype=jnp.int32)
         .at[0]
         .set(10),  # First ladder starts open
         player_position=player_position,
