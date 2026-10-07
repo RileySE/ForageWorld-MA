@@ -928,7 +928,6 @@ def make_train(config, env, wandb_start_step=-1):
             )
             train_state = update_state[0]
             
-            # traj_info is a FrozenDict from LogWrapper - create new dict to avoid mutation issues
             loss_aux = loss_info[1]  # LossAux with fields stacked (num_epochs, num_minibatches, ...)
             # ratio_0: get before mean reduction (like original)
             ratio_0 = loss_aux.ratio.at[0, 0].get().mean()
@@ -946,9 +945,16 @@ def make_train(config, env, wandb_start_step=-1):
             loss_info_mean = jax.tree.map(lambda x: x.mean(), loss_info)
             loss_aux_mean = loss_info_mean[1]
 
-            # Create new metric dict (don't mutate FrozenDict from LogWrapper)
+            # Episode metrics are reduced on device to per-agent means over the episodes that
+            # finished during this rollout, so the per-update host callback receives a few
+            # hundred scalars instead of every (step, env, agent) value of every info field.
+            finished = traj_info["returned_episode"]  # (num_steps, num_envs, num_agents)
+            finished_count = finished.sum(axis=(0, 1))  # (num_agents,)
+
+            def _finished_episode_mean(x):
+                return jnp.where(finished, x, 0.0).sum(axis=(0, 1)) / jnp.maximum(finished_count, 1)
+
             metric = {
-                **dict(traj_info),  # Convert FrozenDict to regular dict
                 "update_steps": update_steps,
                 "loss": {
                     "total_loss": loss_info_mean[0],
@@ -968,6 +974,15 @@ def make_train(config, env, wandb_start_step=-1):
                     "entropy": entropy_per_agent,            # (num_agents,)
                     "aux_loss": aux_loss_per_agent,          # (num_agents,)
                 },
+                "finished_episodes": finished_count,  # (num_agents,)
+                "episode_means": jax.tree.map(  # every leaf: (num_agents,)
+                    _finished_episode_mean,
+                    {
+                        "user_info": traj_info["user_info"],
+                        "returned_episode_returns": traj_info["returned_episode_returns"],
+                        "returned_episode_lengths": traj_info["returned_episode_lengths"],
+                    },
+                ),
             }
 
             rng = update_state[-1]
@@ -1028,21 +1043,25 @@ def make_train(config, env, wandb_start_step=-1):
                         to_log[f"agent_{i}/{k}"] = np.asarray(metrics["loss_per_agent"][k][i]).item()
 
                 # ── Episode-level metrics (only when episodes returned) ──
-                if metrics["returned_episode"].any():
-                    info = metrics["user_info"]
-                    ep_mask = metrics["returned_episode"]  # (num_steps, num_envs, num_agents)
+                if metrics["finished_episodes"].any():
+                    finished_count = np.asarray(metrics["finished_episodes"])  # (num_agents,)
+                    episode_means = metrics["episode_means"]
+                    info = episode_means["user_info"]
 
                     def _team_agent_indices(team_idx):
                         start = team_idx * agents_per_team
                         end = min(start + agents_per_team, num_agents)
                         return range(start, end)
 
+                    def _finished_mean(per_agent_means, agent_idx):
+                        """Mean over this agent's returned episodes, or None if none returned."""
+                        if finished_count[agent_idx] == 0:
+                            return None
+                        return np.asarray(per_agent_means[agent_idx]).item()
+
                     def _agent_mean(key, agent_idx):
                         """Mean of metric for agent over returned episodes."""
-                        mask = ep_mask[:, :, agent_idx]
-                        if not mask.any():
-                            return None
-                        return np.asarray(info[key][:, :, agent_idx][mask].mean()).item()
+                        return _finished_mean(info[key], agent_idx)
 
                     def _team_mean(key, team_idx):
                         """Mean of metric across team members over returned episodes."""
@@ -1064,17 +1083,13 @@ def make_train(config, env, wandb_start_step=-1):
 
                     def _global_mean(key):
                         """Mean of metric over all returned episodes (agent 0, broadcast metric)."""
-                        mask = ep_mask[:, :, 0]
-                        if not mask.any():
-                            return None
-                        return np.asarray(info[key][:, :, 0][mask].mean()).item()
+                        return _agent_mean(key, 0)
 
                     # overview/ episode metrics
-                    ep_lengths = metrics["returned_episode_lengths"]
-                    ep_returns = metrics["returned_episode_returns"]
-                    mask0 = ep_mask[:, :, 0]
-                    if mask0.any():
-                        to_log["overview/episode_length"] = np.asarray(ep_lengths[:, :, 0][mask0].mean()).item()
+                    ep_returns = episode_means["returned_episode_returns"]
+                    episode_length = _finished_mean(episode_means["returned_episode_lengths"], 0)
+                    if episode_length is not None:
+                        to_log["overview/episode_length"] = episode_length
 
                     # Overview shared/team reward as mean across all agent returns.
                     # When SHARED_REWARD=True, all per-agent returns are identical and
@@ -1082,9 +1097,8 @@ def make_train(config, env, wandb_start_step=-1):
                     # this stays a useful team-level overview metric.
                     all_agent_returns = []
                     for ai in range(num_agents):
-                        mask_ai = ep_mask[:, :, ai]
-                        if mask_ai.any():
-                            agent_return = np.asarray(ep_returns[:, :, ai][mask_ai].mean()).item()
+                        agent_return = _finished_mean(ep_returns, ai)
+                        if agent_return is not None:
                             all_agent_returns.append(agent_return)
                             to_log[f"agent_{ai}/episode_return"] = agent_return
                             individual_reward = _agent_mean("Reward/individual_reward", ai)
@@ -1165,9 +1179,9 @@ def make_train(config, env, wandb_start_step=-1):
                         # shared_reward (= episode_returns averaged over team members)
                         team_ret = []
                         for idx in _team_agent_indices(ti):
-                            mask_ai = ep_mask[:, :, idx]
-                            if mask_ai.any():
-                                team_ret.append(np.asarray(ep_returns[:, :, idx][mask_ai].mean()).item())
+                            v = _finished_mean(ep_returns, idx)
+                            if v is not None:
+                                team_ret.append(v)
                         if team_ret:
                             to_log[f"{tp}/shared_reward"] = np.mean(team_ret)
 
