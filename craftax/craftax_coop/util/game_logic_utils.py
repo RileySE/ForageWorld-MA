@@ -2,6 +2,7 @@ import chex
 
 from craftax_coop.constants import *
 from craftax_coop.craftax_state import *
+from craftax_coop.util.maths_utils import random_choice
 
 # For utility functions - functions called more than once in meaningfully different parts of the codebase
 
@@ -566,7 +567,7 @@ def get_ladder_positions(rng, static_params, config, map):
     valid_ladder_down = find_valid_ladder_areas(
         valid_ladder_down, static_params.player_count
     ).flatten()
-    ladder_index = jax.random.choice(
+    ladder_index = random_choice(
         rng,
         jnp.arange(static_params.map_size[0] * static_params.map_size[1]),
         p=valid_ladder_down / valid_ladder_down.sum(),

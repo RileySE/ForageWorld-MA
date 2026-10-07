@@ -247,7 +247,7 @@ def add_items_from_chest(rng, state, inventory, is_opening_chest):
     rng, _rng = jax.random.split(rng)
     is_looting_ore = jax.random.uniform(_rng) < collect_prob * is_opening_chest
     rng, _rng = jax.random.split(rng)
-    ore_loot_id = jax.random.choice(
+    ore_loot_id = random_choice(
         _rng,
         jnp.arange(5, dtype=jnp.int32),
         shape=(),
@@ -313,7 +313,7 @@ def add_items_from_chest(rng, state, inventory, is_opening_chest):
     )
     rng, _rng = jax.random.split(rng)
     pickaxe_loot_level = (
-        jax.random.choice(
+        random_choice(
             _rng,
             (jnp.arange(4) + 1).astype(int),
             shape=(),
@@ -1523,7 +1523,7 @@ def update_mobs(rng, state, params, env_params, static_params):
             DIRECTIONS[1:5] + melee_mobs.position[state.player_level, melee_mob_index], 
             static_params
         )
-        random_move_direction = jax.random.choice(
+        random_move_direction = random_choice(
             _rng,
             DIRECTIONS[1:5],
             p=valid_random_moves
@@ -1551,7 +1551,7 @@ def update_mobs(rng, state, params, env_params, static_params):
             player_move_direction_abs == player_move_direction_abs.max()
         ) / player_move_direction_abs.sum()
         rng, _rng = jax.random.split(rng)
-        player_move_direction_index = jax.random.choice(
+        player_move_direction_index = random_choice(
             _rng,
             jnp.arange(2),
             p=player_move_direction_index_p,
@@ -1739,7 +1739,7 @@ def update_mobs(rng, state, params, env_params, static_params):
                 DIRECTIONS_PASSIVE + passive_mobs.position[state.player_level, passive_mob_index],
                 static_params
             )
-            random_move_direction = jax.random.choice(
+            random_move_direction = random_choice(
                 _rng,
                 DIRECTIONS_PASSIVE,
                 p=valid_random_moves
@@ -1859,7 +1859,7 @@ def update_mobs(rng, state, params, env_params, static_params):
             DIRECTIONS[1:5] + ranged_mobs.position[state.player_level, ranged_mob_index], 
             static_params
         )
-        random_move_direction = jax.random.choice(
+        random_move_direction = random_choice(
             _rng,
             DIRECTIONS[1:5],
             p=valid_random_moves
@@ -1886,7 +1886,7 @@ def update_mobs(rng, state, params, env_params, static_params):
             player_move_direction_abs == player_move_direction_abs.max()
         ) / player_move_direction_abs.sum()
         rng, _rng = jax.random.split(rng)
-        player_move_direction_index = jax.random.choice(
+        player_move_direction_index = random_choice(
             _rng,
             jnp.arange(2),
             p=player_move_direction_index_p,
@@ -2763,7 +2763,7 @@ def spawn_mobs(state, rng, params, static_params):
     )
 
     rng, _rng = jax.random.split(rng)
-    passive_mob_position = jax.random.choice(
+    passive_mob_position = random_choice(
         _rng,
         jnp.arange(static_params.map_size[0] * static_params.map_size[1]),
         shape=(1,),
@@ -2891,7 +2891,7 @@ def spawn_mobs(state, rng, params, static_params):
     )
 
     rng, _rng = jax.random.split(rng)
-    melee_mob_position = jax.random.choice(
+    melee_mob_position = random_choice(
         _rng,
         jnp.arange(static_params.map_size[0] * static_params.map_size[1]),
         shape=(1,),
@@ -3008,7 +3008,7 @@ def spawn_mobs(state, rng, params, static_params):
         )
 
         rng, _rng = jax.random.split(rng)
-        ranged_mob_position = jax.random.choice(
+        ranged_mob_position = random_choice(
             _rng,
             jnp.arange(static_params.map_size[0] * static_params.map_size[1]),
             shape=(1,),
@@ -3409,8 +3409,8 @@ def enchant(rng, state: EnvState, action, static_params: StaticEnvParams):
 
     _rngs = jax.random.split(rng, static_params.player_count+1)
     rng, _rng = _rngs[0], _rngs[1:]
-    armour_target = jax.vmap(jax.random.choice, in_axes=(0, None, None, None, 0))(
-        _rng, jnp.arange(4), (), True, armour_targets
+    armour_target = jax.vmap(random_choice, in_axes=(0, None, 0))(
+        _rng, jnp.arange(4), armour_targets
     )
 
     is_enchanting = jnp.logical_or(

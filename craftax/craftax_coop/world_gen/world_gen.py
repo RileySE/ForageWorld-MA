@@ -3,7 +3,7 @@ import jax.scipy as jsp
 
 from craftax_coop.constants import *
 from craftax_coop.game_logic import calculate_light_level
-from craftax_coop.util.maths_utils import get_all_players_distance_map
+from craftax_coop.util.maths_utils import get_all_players_distance_map, random_choice
 from craftax_coop.craftax_state import EnvState, Inventory, Mobs
 from craftax_coop.util.game_logic_utils import get_ladder_positions
 from craftax_coop.util.noise import generate_fractal_noise_2d
@@ -87,7 +87,7 @@ def generate_dungeon(rng, static_params, config):
         block_map, item_map, room_occupancy_chunks, rng = carry
 
         rng, _rng = jax.random.split(rng)
-        room_chunk = jax.random.choice(
+        room_chunk = random_choice(
             _rng,
             jnp.arange(world_chunk_width * world_chunk_height),
             p=room_occupancy_chunks,
@@ -193,7 +193,7 @@ def generate_dungeon(rng, static_params, config):
         path_source = room_positions[path_index]
 
         rng, _rng = jax.random.split(rng)
-        sink_index = jax.random.choice(
+        sink_index = random_choice(
             _rng, jnp.arange(num_rooms), p=included_rooms_mask
         )
         path_sink = room_positions[sink_index]
@@ -295,11 +295,11 @@ def generate_dungeon(rng, static_params, config):
     adj_path_map = adj_path_map > 0.5
 
     rng, _rng = jax.random.split(rng)
-    rare_map = jax.random.choice(
+    rare_map = random_choice(
         _rng,
         jnp.array([False, True]),
-        static_params.map_size,
         p=jnp.array([0.9, 0.1]),
+        shape=static_params.map_size,
     )
 
     wall_map = (
@@ -353,7 +353,7 @@ def generate_dungeon(rng, static_params, config):
             valid_flat / valid_count,
             jnp.full_like(valid_flat, 1.0 / num_tiles),
         )
-        flat_idx = jax.random.choice(_room_rng, jnp.arange(num_tiles), p=probs)
+        flat_idx = random_choice(_room_rng, jnp.arange(num_tiles), p=probs)
         tile_r = flat_idx // static_params.map_size[1]
         tile_c = flat_idx % static_params.map_size[1]
 
@@ -699,7 +699,7 @@ def generate_world(rng, params, static_params):
             unused.astype(jnp.float32),
         )
         probs = probs / jnp.maximum(probs.sum(), 1.0)
-        room_idx = jax.random.choice(rng_choice, num_rooms, p=probs)
+        room_idx = random_choice(rng_choice, num_rooms, p=probs)
         return used_mask.at[room_idx].set(True), room_idx
 
     rng, _rng_ra, _rng_rb, _rng_rc, _rng_non_forager = jax.random.split(rng, 5)
@@ -1031,7 +1031,7 @@ def generate_world(rng, params, static_params):
                 has_warrior_room,
             ),
         )
-        chosen_room_slot = jax.random.choice(
+        chosen_room_slot = random_choice(
             melee_team_rngs[t * 2 + 1],
             jnp.arange(room_slot_count),
             p=room_slot_probs,
