@@ -1510,6 +1510,122 @@ def place_block(state, action, static_params):
     return state
 
 
+def _resolve_sequential_moves(position, proposed, valid_without_mobs, mask, new_mask, mob_map):
+    """Final positions of mobs that move one at a time in index order, computed in parallel.
+
+    Moving sequentially, mob i takes proposed[i] iff valid_without_mobs[i] and that cell of mob_map
+    is empty on its turn. The cell's value then is the last write to it by an earlier mob j < i
+    (mob j clears position[j] if mask[j], then sets its new position if new_mask[j]), or its
+    initial value if no earlier mob wrote it. Each mob's outcome depends only on earlier mobs'
+    outcomes, so recomputing every outcome from the previous guess reaches the sequential result
+    after at most num_mobs passes (in practice 1-3) and then stops changing.
+    """
+    num_mobs = position.shape[0]
+    mob_index = jnp.arange(num_mobs)
+    earlier = mob_index[None, :] < mob_index[:, None]  # [i, j]: mob j moves before mob i
+
+    def last_write(writes):
+        return jnp.max(jnp.where(writes, mob_index[None, :], -1), axis=1)
+
+    hits_proposed = lambda cells: (cells[None, :, :] == proposed[:, None, :]).all(axis=-1)
+    last_clear = last_write(earlier & mask[None, :] & hits_proposed(position))
+    initially_occupied = mob_map[proposed[:, 0], proposed[:, 1]]
+
+    def outcome(moves):
+        last_set = last_write(
+            earlier & new_mask[None, :] & hits_proposed(jnp.where(moves[:, None], proposed, position))
+        )
+        # A mob's set follows its own clear, so a set by the same mob wins the tie.
+        occupied = jnp.where(
+            (last_set >= 0) | (last_clear >= 0), last_set >= last_clear, initially_occupied
+        )
+        return valid_without_mobs & ~occupied
+
+    def refine(carry):
+        moves, _ = carry
+        new_moves = outcome(moves)
+        return new_moves, (new_moves != moves).any()
+
+    moves, _ = jax.lax.while_loop(
+        lambda carry: carry[1], refine, (valid_without_mobs & ~initially_occupied, jnp.asarray(True))
+    )
+    return jnp.where(moves[:, None], proposed, position)
+
+
+def _apply_mob_map_moves(mob_map, position, new_position, mask, new_mask):
+    """mob_map after each mob, in index order, clears its old cell (if mask) and sets its new cell (if new_mask)."""
+    mob_index = jnp.arange(position.shape[0])
+    last_write = jnp.full(mob_map.shape, -1, dtype=jnp.int32)
+    last_write = last_write.at[position[:, 0], position[:, 1]].max(jnp.where(mask, 2 * mob_index, -1))
+    last_write = last_write.at[new_position[:, 0], new_position[:, 1]].max(
+        jnp.where(new_mask, 2 * mob_index + 1, -1)
+    )
+    # Odd stamps are sets (a mob's set follows its own clear); cells nobody wrote keep their value.
+    return jnp.where(last_write >= 0, last_write % 2 == 1, mob_map)
+
+
+def move_passive_mobs(rng, state, params, static_params):
+    """Move every passive mob; same result as moving them one at a time in index order.
+
+    A passive mob's move depends on earlier mobs only through mob_map occupancy, so moves are
+    proposed for all mobs at once (with the same per-mob keys as the sequential loop) and the
+    occupancy is resolved exactly by _resolve_sequential_moves.
+    """
+    num_mobs = static_params.max_passive_mobs
+    if num_mobs == 0:
+        return rng, state
+    level = state.player_level
+    mobs = state.passive_mobs
+    position = mobs.position[level]
+    mask = mobs.mask[level]
+
+    def propose_random_moves(rng):
+        mob_keys = []
+        for _ in range(num_mobs):  # the sequential loop splits the carried key once per mob
+            rng, mob_key = jax.random.split(rng)
+            mob_keys.append(mob_key)
+        valid_directions = jax.vmap(lambda pos: in_bounds(DIRECTIONS_PASSIVE + pos, static_params))(position)
+        directions = jax.vmap(lambda key, p: random_choice(key, DIRECTIONS_PASSIVE, p=p))(
+            jnp.stack(mob_keys), valid_directions
+        )
+        return rng, position + directions
+
+    # Static mobs propose their current cell, which resolves to staying put.
+    rng, proposed = jax.lax.cond(
+        params.passive_mobs_static, lambda rng: (rng, position), propose_random_moves, rng
+    )
+
+    no_mobs = state.replace(mob_map=jnp.zeros_like(state.mob_map))
+    valid_without_mobs = jax.vmap(
+        lambda pos, collision_map: is_position_in_bounds_not_in_mob_not_colliding(
+            no_mobs, pos[None, :], collision_map, static_params
+        )[0]
+    )(proposed, MOB_TYPE_COLLISION_MAPPING[mobs.type_id[level], 0])
+    in_other_player = jax.vmap(lambda pos: is_in_other_player(state, pos[None, :])[0])(proposed)
+    valid_without_mobs = jnp.logical_and(valid_without_mobs, jnp.logical_not(in_other_player))
+
+    distance_to_players = jnp.abs(state.player_position[None, :, :] - position[:, None, :]).sum(axis=-1)
+    should_not_despawn = jnp.logical_and(
+        distance_to_players < params.mob_despawn_distance, state.player_alive[None, :]
+    ).any(axis=-1)
+    new_mask = jnp.logical_and(mask, should_not_despawn)
+
+    level_mob_map = state.mob_map[level]
+    new_position = _resolve_sequential_moves(
+        position, proposed, valid_without_mobs, mask, new_mask, level_mob_map
+    )
+    state = state.replace(
+        passive_mobs=mobs.replace(
+            position=mobs.position.at[level].set(new_position),
+            mask=mobs.mask.at[level].set(new_mask),
+        ),
+        mob_map=state.mob_map.at[level].set(
+            _apply_mob_map_moves(level_mob_map, position, new_position, mask, new_mask)
+        ),
+    )
+    return rng, state
+
+
 def update_mobs(rng, state, params, env_params, static_params):
 
     # Move melee_mobs
@@ -1725,127 +1841,8 @@ def update_mobs(rng, state, params, env_params, static_params):
     )
 
     # Move passive_mobs
-    def _move_passive_mob(rng_and_state, passive_mob_index):
-        rng, state = rng_and_state
-        passive_mobs = state.passive_mobs
-
-        def _move_it(rng_and_state):
-            rng, state = rng_and_state
-            passive_mobs = state.passive_mobs
-
-            # Random move
-            rng, _rng = jax.random.split(rng)
-            valid_random_moves = in_bounds(
-                DIRECTIONS_PASSIVE + passive_mobs.position[state.player_level, passive_mob_index],
-                static_params
-            )
-            random_move_direction = random_choice(
-                _rng,
-                DIRECTIONS_PASSIVE,
-                p=valid_random_moves
-            )
-            proposed_position = (
-                passive_mobs.position[state.player_level, passive_mob_index]
-                + random_move_direction
-            )
-
-            mob_type = passive_mobs.type_id[state.player_level, passive_mob_index]
-            collision_map = MOB_TYPE_COLLISION_MAPPING[mob_type, 0]
-            valid_move = is_position_in_bounds_not_in_mob_not_colliding(
-                state, proposed_position[None, :], collision_map, static_params
-            )[0]
-            in_other_player = is_in_other_player(state, proposed_position[None, :])[0]
-            valid_move = jnp.logical_and(
-                valid_move,
-                jnp.logical_not(in_other_player)
-            )
-            position = jax.lax.select(
-                valid_move,
-                proposed_position,
-                passive_mobs.position[state.player_level, passive_mob_index],
-            )
-            
-            return position, rng
-        
-        def _stay_static(rng_and_state):
-            rng, state = rng_and_state
-            passive_mobs = state.passive_mobs
-            position = passive_mobs.position[state.player_level, passive_mob_index]
-            
-            return position, rng
-        
-        position, rng = jax.lax.cond(
-            params.passive_mobs_static,
-            _stay_static,
-            _move_it,
-            rng_and_state,
-        )
-
-        distance_to_players = jnp.abs(
-            state.player_position
-            - passive_mobs.position[state.player_level, passive_mob_index]
-        ).sum(axis=1)
-        should_not_despawn = jnp.logical_and(
-            distance_to_players < params.mob_despawn_distance,
-            state.player_alive
-        ).any()
-
-        # Clear our old entry if we are alive
-        new_mob_map = state.mob_map.at[
-            state.player_level,
-            state.passive_mobs.position[state.player_level, passive_mob_index, 0],
-            state.passive_mobs.position[state.player_level, passive_mob_index, 1],
-        ].set(
-            jnp.logical_and(
-                state.mob_map[
-                    state.player_level,
-                    state.passive_mobs.position[
-                        state.player_level, passive_mob_index, 0
-                    ],
-                    state.passive_mobs.position[
-                        state.player_level, passive_mob_index, 1
-                    ],
-                ],
-                jnp.logical_not(
-                    passive_mobs.mask[state.player_level, passive_mob_index]
-                ),
-            )
-        )
-        new_mask = jnp.logical_and(
-            state.passive_mobs.mask[state.player_level, passive_mob_index],
-            should_not_despawn,
-        )
-        # Enter new entry if we are alive and not despawning this timestep
-        new_mob_map = new_mob_map.at[state.player_level, position[0], position[1]].set(
-            jnp.logical_or(
-                new_mob_map[state.player_level, position[0], position[1]], new_mask
-            )
-        )
-
-        state = state.replace(
-            passive_mobs=state.passive_mobs.replace(
-                position=state.passive_mobs.position.at[
-                    state.player_level, passive_mob_index
-                ].set(position),
-                mask=state.passive_mobs.mask.at[
-                    state.player_level, passive_mob_index
-                ].set(
-                    jnp.logical_and(
-                        state.passive_mobs.mask[state.player_level, passive_mob_index],
-                        should_not_despawn,
-                    )
-                ),
-            ),
-            mob_map=new_mob_map,
-        )
-
-        return (rng, state), None
-
     rng, _rng = jax.random.split(rng)
-    (rng, state), _ = jax.lax.scan(
-        _move_passive_mob, (rng, state), jnp.arange(static_params.max_passive_mobs),
-        unroll=ENV_SCAN_UNROLL,
-    )
+    rng, state = move_passive_mobs(rng, state, params, static_params)
 
     # Move ranged_mobs
 
