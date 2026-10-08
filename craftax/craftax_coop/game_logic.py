@@ -1768,6 +1768,353 @@ def move_melee_mobs(rng, state, params, static_params):
     return rng, state
 
 
+def _for_each_active_slot(state, active, move_one):
+    """move_one(state, i) for each slot i with active[i], one at a time in index order.
+
+    Under vmap the loop runs as many times as the env with the most active slots.
+    """
+    num_slots = active.shape[0]
+    order = jnp.nonzero(active, size=num_slots, fill_value=num_slots)[0]
+    num_active = active.sum()
+
+    def move_next(carry):
+        k, state = carry
+        return k + 1, move_one(state, order[k])
+
+    _, state = jax.lax.while_loop(
+        lambda carry: carry[0] < num_active, move_next, (jnp.zeros_like(num_active), state)
+    )
+    return state
+
+
+def _move_mob_projectile(state, projectile_index, static_params):
+    projectiles = state.mob_projectiles
+
+    proposed_position = (
+        projectiles.position[state.player_level, projectile_index]
+        + state.mob_projectile_directions[state.player_level, projectile_index]
+    )
+
+
+    proposed_position_in_bounds = in_bounds(proposed_position[None, :], static_params)[0]
+    in_wall = is_in_solid_block(state.map[state.player_level], proposed_position[None, :])[0]
+    in_wall = jnp.logical_and(
+        in_wall,
+        jnp.logical_not(
+            state.map[state.player_level][
+                proposed_position[0], proposed_position[1]
+            ]
+            == BlockType.WATER.value
+        ),
+    )  # Arrows can go over water
+    in_mob = is_in_mob(state, proposed_position[None, :])[0]
+
+    continue_move = jnp.logical_and(
+        proposed_position_in_bounds, jnp.logical_not(in_wall)
+    )
+    continue_move = jnp.logical_and(continue_move, jnp.logical_not(in_mob))
+
+    hit_player0 = jnp.logical_and(
+        (
+            projectiles.position[state.player_level, projectile_index]
+            == state.player_position
+        ).all(axis=1),
+        projectiles.mask[state.player_level, projectile_index],
+    )
+
+    proposed_position_in_player = (proposed_position == state.player_position).all(axis=1)
+    hit_player1 = jnp.logical_and(
+        proposed_position_in_player,
+        projectiles.mask[state.player_level, projectile_index],
+    )
+    hit_player = jnp.logical_or(hit_player0, hit_player1)
+    hit_player = jnp.logical_and(hit_player, state.player_alive)
+
+    continue_move = jnp.logical_and(continue_move, jnp.logical_not(hit_player.any()))
+
+    position = proposed_position
+
+    # Clear our old entry if we are alive
+    new_mask = jnp.logical_and(
+        continue_move, projectiles.mask[state.player_level, projectile_index]
+    )
+
+    hit_bench_or_furnace = jnp.logical_or(
+        state.map[state.player_level, position[0], position[1]]
+        == BlockType.FURNACE.value,
+        state.map[state.player_level, position[0], position[1]]
+        == BlockType.CRAFTING_TABLE.value,
+    )
+    removing_block = jnp.logical_and(
+        hit_bench_or_furnace, projectiles.mask[state.player_level, projectile_index]
+    )
+
+    new_block = jax.lax.select(
+        removing_block,
+        BlockType.PATH.value,
+        state.map[state.player_level, position[0], position[1]],
+    )
+
+    projectile_type = state.mob_projectiles.type_id[
+        state.player_level, projectile_index
+    ]
+    projectile_damage = get_damage_done_to_player(
+        state,
+        static_params,
+        MOB_TYPE_DAMAGE_MAPPING[projectile_type, MobType.PROJECTILE.value][None, :],
+    )
+
+    ranged_damage_taken = projectile_damage * hit_player
+
+    state = state.replace(
+        mob_projectiles=state.mob_projectiles.replace(
+            position=state.mob_projectiles.position.at[
+                state.player_level, projectile_index
+            ].set(position),
+            mask=state.mob_projectiles.mask.at[
+                state.player_level, projectile_index
+            ].set(new_mask),
+        ),
+        player_health=state.player_health - projectile_damage * hit_player,
+        is_sleeping=jnp.logical_and(state.is_sleeping, jnp.logical_not(hit_player)),
+        is_resting=jnp.logical_and(state.is_resting, jnp.logical_not(hit_player)),
+        log_predator_hit=jnp.maximum(
+            state.log_predator_hit,
+            hit_player.astype(state.log_predator_hit.dtype),
+        ),
+        map=state.map.at[state.player_level, position[0], position[1]].set(
+            new_block
+        ),
+    )
+
+    return state
+
+
+def move_mob_projectiles(state, static_params):
+    """Move every mob projectile; same result as moving them one at a time in slot order.
+
+    For an inactive slot the loop only advanced its position by its direction (everything else
+    it did added zero or OR-ed False), so the active slots are moved one at a time in order and
+    the inactive ones are advanced together. In most envs no slot is active.
+    """
+    if static_params.max_mob_projectiles == 0:
+        return state
+
+    level = state.player_level
+    active = state.mob_projectiles.mask[level]
+    state = _for_each_active_slot(
+        state, active, lambda state, i: _move_mob_projectile(state, i, static_params)
+    )
+    inactive_step = jnp.where(
+        jnp.logical_not(active)[:, None], state.mob_projectile_directions[level], 0
+    )
+    return state.replace(
+        mob_projectiles=state.mob_projectiles.replace(
+            position=state.mob_projectiles.position.at[level].add(inactive_step)
+        )
+    )
+
+
+def _move_player_projectile(state, projectile_index, env_params, static_params):
+    projectiles = state.player_projectiles
+
+    projectile_owner = state.player_projectile_owners[
+        state.player_level, projectile_index
+    ]
+
+    projectile_type = state.player_projectiles.type_id[
+        state.player_level, projectile_index
+    ]
+
+    projectile_damage_vector = (
+        MOB_TYPE_DAMAGE_MAPPING[projectile_type, MobType.PROJECTILE.value]
+        * projectiles.mask[state.player_level, projectile_index]
+    )
+
+    is_arrow = jnp.logical_or(
+        projectile_type == ProjectileType.ARROW.value,
+        projectile_type == ProjectileType.ARROW2.value,
+    )
+
+    # Bow enchantment
+    arrow_damage_add = jnp.zeros(3, dtype=jnp.float32)
+    arrow_damage_add = arrow_damage_add.at[state.bow_enchantment[projectile_owner]].set(
+        projectile_damage_vector[0] / 2
+    )
+    arrow_damage_add = arrow_damage_add.at[0].set(0)
+
+    projectile_damage_vector += jax.lax.select(
+        is_arrow,
+        arrow_damage_add,
+        jnp.zeros(3, dtype=jnp.float32),
+    )
+
+    # Apply attribute scaling
+    arrow_damage_coeff = 1 + 0.2 * (state.player_dexterity[projectile_owner] - 1)
+    magic_damage_coeff = 1 + 0.5 * (state.player_intelligence[projectile_owner] - 1)
+
+    projectile_damage_vector *= jax.lax.select(
+        is_arrow,
+        arrow_damage_coeff,
+        1.0,
+    )
+
+    projectile_damage_vector *= jax.lax.select(
+        projectile_type == ProjectileType.FIREBALL.value,
+        magic_damage_coeff,
+        1.0,
+    )
+
+    proposed_position = (
+        projectiles.position[state.player_level, projectile_index]
+        + state.player_projectile_directions[state.player_level, projectile_index]
+    )
+
+    proposed_position_in_bounds = in_bounds(proposed_position[None, :], static_params)[0]
+    in_wall = is_in_solid_block(state.map[state.player_level], proposed_position[None, :])[0]
+    in_wall = jnp.logical_and(
+        in_wall,
+        jnp.logical_not(
+            state.map[state.player_level][
+                proposed_position[0], proposed_position[1]
+            ]
+            == BlockType.WATER.value
+        ),
+    )  # Arrows can go over water
+
+    # Check if we hit a player
+    deal_damage = projectiles.mask[state.player_level, projectile_index]
+
+    per_player_contact = (state.player_position == proposed_position[None, :]).all(axis=-1)
+    did_attack_player = per_player_contact.any()    
+    player_attack_index = jnp.argmax(per_player_contact)
+
+    player_defense_vector = get_player_defense_vector(state)[player_attack_index]
+    # Match melee interaction semantics: only damage opposing team (different subclass)
+    shooter_team = state.player_sc[projectile_owner]
+    victim_team = state.player_sc[player_attack_index]
+    is_cross_team_hit = shooter_team != victim_team
+    player_damage_dealt = (
+        get_damage(projectile_damage_vector, player_defense_vector)
+        * did_attack_player
+        * env_params.friendly_fire
+        * is_cross_team_hit
+    )
+    new_player_health = state.player_health.at[player_attack_index].add(-player_damage_dealt)
+
+    # Track projectile kills between teams
+    shooter_index = state.player_projectile_owners[state.player_level, projectile_index]
+    was_alive_victim = state.player_health[player_attack_index] > 0
+    is_now_dead_victim = new_player_health[player_attack_index] <= 0
+    # Only count if this projectile damage was the killing blow
+    death_caused_by_projectile = jnp.logical_and(
+        jnp.logical_and(was_alive_victim, is_now_dead_victim),
+        player_damage_dealt >= state.player_health[player_attack_index]  # Killing blow check
+    )
+    just_killed_projectile = jnp.logical_and(
+        death_caused_by_projectile,
+        shooter_team != victim_team  # Only count cross-team kills
+    )
+    # Attribute projectile kill to shooter's team
+    new_team_kills_projectile = state.team_kills.at[shooter_team].add(just_killed_projectile.astype(jnp.int32))
+
+    state, did_attack_mob0, did_kill_mob0 = attack_mob(
+        state,
+        deal_damage,
+        projectiles.position[None, state.player_level, projectile_index],
+        projectile_damage_vector[None, :],
+        jnp.array([False]),
+        jnp.array([projectile_owner], dtype=jnp.int32),
+        env_params,
+    )
+    did_attack_mob0 = did_attack_mob0[0]
+
+    did_attack_mob = jnp.logical_or(did_attack_player, did_attack_mob0)
+
+    projectile_damage_vector = projectile_damage_vector * (1 - did_attack_mob0)
+
+    state, did_attack_mob1, did_kill_mob1 = attack_mob(
+        state,
+        deal_damage,
+        proposed_position[None, :],
+        projectile_damage_vector[None, :],
+        jnp.array([False]),
+        jnp.array([projectile_owner], dtype=jnp.int32),
+        env_params,
+    )
+    did_attack_mob1 = did_attack_mob1[0]
+
+    did_attack_mob = jnp.logical_or(did_attack_mob, did_attack_mob1)
+
+    continue_move = jnp.logical_and(
+        proposed_position_in_bounds, jnp.logical_not(in_wall)
+    )
+    continue_move = jnp.logical_and(continue_move, jnp.logical_not(did_attack_mob))
+    position = proposed_position
+
+    # Clear our old entry if we are alive
+    new_mask = jnp.logical_and(
+        continue_move, projectiles.mask[state.player_level, projectile_index]
+    )
+
+    ff_ranged_damage_taken = jnp.zeros(static_params.player_count, dtype=jnp.float32).at[
+        player_attack_index
+    ].add(player_damage_dealt)
+
+    # Track damage dealt to other team by shooter's team (projectile)
+    new_damage_dealt_projectile = state.damage_dealt_to_other_team.at[shooter_team].add(
+        player_damage_dealt * is_cross_team_hit
+    )
+
+    state = state.replace(
+        player_health=new_player_health,
+        team_kills=new_team_kills_projectile,
+        player_projectiles=state.player_projectiles.replace(
+            position=state.player_projectiles.position.at[
+                state.player_level, projectile_index
+            ].set(position),
+            mask=state.player_projectiles.mask.at[
+                state.player_level, projectile_index
+            ].set(new_mask),
+        ),
+        damage_taken_ff=state.damage_taken_ff + ff_ranged_damage_taken,
+        damage_dealt_to_other_team=new_damage_dealt_projectile,
+    )
+
+    return state
+
+
+def move_player_projectiles(state, env_params, static_params):
+    """Move every player projectile; same result as moving them one at a time in slot order.
+
+    For an inactive slot the loop advanced its position by its direction and called attack_mob
+    without attacking, which still deactivates any active mob whose health is <= 0 (attack_mob
+    otherwise does that as it deals damage, so it changes nothing in reachable states). Slot 0
+    is always moved first so that clean-up happens exactly where the loop did it; after that an
+    inactive slot only advances, so the active slots are moved one at a time in order and the
+    inactive ones are advanced together. In most envs no slot is active.
+    """
+    if static_params.max_player_projectiles == 0:
+        return state
+
+    level = state.player_level
+    after_first = jnp.arange(static_params.max_player_projectiles) > 0
+    active = state.player_projectiles.mask[level]
+    move_one = lambda state, i: _move_player_projectile(state, i, env_params, static_params)
+    state = move_one(state, 0)
+    state = _for_each_active_slot(state, jnp.logical_and(active, after_first), move_one)
+    inactive_step = jnp.where(
+        jnp.logical_and(jnp.logical_not(active), after_first)[:, None],
+        state.player_projectile_directions[level],
+        0,
+    )
+    return state.replace(
+        player_projectiles=state.player_projectiles.replace(
+            position=state.player_projectiles.position.at[level].add(inactive_step)
+        )
+    )
+
+
 def update_mobs(rng, state, params, env_params, static_params):
 
     # Move melee_mobs
@@ -2003,293 +2350,11 @@ def update_mobs(rng, state, params, env_params, static_params):
         )
 
     # Move projectiles
-    def _move_mob_projectile(rng_and_state, projectile_index):
-        rng, state = rng_and_state
-        projectiles = state.mob_projectiles
-
-        proposed_position = (
-            projectiles.position[state.player_level, projectile_index]
-            + state.mob_projectile_directions[state.player_level, projectile_index]
-        )
-
-
-        proposed_position_in_bounds = in_bounds(proposed_position[None, :], static_params)[0]
-        in_wall = is_in_solid_block(state.map[state.player_level], proposed_position[None, :])[0]
-        in_wall = jnp.logical_and(
-            in_wall,
-            jnp.logical_not(
-                state.map[state.player_level][
-                    proposed_position[0], proposed_position[1]
-                ]
-                == BlockType.WATER.value
-            ),
-        )  # Arrows can go over water
-        in_mob = is_in_mob(state, proposed_position[None, :])[0]
-
-        continue_move = jnp.logical_and(
-            proposed_position_in_bounds, jnp.logical_not(in_wall)
-        )
-        continue_move = jnp.logical_and(continue_move, jnp.logical_not(in_mob))
-
-        hit_player0 = jnp.logical_and(
-            (
-                projectiles.position[state.player_level, projectile_index]
-                == state.player_position
-            ).all(axis=1),
-            projectiles.mask[state.player_level, projectile_index],
-        )
-
-        proposed_position_in_player = (proposed_position == state.player_position).all(axis=1)
-        hit_player1 = jnp.logical_and(
-            proposed_position_in_player,
-            projectiles.mask[state.player_level, projectile_index],
-        )
-        hit_player = jnp.logical_or(hit_player0, hit_player1)
-        hit_player = jnp.logical_and(hit_player, state.player_alive)
-
-        continue_move = jnp.logical_and(continue_move, jnp.logical_not(hit_player.any()))
-
-        position = proposed_position
-
-        # Clear our old entry if we are alive
-        new_mask = jnp.logical_and(
-            continue_move, projectiles.mask[state.player_level, projectile_index]
-        )
-
-        hit_bench_or_furnace = jnp.logical_or(
-            state.map[state.player_level, position[0], position[1]]
-            == BlockType.FURNACE.value,
-            state.map[state.player_level, position[0], position[1]]
-            == BlockType.CRAFTING_TABLE.value,
-        )
-        removing_block = jnp.logical_and(
-            hit_bench_or_furnace, projectiles.mask[state.player_level, projectile_index]
-        )
-
-        new_block = jax.lax.select(
-            removing_block,
-            BlockType.PATH.value,
-            state.map[state.player_level, position[0], position[1]],
-        )
-
-        projectile_type = state.mob_projectiles.type_id[
-            state.player_level, projectile_index
-        ]
-        projectile_damage = get_damage_done_to_player(
-            state,
-            static_params,
-            MOB_TYPE_DAMAGE_MAPPING[projectile_type, MobType.PROJECTILE.value][None, :],
-        )
-
-        ranged_damage_taken = projectile_damage * hit_player
-
-        state = state.replace(
-            mob_projectiles=state.mob_projectiles.replace(
-                position=state.mob_projectiles.position.at[
-                    state.player_level, projectile_index
-                ].set(position),
-                mask=state.mob_projectiles.mask.at[
-                    state.player_level, projectile_index
-                ].set(new_mask),
-            ),
-            player_health=state.player_health - projectile_damage * hit_player,
-            is_sleeping=jnp.logical_and(state.is_sleeping, jnp.logical_not(hit_player)),
-            is_resting=jnp.logical_and(state.is_resting, jnp.logical_not(hit_player)),
-            log_predator_hit=jnp.maximum(
-                state.log_predator_hit,
-                hit_player.astype(state.log_predator_hit.dtype),
-            ),
-            map=state.map.at[state.player_level, position[0], position[1]].set(
-                new_block
-            ),
-        )
-
-        return (rng, state), None
+    rng, _rng = jax.random.split(rng)
+    state = move_mob_projectiles(state, static_params)
 
     rng, _rng = jax.random.split(rng)
-    (rng, state), _ = jax.lax.scan(
-        _move_mob_projectile,
-        (rng, state),
-        jnp.arange(static_params.max_mob_projectiles),
-        unroll=ENV_SCAN_UNROLL,
-    )
-
-    def _move_player_projectile(rng_and_state, projectile_index):
-        rng, state = rng_and_state
-        projectiles = state.player_projectiles
-
-        projectile_owner = state.player_projectile_owners[
-            state.player_level, projectile_index
-        ]
-
-        projectile_type = state.player_projectiles.type_id[
-            state.player_level, projectile_index
-        ]
-
-        projectile_damage_vector = (
-            MOB_TYPE_DAMAGE_MAPPING[projectile_type, MobType.PROJECTILE.value]
-            * projectiles.mask[state.player_level, projectile_index]
-        )
-
-        is_arrow = jnp.logical_or(
-            projectile_type == ProjectileType.ARROW.value,
-            projectile_type == ProjectileType.ARROW2.value,
-        )
-
-        # Bow enchantment
-        arrow_damage_add = jnp.zeros(3, dtype=jnp.float32)
-        arrow_damage_add = arrow_damage_add.at[state.bow_enchantment[projectile_owner]].set(
-            projectile_damage_vector[0] / 2
-        )
-        arrow_damage_add = arrow_damage_add.at[0].set(0)
-
-        projectile_damage_vector += jax.lax.select(
-            is_arrow,
-            arrow_damage_add,
-            jnp.zeros(3, dtype=jnp.float32),
-        )
-
-        # Apply attribute scaling
-        arrow_damage_coeff = 1 + 0.2 * (state.player_dexterity[projectile_owner] - 1)
-        magic_damage_coeff = 1 + 0.5 * (state.player_intelligence[projectile_owner] - 1)
-
-        projectile_damage_vector *= jax.lax.select(
-            is_arrow,
-            arrow_damage_coeff,
-            1.0,
-        )
-
-        projectile_damage_vector *= jax.lax.select(
-            projectile_type == ProjectileType.FIREBALL.value,
-            magic_damage_coeff,
-            1.0,
-        )
-
-        proposed_position = (
-            projectiles.position[state.player_level, projectile_index]
-            + state.player_projectile_directions[state.player_level, projectile_index]
-        )
-        
-        proposed_position_in_bounds = in_bounds(proposed_position[None, :], static_params)[0]
-        in_wall = is_in_solid_block(state.map[state.player_level], proposed_position[None, :])[0]
-        in_wall = jnp.logical_and(
-            in_wall,
-            jnp.logical_not(
-                state.map[state.player_level][
-                    proposed_position[0], proposed_position[1]
-                ]
-                == BlockType.WATER.value
-            ),
-        )  # Arrows can go over water
-
-        # Check if we hit a player
-        deal_damage = projectiles.mask[state.player_level, projectile_index]
-
-        per_player_contact = (state.player_position == proposed_position[None, :]).all(axis=-1)
-        did_attack_player = per_player_contact.any()    
-        player_attack_index = jnp.argmax(per_player_contact)
-
-        player_defense_vector = get_player_defense_vector(state)[player_attack_index]
-        # Match melee interaction semantics: only damage opposing team (different subclass)
-        shooter_team = state.player_sc[projectile_owner]
-        victim_team = state.player_sc[player_attack_index]
-        is_cross_team_hit = shooter_team != victim_team
-        player_damage_dealt = (
-            get_damage(projectile_damage_vector, player_defense_vector)
-            * did_attack_player
-            * env_params.friendly_fire
-            * is_cross_team_hit
-        )
-        new_player_health = state.player_health.at[player_attack_index].add(-player_damage_dealt)
-        
-        # Track projectile kills between teams
-        shooter_index = state.player_projectile_owners[state.player_level, projectile_index]
-        was_alive_victim = state.player_health[player_attack_index] > 0
-        is_now_dead_victim = new_player_health[player_attack_index] <= 0
-        # Only count if this projectile damage was the killing blow
-        death_caused_by_projectile = jnp.logical_and(
-            jnp.logical_and(was_alive_victim, is_now_dead_victim),
-            player_damage_dealt >= state.player_health[player_attack_index]  # Killing blow check
-        )
-        just_killed_projectile = jnp.logical_and(
-            death_caused_by_projectile,
-            shooter_team != victim_team  # Only count cross-team kills
-        )
-        # Attribute projectile kill to shooter's team
-        new_team_kills_projectile = state.team_kills.at[shooter_team].add(just_killed_projectile.astype(jnp.int32))
-        
-        state, did_attack_mob0, did_kill_mob0 = attack_mob(
-            state,
-            deal_damage,
-            projectiles.position[None, state.player_level, projectile_index],
-            projectile_damage_vector[None, :],
-            jnp.array([False]),
-            jnp.array([projectile_owner], dtype=jnp.int32),
-            env_params,
-        )
-        did_attack_mob0 = did_attack_mob0[0]
-
-        did_attack_mob = jnp.logical_or(did_attack_player, did_attack_mob0)
-
-        projectile_damage_vector = projectile_damage_vector * (1 - did_attack_mob0)
-
-        state, did_attack_mob1, did_kill_mob1 = attack_mob(
-            state,
-            deal_damage,
-            proposed_position[None, :],
-            projectile_damage_vector[None, :],
-            jnp.array([False]),
-            jnp.array([projectile_owner], dtype=jnp.int32),
-            env_params,
-        )
-        did_attack_mob1 = did_attack_mob1[0]
-
-        did_attack_mob = jnp.logical_or(did_attack_mob, did_attack_mob1)
-
-        continue_move = jnp.logical_and(
-            proposed_position_in_bounds, jnp.logical_not(in_wall)
-        )
-        continue_move = jnp.logical_and(continue_move, jnp.logical_not(did_attack_mob))
-        position = proposed_position
-
-        # Clear our old entry if we are alive
-        new_mask = jnp.logical_and(
-            continue_move, projectiles.mask[state.player_level, projectile_index]
-        )
-
-        ff_ranged_damage_taken = jnp.zeros(static_params.player_count, dtype=jnp.float32).at[
-            player_attack_index
-        ].add(player_damage_dealt)
-
-        # Track damage dealt to other team by shooter's team (projectile)
-        new_damage_dealt_projectile = state.damage_dealt_to_other_team.at[shooter_team].add(
-            player_damage_dealt * is_cross_team_hit
-        )
-
-        state = state.replace(
-            player_health=new_player_health,
-            team_kills=new_team_kills_projectile,
-            player_projectiles=state.player_projectiles.replace(
-                position=state.player_projectiles.position.at[
-                    state.player_level, projectile_index
-                ].set(position),
-                mask=state.player_projectiles.mask.at[
-                    state.player_level, projectile_index
-                ].set(new_mask),
-            ),
-            damage_taken_ff=state.damage_taken_ff + ff_ranged_damage_taken,
-            damage_dealt_to_other_team=new_damage_dealt_projectile,
-        )
-
-        return (rng, state), None
-
-    rng, _rng = jax.random.split(rng)
-    (rng, state), _ = jax.lax.scan(
-        _move_player_projectile,
-        (rng, state),
-        jnp.arange(static_params.max_player_projectiles),
-        unroll=ENV_SCAN_UNROLL,
-    )
+    state = move_player_projectiles(state, env_params, static_params)
 
     return state
 

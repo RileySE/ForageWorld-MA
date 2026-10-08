@@ -14,12 +14,17 @@ from craftax_coop.constants import (
     MOB_TYPE_DAMAGE_MAPPING,
     OBS_DIM,
     Achievement,
+    BlockType,
     MobType,
 )
 from craftax_coop.craftax_state import Mobs
 from craftax_coop.game_logic import (
+    _move_mob_projectile,
+    _move_player_projectile,
     move_melee_mobs,
+    move_mob_projectiles,
     move_passive_mobs,
+    move_player_projectiles,
 )
 from craftax_coop.renderer.renderer_symbolic import add_mobs_to_obs_mob_map
 from craftax_coop.util.game_logic_utils import (
@@ -485,3 +490,122 @@ def test_move_melee_mobs_matches_sequential_loop():
         )
         actual = jax.jit(jax.vmap(lambda r, s: move_melee_mobs(r, s, params, static_params)))(rngs, states)
         _assert_trees_equal(actual, expected)
+
+
+def _sequential_slots(move_one, state, num_slots):
+    """The original loop: move_one for every slot, in order."""
+    state, _ = jax.lax.scan(lambda state, i: (move_one(state, i), None), state, jnp.arange(num_slots))
+    return state
+
+
+def _scatter_projectiles(key, state, static_params):
+    """Projectiles (some active) near players, mobs, benches/furnaces/water and the map edge.
+
+    Also gives some envs an active melee mob with health 0 (unreachable in play) to check that
+    attack_mob's clean-up of such mobs still happens exactly where the per-slot loop did it.
+    """
+    level = state.player_level
+    num_players = state.player_position.shape[0]
+    keys = iter(jax.random.split(key, 40))
+    centre = state.player_position[0]
+    edge = static_params.map_size[0] - 1
+
+    def projectile_slots(mobs, num_slots, owners_and_directions):
+        # A quarter of envs have no active projectiles of this kind.
+        active_fraction = jax.random.uniform(next(keys)) * (jax.random.uniform(next(keys)) < 0.75)
+        near = jnp.clip(centre + jax.random.randint(next(keys), (num_slots, 2), -3, 4), 0, edge)
+        on_edge = jnp.stack(
+            [jax.random.choice(next(keys), jnp.array([0, edge]), (num_slots,)),
+             jax.random.randint(next(keys), (num_slots,), 0, edge + 1)], axis=-1
+        )
+        position = jnp.where((jax.random.uniform(next(keys), (num_slots,)) < 0.25)[:, None], on_edge, near)
+        mask = jax.random.uniform(next(keys), (num_slots,)) < active_fraction
+        directions = DIRECTIONS[1:5][jax.random.randint(next(keys), (num_slots,), 0, 4)]
+        owners = jax.random.randint(next(keys), (num_slots,), 0, num_players)
+        mobs = mobs.replace(
+            position=mobs.position.at[level].set(position),
+            mask=mobs.mask.at[level].set(mask),
+            type_id=mobs.type_id.at[level].set(jax.random.randint(next(keys), (num_slots,), 0, 8)),
+        )
+        dir_array, owner_array = owners_and_directions
+        return mobs, dir_array.at[level].set(directions), owner_array.at[level].set(owners)
+
+    mob_projectiles, mob_directions, mob_owners = projectile_slots(
+        state.mob_projectiles, static_params.max_mob_projectiles,
+        (state.mob_projectile_directions, state.mob_projectile_owners),
+    )
+    player_projectiles, player_directions, player_owners = projectile_slots(
+        state.player_projectiles, static_params.max_player_projectiles,
+        (state.player_projectile_directions, state.player_projectile_owners),
+    )
+
+    # Benches, furnaces, water and stone around the players.
+    cells = jnp.clip(centre + jax.random.randint(next(keys), (30, 2), -4, 5), 0, edge)
+    blocks = jnp.array([BlockType.CRAFTING_TABLE.value, BlockType.FURNACE.value, BlockType.WATER.value,
+                        BlockType.STONE.value, BlockType.PATH.value])
+    level_map = state.map[level].at[cells[:, 0], cells[:, 1]].set(
+        blocks[jax.random.randint(next(keys), (30,), 0, len(blocks))]
+    )
+
+    # Weak melee and passive mobs near the players; maybe one active melee mob with health 0.
+    def weak_mobs(mobs, mob_map):
+        num_mobs = mobs.mask.shape[1]
+        position = jnp.clip(centre + jax.random.randint(next(keys), (num_mobs, 2), -3, 4), 0, edge)
+        mask = jax.random.uniform(next(keys), (num_mobs,)) < 0.5
+        health = jax.random.choice(next(keys), jnp.array([0.5, 1.0, 3.0]), (num_mobs,))
+        mobs = mobs.replace(
+            position=mobs.position.at[level].set(position),
+            mask=mobs.mask.at[level].set(mask),
+            health=mobs.health.at[level].set(health),
+        )
+        return mobs, mob_map.at[level, position[:, 0], position[:, 1]].max(mask)
+
+    melee_mobs, mob_map = weak_mobs(state.melee_mobs, state.mob_map)
+    passive_mobs, mob_map = weak_mobs(state.passive_mobs, mob_map)
+    zero_health_mob = jax.random.uniform(next(keys)) < 0.5
+    melee_mobs = melee_mobs.replace(
+        mask=melee_mobs.mask.at[level, 0].set(jnp.logical_or(melee_mobs.mask[level, 0], zero_health_mob)),
+        health=melee_mobs.health.at[level, 0].set(jnp.where(zero_health_mob, 0.0, melee_mobs.health[level, 0])),
+    )
+
+    return state.replace(
+        map=state.map.at[level].set(level_map),
+        mob_map=mob_map,
+        melee_mobs=melee_mobs,
+        passive_mobs=passive_mobs,
+        mob_projectiles=mob_projectiles,
+        mob_projectile_directions=mob_directions,
+        mob_projectile_owners=mob_owners,
+        player_projectiles=player_projectiles,
+        player_projectile_directions=player_directions,
+        player_projectile_owners=player_owners,
+        is_sleeping=jax.random.uniform(next(keys), (num_players,)) < 0.5,
+        is_resting=jax.random.uniform(next(keys), (num_players,)) < 0.3,
+        player_health=jax.random.uniform(next(keys), (num_players,), minval=0.5, maxval=9.0),
+        bow_enchantment=jax.random.randint(next(keys), (num_players,), 0, 3),
+        player_dexterity=jax.random.randint(next(keys), (num_players,), 1, 6),
+        player_intelligence=jax.random.randint(next(keys), (num_players,), 1, 6),
+    )
+
+
+def test_projectile_moves_match_sequential_loop():
+    # Two teams, so that projectiles can hit (cross-team) players.
+    env = make_craftax_env_from_name("Craftax-Coop-Symbolic", num_teams=2, team_composition=(1, 1, 2))
+    params, static_params = env.default_params, env.static_env_params
+    num_envs = 16
+    _, states = jax.vmap(env.reset)(jax.random.split(jax.random.PRNGKey(9), num_envs))
+    states = jax.vmap(_scatter_projectiles, in_axes=(0, 0, None))(
+        jax.random.split(jax.random.PRNGKey(10), num_envs), states, static_params
+    )
+
+    move_mob = lambda state, i: _move_mob_projectile(state, i, static_params)
+    expected = jax.jit(jax.vmap(
+        lambda s: _sequential_slots(move_mob, s, static_params.max_mob_projectiles)))(states)
+    actual = jax.jit(jax.vmap(lambda s: move_mob_projectiles(s, static_params)))(states)
+    _assert_trees_equal(actual, expected)
+
+    move_player = lambda state, i: _move_player_projectile(state, i, params, static_params)
+    expected = jax.jit(jax.vmap(
+        lambda s: _sequential_slots(move_player, s, static_params.max_player_projectiles)))(states)
+    actual = jax.jit(jax.vmap(lambda s: move_player_projectiles(s, params, static_params)))(states)
+    _assert_trees_equal(actual, expected)
