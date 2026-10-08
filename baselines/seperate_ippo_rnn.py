@@ -1285,7 +1285,7 @@ def make_train(config, env, wandb_start_step=-1):
 
             # Compute a pseudo episode_id from cumulative done flags
             # done shape: (T, num_agents, NUM_ENVS)  (network output field)
-            # episode_count shape: (num_agents, NUM_ENVS) — carried across logging steps
+            # episode_count shape: (num_agents, logging envs) — carried across logging steps
             # Shift by 1 so the done step itself still belongs to the old episode
             done_shifted = jnp.concatenate([
                 jnp.zeros((1,) + traj_batch.info['done'].shape[1:]),
@@ -1389,7 +1389,7 @@ def make_train(config, env, wandb_start_step=-1):
             # No reshape needed - shapes are already correct
             for agent_n in range(env.num_agents):
                 # Network outputs have shape (T, num_agents, NUM_ENVS) - extract agent_n -> (T, NUM_ENVS)
-                log_array = traj_batch.info['action'][:, agent_n, :].reshape((traj_batch.info['action'].shape[0], config['NUM_ENVS'], 1))
+                log_array = traj_batch.info['action'][:, agent_n, :, None]  # (T, logging envs, 1)
                 # Yes this is a for loop in the JAX code but this stuff was getting done in serial before anyway and it's cheap operations
                 for field_to_log in fields_to_log:
                     log_array = add_field_to_log_array(traj_batch.info, log_array, field_to_log, agent_n)
@@ -1502,16 +1502,31 @@ def make_train(config, env, wandb_start_step=-1):
             effective_cap = _get_effective_episode_cap(update_steps)
             state = _apply_episode_cap_to_runner_state(state, effective_cap)
 
-            # episode_count tracks cumulative episode IDs across logging steps: (num_agents, NUM_ENVS)
-            episode_count = jnp.zeros((env.num_agents, config["NUM_ENVS"]), dtype=jnp.int32)
-            (state, episode_count), empty = jax.lax.scan(
+            # The logging rollout runs on a copy of the first LOGGING_THREADS envs (the ones
+            # written to the CSVs). The training envs do not advance; their RNG is split once.
+            train_state_l, env_state_l, obsv_l, done_l, hstate_l, rng_l, reset_pool_l = state
+            rng_l, rng_logging = jax.random.split(rng_l)
+            logging_envs = lambda x: x[:config["LOGGING_THREADS"]]
+            logging_runner = (
+                train_state_l,
+                jax.tree.map(logging_envs, env_state_l),
+                jax.tree.map(logging_envs, obsv_l),
+                jax.tree.map(logging_envs, done_l),
+                hstate_l[:, :config["LOGGING_THREADS"]],
+                rng_logging,
+                None,  # finished logging envs generate their own new world
+            )
+            state = (train_state_l, env_state_l, obsv_l, done_l, hstate_l, rng_l, reset_pool_l)
+            # episode_count tracks cumulative episode IDs across logging steps: (num_agents, LOGGING_THREADS)
+            episode_count = jnp.zeros((env.num_agents, config["LOGGING_THREADS"]), dtype=jnp.int32)
+            jax.lax.scan(
                 functools.partial(
                     _logging_step,
                     logging_threads=config["LOGGING_THREADS"],
                     update_step=update_steps,
                     effective_cap=effective_cap,
                 ),
-                (state, episode_count), None,
+                (logging_runner, episode_count), None,
                 config["LOGGING_NUM_CALLS"],
             )
 
