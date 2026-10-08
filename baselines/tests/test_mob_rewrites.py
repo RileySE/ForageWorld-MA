@@ -7,17 +7,29 @@ import jax.numpy as jnp
 import numpy as np
 
 from craftax.craftax_env import make_craftax_env_from_name
-from craftax_coop.constants import DIRECTIONS_PASSIVE, MOB_TYPE_COLLISION_MAPPING, OBS_DIM
+from craftax_coop.constants import (
+    DIRECTIONS,
+    DIRECTIONS_PASSIVE,
+    MOB_TYPE_COLLISION_MAPPING,
+    MOB_TYPE_DAMAGE_MAPPING,
+    OBS_DIM,
+    Achievement,
+    MobType,
+)
 from craftax_coop.craftax_state import Mobs
-from craftax_coop.game_logic import move_passive_mobs
+from craftax_coop.game_logic import (
+    move_melee_mobs,
+    move_passive_mobs,
+)
 from craftax_coop.renderer.renderer_symbolic import add_mobs_to_obs_mob_map
 from craftax_coop.util.game_logic_utils import (
+    get_damage_done_to_player,
     in_bounds,
+    is_fighting_boss,
     is_in_other_player,
     is_position_in_bounds_not_in_mob_not_colliding,
 )
 from craftax_coop.util.maths_utils import random_choice
-
 
 def _assert_trees_equal(a, b):
     leaves_a, leaves_b = jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b)
@@ -206,3 +218,270 @@ def test_obs_mob_map_matches_sequential_writes():
         )(*cases)
         actual = jax.vmap(lambda m, mobs, p: add_mobs_to_obs_mob_map(m, mobs, mob_class_index, p))(*cases)
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+def _sequential_move_melee_mobs(rng, state, params, static_params):
+    """The original per-mob scan from update_mobs."""
+
+    def _move_melee_mob(rng_and_state, melee_mob_index):
+        rng, state = rng_and_state
+        melee_mobs = state.melee_mobs
+
+        # Random move
+        rng, _rng = jax.random.split(rng)
+        valid_random_moves = in_bounds(
+            DIRECTIONS[1:5] + melee_mobs.position[state.player_level, melee_mob_index],
+            static_params
+        )
+        random_move_direction = jax.random.choice(
+            _rng,
+            DIRECTIONS[1:5],
+            p=valid_random_moves
+        )
+        random_move_proposed_position = (
+            melee_mobs.position[state.player_level, melee_mob_index]
+            + random_move_direction
+        )
+
+        # Move towards closest player
+        player_move_direction = jnp.zeros((2,), dtype=jnp.int32)
+        all_players_move_direction_abs = jnp.abs(
+            state.player_position
+            - melee_mobs.position[state.player_level, melee_mob_index]
+        )
+        distance_to_players = all_players_move_direction_abs.sum(axis=1)
+        player_targetted = jnp.argmin(jnp.where(
+            state.player_alive,
+            distance_to_players,
+            jnp.inf
+        ))
+        player_move_direction_abs = all_players_move_direction_abs[player_targetted]
+
+        player_move_direction_index_p = (
+            player_move_direction_abs == player_move_direction_abs.max()
+        ) / player_move_direction_abs.sum()
+        rng, _rng = jax.random.split(rng)
+        player_move_direction_index = jax.random.choice(
+            _rng,
+            jnp.arange(2),
+            p=player_move_direction_index_p,
+        )
+
+        player_move_direction = player_move_direction.at[
+            player_move_direction_index
+        ].set(
+            jnp.sign(
+                state.player_position[player_targetted, player_move_direction_index]
+                - melee_mobs.position[state.player_level, melee_mob_index, player_move_direction_index]
+            ).astype(jnp.int32)
+        )
+        player_move_proposed_position = (
+            melee_mobs.position[state.player_level, melee_mob_index]
+            + player_move_direction
+        )
+
+        # Choose movement
+        close_to_player = distance_to_players < 10
+        close_to_player = jnp.logical_and(
+            close_to_player,
+            state.player_alive
+        ).any()
+        close_to_player = jnp.logical_or(
+            close_to_player, is_fighting_boss(state, static_params)
+        )
+        rng, _rng = jax.random.split(rng)
+        close_to_player = jnp.logical_and(
+            close_to_player, jax.random.uniform(_rng) < 0.75
+        )
+        proposed_position = jax.lax.select(
+            close_to_player,
+            player_move_proposed_position,
+            random_move_proposed_position,
+        )
+
+        # Choose attack or not
+        is_attacking_player = distance_to_players == 1
+        is_attacking_player = jnp.logical_and(
+            is_attacking_player,
+            state.player_alive
+        )
+        is_attacking_player = jnp.logical_and(
+            is_attacking_player,
+            melee_mobs.attack_cooldown[state.player_level, melee_mob_index] <= 0,
+        )
+        is_attacking_player = jnp.logical_and(
+            is_attacking_player, melee_mobs.mask[state.player_level, melee_mob_index]
+        )
+
+        proposed_position = jax.lax.select(
+            is_attacking_player.any(),
+            melee_mobs.position[state.player_level, melee_mob_index],
+            proposed_position,
+        )
+
+        melee_mob_base_damage = MOB_TYPE_DAMAGE_MAPPING[
+            melee_mobs.type_id[state.player_level, melee_mob_index], MobType.MELEE.value
+        ]
+
+        melee_mob_damage = get_damage_done_to_player(
+            state, static_params, melee_mob_base_damage * (1 + 2.5 * state.is_sleeping[:, None])
+        )
+
+        new_cooldown = jnp.where(
+            is_attacking_player.any(),
+            5,
+            melee_mobs.attack_cooldown[state.player_level, melee_mob_index] - 1,
+        )
+
+        is_waking_player = jnp.logical_and(state.is_sleeping, is_attacking_player)
+
+        melee_damage_taken = melee_mob_damage * is_attacking_player
+
+        state = state.replace(
+            player_health=state.player_health - melee_mob_damage * is_attacking_player,
+            is_sleeping=jnp.logical_and(
+                state.is_sleeping, jnp.logical_not(is_attacking_player)
+            ),
+            is_resting=jnp.logical_and(
+                state.is_resting, jnp.logical_not(is_attacking_player)
+            ),
+            achievements=state.achievements.at[:, Achievement.WAKE_UP.value].set(
+                jnp.logical_or(
+                    state.achievements[:, Achievement.WAKE_UP.value], is_waking_player
+                )
+            ),
+            damage_taken_melee=state.damage_taken_melee + melee_damage_taken,
+            log_predator_hit=jnp.maximum(
+                state.log_predator_hit,
+                is_attacking_player.astype(state.log_predator_hit.dtype),
+            ),
+        )
+
+        mob_type = melee_mobs.type_id[state.player_level, melee_mob_index]
+        collision_map = MOB_TYPE_COLLISION_MAPPING[mob_type, 1]
+        valid_move = is_position_in_bounds_not_in_mob_not_colliding(
+            state, proposed_position[None, :], collision_map, static_params
+        )[0]
+        in_other_player = is_in_other_player(state, proposed_position[None, :])[0]
+        valid_move = jnp.logical_and(
+            valid_move,
+            jnp.logical_not(in_other_player)
+        )
+
+
+        position = jax.lax.select(
+            valid_move,
+            proposed_position,
+            melee_mobs.position[state.player_level, melee_mob_index],
+        )
+
+        # Melee despawn behavior depends on config flag
+        # Passive mobs (including snails) use their own logic and are unchanged.
+        should_not_despawn = jax.lax.select(
+            params.melee_mobs_despawn_when_far,
+            (distance_to_players < params.melee_mob_despawn_distance).any(),  # if flag=True. distance-gated and can despawn
+            jnp.asarray(True), # if flag=False always persist
+        )
+
+        rng, _rng = jax.random.split(rng)
+
+        # Clear our old entry if we are alive
+        new_mob_map = state.mob_map.at[
+            state.player_level,
+            state.melee_mobs.position[state.player_level, melee_mob_index, 0],
+            state.melee_mobs.position[state.player_level, melee_mob_index, 1],
+        ].set(
+            jnp.logical_and(
+                state.mob_map[
+                    state.player_level,
+                    state.melee_mobs.position[state.player_level, melee_mob_index, 0],
+                    state.melee_mobs.position[state.player_level, melee_mob_index, 1],
+                ],
+                jnp.logical_not(melee_mobs.mask[state.player_level, melee_mob_index]),
+            )
+        )
+        new_mask = jnp.logical_and(
+            state.melee_mobs.mask[state.player_level, melee_mob_index],
+            should_not_despawn,
+        )
+        # Enter new entry if we are alive and not despawning this timestep
+        new_mob_map = new_mob_map.at[state.player_level, position[0], position[1]].set(
+            jnp.logical_or(
+                new_mob_map[state.player_level, position[0], position[1]], new_mask
+            )
+        )
+
+        state = state.replace(
+            melee_mobs=state.melee_mobs.replace(
+                position=state.melee_mobs.position.at[
+                    state.player_level, melee_mob_index
+                ].set(position),
+                attack_cooldown=state.melee_mobs.attack_cooldown.at[
+                    state.player_level, melee_mob_index
+                ].set(new_cooldown),
+                mask=state.melee_mobs.mask.at[state.player_level, melee_mob_index].set(
+                    new_mask
+                ),
+            ),
+            mob_map=new_mob_map,
+        )
+
+        return (_rng, state), None
+
+    (rng, state), _ = jax.lax.scan(
+        _move_melee_mob, (rng, state), jnp.arange(static_params.max_melee_mobs)
+    )
+    return rng, state
+
+
+def _crowd_melee_mobs(key, state, static_params):
+    """Pack melee mobs around the players, most of them next to one, with mostly expired cooldowns,
+    sleeping and dead players, and varied armour, so that several mobs attack the same player and
+    wake-ups and collisions all occur."""
+    level = state.player_level
+    num_mobs = static_params.max_melee_mobs
+    num_players = state.player_position.shape[0]
+    keys = jax.random.split(key, 12)
+    anchor = state.player_position[jax.random.randint(keys[0], (num_mobs,), 0, num_players)]
+    nearby = anchor + jax.random.randint(keys[1], (num_mobs, 2), -3, 4)
+    adjacent = anchor + DIRECTIONS[1:5][jax.random.randint(keys[10], (num_mobs,), 0, 4)]
+    position = jnp.where((jax.random.uniform(keys[11], (num_mobs,)) < 0.6)[:, None], adjacent, nearby)
+    position = jnp.clip(position, 0, static_params.map_size[0] - 1)
+    mask = jax.random.uniform(keys[2], (num_mobs,)) < 0.8
+    mobs = state.melee_mobs
+    return state.replace(
+        melee_mobs=mobs.replace(
+            position=mobs.position.at[level].set(position),
+            mask=mobs.mask.at[level].set(mask),
+            attack_cooldown=mobs.attack_cooldown.at[level].set(
+                jax.random.randint(keys[3], (num_mobs,), -1, 3)
+            ),
+        ),
+        mob_map=state.mob_map.at[level, position[:, 0], position[:, 1]].max(mask),
+        is_sleeping=jax.random.uniform(keys[4], (num_players,)) < 0.5,
+        is_resting=jax.random.uniform(keys[5], (num_players,)) < 0.3,
+        player_alive=jax.random.uniform(keys[6], (num_players,)) < 0.85,
+        player_health=jax.random.uniform(keys[7], (num_players,), minval=0.5, maxval=9.0),
+        inventory=state.inventory.replace(
+            armour=jax.random.randint(keys[8], state.inventory.armour.shape, 0, 3)
+        ),
+        armour_enchantments=jax.random.randint(keys[9], state.armour_enchantments.shape, 0, 3),
+    )
+
+
+def test_move_melee_mobs_matches_sequential_loop():
+    env = make_craftax_env_from_name("Craftax-Coop-Symbolic", num_teams=1, team_composition=(1, 1, 2))
+    static_params = env.static_env_params
+    num_envs = 8
+    _, states = jax.vmap(env.reset)(jax.random.split(jax.random.PRNGKey(6), num_envs))
+    states = jax.vmap(_crowd_melee_mobs, in_axes=(0, 0, None))(
+        jax.random.split(jax.random.PRNGKey(7), num_envs), states, static_params
+    )
+    rngs = jax.random.split(jax.random.PRNGKey(8), num_envs)
+    for despawn_when_far in (False, True):
+        params = env.default_params.replace(melee_mobs_despawn_when_far=despawn_when_far)
+        expected = jax.jit(jax.vmap(lambda r, s: _sequential_move_melee_mobs(r, s, params, static_params)))(
+            rngs, states
+        )
+        actual = jax.jit(jax.vmap(lambda r, s: move_melee_mobs(r, s, params, static_params)))(rngs, states)
+        _assert_trees_equal(actual, expected)
