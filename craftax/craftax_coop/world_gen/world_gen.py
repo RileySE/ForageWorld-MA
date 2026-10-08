@@ -4,21 +4,17 @@ import jax.scipy as jsp
 from craftax_coop.constants import *
 from craftax_coop.game_logic import calculate_light_level
 from craftax_coop.util.maths_utils import get_all_players_distance_map, random_choice
-from craftax_coop.craftax_state import EnvState, Inventory, Mobs
+from craftax_coop.craftax_state import LEVEL_INDEX, EnvState, Inventory, Mobs
 from craftax_coop.util.game_logic_utils import get_ladder_positions
 from craftax_coop.util.noise import generate_fractal_noise_2d
-from craftax_coop.world_gen.world_gen_configs import (
-    ALL_DUNGEON_CONFIGS,
-    ALL_SMOOTHGEN_CONFIGS,
-)
+from craftax_coop.world_gen.world_gen_configs import ALL_DUNGEON_CONFIGS
 
 # Episodes are played entirely on START_LEVEL (the first dungeon level); floor changes are
-# disabled. Only levels 0..START_LEVEL are kept in the env state: START_LEVEL is the playing
-# level and update_plants writes to level 0. Nothing reads the deeper levels, and storing all
-# static_params.num_levels (9) of them made each env step about twice as slow. num_levels
-# itself stays 9 because the boss/terminal checks use it as the logical number of levels.
+# disabled. The env state stores only that level (at LEVEL_INDEX of the per-level arrays), so
+# only that level is generated. static_params.num_levels stays 9 because the boss/terminal
+# checks use it as the logical number of levels.
 START_LEVEL = 2
-NUM_STORED_LEVELS = START_LEVEL + 1
+NUM_STORED_LEVELS = 1
 
 
 def get_new_empty_inventory(player_count):
@@ -560,14 +556,8 @@ def generate_smoothworld(rng, static_params, player_position, config, params=Non
 
 
 def generate_world(rng, params, static_params):
-    # --- Phase 1: Generate all maps first (before choosing spawn) ---
-    # We need a temporary player_position for smoothgen (it uses it for
-    # proximity maps to push water/mountains away).  Place it at map centre;
-    # the real spawn will be chosen after map generation from PATH tiles.
-    map_h, map_w = static_params.map_size[0], static_params.map_size[1]
+    # --- Phase 1: Generate the map first (before choosing spawn) ---
     num_rooms = static_params.num_rooms
-    temp_center = jnp.array([map_h // 2, map_w // 2])
-    temp_player_position = jnp.tile(temp_center, (static_params.player_count, 1))
 
     agents_per_team = len(static_params.team_composition)
     if agents_per_team <= 0:
@@ -638,33 +628,21 @@ def generate_world(rng, params, static_params):
     player_sc = jnp.arange(static_params.player_count) // agents_per_team
 
     # Generate smoothgens (overworld, caves, elemental levels, boss level)
-    rngs = jax.random.split(rng, 7)
-    rng, _rng = rngs[0], rngs[1:]
-    smoothgens = jax.vmap(generate_smoothworld, in_axes=(0, None, None, 0))(
-        _rng, static_params, temp_player_position, ALL_SMOOTHGEN_CONFIGS
-    )
+    # Only START_LEVEL (the first dungeon) is generated. The splits that drew keys for the other
+    # levels are kept, so this level and everything drawn afterwards use the same keys as before.
+    rngs = jax.random.split(rng, 7)  # previously: keys for the 6 smoothgen levels
+    rng = rngs[0]
 
-    # Generate dungeons
-    rngs = jax.random.split(rng, 4)
-    rng, _rng = rngs[0], rngs[1:]
+    rngs = jax.random.split(rng, 4)  # previously: keys for the 3 dungeon levels
+    rng, _rng = rngs[0], rngs[1:2]
     dungeon_results = jax.vmap(generate_dungeon, in_axes=(0, None, 0))(
-        _rng, static_params, ALL_DUNGEON_CONFIGS
+        _rng, static_params, jax.tree_util.tree_map(lambda c: c[:1], ALL_DUNGEON_CONFIGS)
     )
-    # Separate room metadata from map data
-    # dungeon_results = (maps, item_maps, light_maps, ladders_down, ladders_up, room_positions, room_sizes)
-    d_maps, d_item_maps, d_light_maps, d_ladders_down, d_ladders_up, dungeon_room_positions, dungeon_room_sizes = dungeon_results
-    dungeons = (d_maps, d_item_maps, d_light_maps, d_ladders_down, d_ladders_up)
-    # dungeon_room_positions: (3, num_rooms, 2) top-left corner of each room (unpadded)
-    # dungeon_room_sizes:     (3, num_rooms, 2) (height, width) of each room
-
-    # Returns stacked versions of the map, item_map, light_map and ladders.
-    # The full level order is (x[0], x[1], y[0], y[1], y[2], x[2], x[3], x[4], x[5]);
-    # only the first NUM_STORED_LEVELS of them are kept (see NUM_STORED_LEVELS).
-    map, item_map, light_map, ladders_down, ladders_up = jax.tree_util.tree_map(
-        lambda x, y: jnp.stack((x[0], x[1], y[0]), axis=0),
-        smoothgens,
-        dungeons,
-    )
+    # dungeon_results = (maps, item_maps, light_maps, ladders_down, ladders_up, room_positions, room_sizes),
+    # each with a leading axis of NUM_STORED_LEVELS (1)
+    map, item_map, light_map, ladders_down, ladders_up, dungeon_room_positions, dungeon_room_sizes = dungeon_results
+    # dungeon_room_positions: (1, num_rooms, 2) top-left corner of each room (unpadded)
+    # dungeon_room_sizes:     (1, num_rooms, 2) (height, width) of each room
 
     # --- Phase 2: Pick team spawn positions inside ROOMS on the start level ---
     start_room_positions = dungeon_room_positions[0]  # (num_rooms, 2) top-left corners
@@ -805,19 +783,19 @@ def generate_world(rng, params, static_params):
     # Force spawn tiles to PATH on the start level (clear the spots)
     # Only overwrite if the current block is solid/would trap the player (wall, chest, etc.)
     # Keep fountains and other non-blocking features intact.
-    spawn_blocks = map[START_LEVEL, player_position[:, 0], player_position[:, 1]]
+    spawn_blocks = map[LEVEL_INDEX, player_position[:, 0], player_position[:, 1]]
     is_solid_spawn = jnp.isin(spawn_blocks, jnp.array(SOLID_BLOCKS))
-    map = map.at[START_LEVEL, player_position[:, 0], player_position[:, 1]].set(
+    map = map.at[LEVEL_INDEX, player_position[:, 0], player_position[:, 1]].set(
         jnp.where(is_solid_spawn, BlockType.PATH.value, spawn_blocks)
     )
     # Only remove ladders from spawn tiles to prevent immediate floor transitions
-    spawn_items = item_map[START_LEVEL, player_position[:, 0], player_position[:, 1]]
+    spawn_items = item_map[LEVEL_INDEX, player_position[:, 0], player_position[:, 1]]
     is_ladder = jnp.isin(spawn_items, jnp.array([
         ItemType.LADDER_DOWN.value,
         ItemType.LADDER_UP.value,
         ItemType.LADDER_DOWN_BLOCKED.value,
     ]))
-    item_map = item_map.at[START_LEVEL, player_position[:, 0], player_position[:, 1]].set(
+    item_map = item_map.at[LEVEL_INDEX, player_position[:, 0], player_position[:, 1]].set(
         jnp.where(is_ladder, ItemType.NONE.value, spawn_items)
     )
 
@@ -847,10 +825,10 @@ def generate_world(rng, params, static_params):
         cols = jnp.arange(static_params.map_size[1])
         in_room = (rows >= rp[0])[:, None] & (rows < rp[0] + rs[0])[:, None] & \
                   (cols >= rp[1])[None, :] & (cols < rp[1] + rs[1])[None, :]
-        is_snail = current_map[START_LEVEL] == BlockType.SNAIL_SPAWN.value
+        is_snail = current_map[LEVEL_INDEX] == BlockType.SNAIL_SPAWN.value
         revert = in_room & is_snail & room_active
-        new_level_map = jnp.where(revert, BlockType.PATH.value, current_map[START_LEVEL])
-        current_map = current_map.at[START_LEVEL].set(new_level_map)
+        new_level_map = jnp.where(revert, BlockType.PATH.value, current_map[LEVEL_INDEX])
+        current_map = current_map.at[LEVEL_INDEX].set(new_level_map)
         return current_map, None
 
     map, _ = jax.lax.scan(
@@ -940,11 +918,11 @@ def generate_world(rng, params, static_params):
                     collides_with_snail = jnp.asarray(False)
                     for prev_s in range(s):
                         prev_mob_idx = (t * room_slot_count + f) * MAX_SNAILS_PER_TEAM + prev_s
-                        prev_pos = passive_mobs.position[START_LEVEL, prev_mob_idx]
-                        prev_active = passive_mobs.mask[START_LEVEL, prev_mob_idx]
+                        prev_pos = passive_mobs.position[LEVEL_INDEX, prev_mob_idx]
+                        prev_active = passive_mobs.mask[LEVEL_INDEX, prev_mob_idx]
                         same_pos = jnp.logical_and(prev_active, (candidate_pos == prev_pos).all())
                         collides_with_snail = jnp.logical_or(collides_with_snail, same_pos)
-                    candidate_block = map[START_LEVEL, candidate_pos[0], candidate_pos[1]]
+                    candidate_block = map[LEVEL_INDEX, candidate_pos[0], candidate_pos[1]]
                     is_walkable = jnp.logical_not(jnp.isin(candidate_block, jnp.array(SOLID_BLOCKS)))
                     no_collision = jnp.logical_and(
                         jnp.logical_not(collides_with_player),
@@ -957,14 +935,14 @@ def generate_world(rng, params, static_params):
 
                 mob_idx = (t * room_slot_count + f) * MAX_SNAILS_PER_TEAM + s
                 passive_mobs = passive_mobs.replace(
-                    position=passive_mobs.position.at[START_LEVEL, mob_idx].set(
-                        jnp.where(should_spawn, snail_pos, passive_mobs.position[START_LEVEL, mob_idx])),
-                    health=passive_mobs.health.at[START_LEVEL, mob_idx].set(
-                        jnp.where(should_spawn, snail_health, passive_mobs.health[START_LEVEL, mob_idx])),
-                    mask=passive_mobs.mask.at[START_LEVEL, mob_idx].set(
-                        jnp.where(should_spawn, True, passive_mobs.mask[START_LEVEL, mob_idx])),
-                    type_id=passive_mobs.type_id.at[START_LEVEL, mob_idx].set(
-                        jnp.where(should_spawn, snail_type_id, passive_mobs.type_id[START_LEVEL, mob_idx])),
+                    position=passive_mobs.position.at[LEVEL_INDEX, mob_idx].set(
+                        jnp.where(should_spawn, snail_pos, passive_mobs.position[LEVEL_INDEX, mob_idx])),
+                    health=passive_mobs.health.at[LEVEL_INDEX, mob_idx].set(
+                        jnp.where(should_spawn, snail_health, passive_mobs.health[LEVEL_INDEX, mob_idx])),
+                    mask=passive_mobs.mask.at[LEVEL_INDEX, mob_idx].set(
+                        jnp.where(should_spawn, True, passive_mobs.mask[LEVEL_INDEX, mob_idx])),
+                    type_id=passive_mobs.type_id.at[LEVEL_INDEX, mob_idx].set(
+                        jnp.where(should_spawn, snail_type_id, passive_mobs.type_id[LEVEL_INDEX, mob_idx])),
                 )
 
     warrior_spawn_room_mask = jnp.stack(
@@ -1049,14 +1027,14 @@ def generate_world(rng, params, static_params):
             candidate_pos = jnp.clip(chosen_room_center + offset, room_min, room_max)
             collides_with_player = (player_position == candidate_pos[None, :]).all(axis=1).any()
             collides_with_snail = jnp.logical_and(
-                passive_mobs.mask[START_LEVEL],
-                (passive_mobs.position[START_LEVEL] == candidate_pos[None, :]).all(axis=1),
+                passive_mobs.mask[LEVEL_INDEX],
+                (passive_mobs.position[LEVEL_INDEX] == candidate_pos[None, :]).all(axis=1),
             ).any()
             collides_with_melee = jnp.logical_and(
-                melee_mobs.mask[START_LEVEL],
-                (melee_mobs.position[START_LEVEL] == candidate_pos[None, :]).all(axis=1),
+                melee_mobs.mask[LEVEL_INDEX],
+                (melee_mobs.position[LEVEL_INDEX] == candidate_pos[None, :]).all(axis=1),
             ).any()
-            candidate_block = map[START_LEVEL, candidate_pos[0], candidate_pos[1]]
+            candidate_block = map[LEVEL_INDEX, candidate_pos[0], candidate_pos[1]]
             is_walkable = jnp.logical_not(jnp.isin(candidate_block, jnp.array(SOLID_BLOCKS)))
             no_collision = jnp.logical_and(
                 jnp.logical_not(collides_with_player),
@@ -1072,17 +1050,17 @@ def generate_world(rng, params, static_params):
 
         should_spawn_melee = jnp.logical_and(should_spawn_melee, has_selected_pos)
         melee_mobs = melee_mobs.replace(
-            position=melee_mobs.position.at[START_LEVEL, t].set(
-                jnp.where(should_spawn_melee, melee_pos, melee_mobs.position[START_LEVEL, t])
+            position=melee_mobs.position.at[LEVEL_INDEX, t].set(
+                jnp.where(should_spawn_melee, melee_pos, melee_mobs.position[LEVEL_INDEX, t])
             ),
-            health=melee_mobs.health.at[START_LEVEL, t].set(
-                jnp.where(should_spawn_melee, melee_health, melee_mobs.health[START_LEVEL, t])
+            health=melee_mobs.health.at[LEVEL_INDEX, t].set(
+                jnp.where(should_spawn_melee, melee_health, melee_mobs.health[LEVEL_INDEX, t])
             ),
-            mask=melee_mobs.mask.at[START_LEVEL, t].set(
-                jnp.where(should_spawn_melee, True, melee_mobs.mask[START_LEVEL, t])
+            mask=melee_mobs.mask.at[LEVEL_INDEX, t].set(
+                jnp.where(should_spawn_melee, True, melee_mobs.mask[LEVEL_INDEX, t])
             ),
-            type_id=melee_mobs.type_id.at[START_LEVEL, t].set(
-                jnp.where(should_spawn_melee, melee_type_id, melee_mobs.type_id[START_LEVEL, t])
+            type_id=melee_mobs.type_id.at[LEVEL_INDEX, t].set(
+                jnp.where(should_spawn_melee, melee_type_id, melee_mobs.type_id[LEVEL_INDEX, t])
             ),
         )
 
@@ -1137,9 +1115,7 @@ def generate_world(rng, params, static_params):
         down_ladders=ladders_down,
         up_ladders=ladders_up,
         chests_opened=jnp.zeros((NUM_STORED_LEVELS, static_params.player_count), dtype=bool),
-        monsters_killed=jnp.zeros(NUM_STORED_LEVELS, dtype=jnp.int32)
-        .at[0]
-        .set(10),  # First ladder starts open
+        monsters_killed=jnp.zeros(NUM_STORED_LEVELS, dtype=jnp.int32),
         player_position=player_position,
         player_spawn_position=player_position,
         player_direction=jnp.full(

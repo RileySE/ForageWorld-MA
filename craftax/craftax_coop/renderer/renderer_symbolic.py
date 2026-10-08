@@ -45,7 +45,7 @@ def add_mobs_to_obs_mob_map(mob_map, mobs, mob_class_index, player_position):
 
 
 def render_craftax_symbolic(state: EnvState, static_params: StaticEnvParams):
-    map = state.map[state.player_level]
+    map = state.map[state.level_index]
 
     obs_dim_array = jnp.array([OBS_DIM[0], OBS_DIM[1]], dtype=jnp.int32)
 
@@ -65,7 +65,7 @@ def render_craftax_symbolic(state: EnvState, static_params: StaticEnvParams):
 
     # Items
     padded_items_map = jnp.pad(
-        state.item_map[state.player_level],
+        state.item_map[state.level_index],
         (MAX_OBS_DIM + 2, MAX_OBS_DIM + 2),
         constant_values=ItemType.NONE.value,
     )
@@ -92,7 +92,7 @@ def render_craftax_symbolic(state: EnvState, static_params: StaticEnvParams):
         if mobs.mask.shape[1] > 0:
             mob_map = add_mobs_to_obs_mob_map(
                 mob_map,
-                jax.tree_util.tree_map(lambda x: x[state.player_level], mobs),
+                jax.tree_util.tree_map(lambda x: x[state.level_index], mobs),
                 mob_class_index,
                 state.player_position,
             )
@@ -161,7 +161,7 @@ def render_craftax_symbolic(state: EnvState, static_params: StaticEnvParams):
 
     # Light map
     padded_light_map = jnp.pad(
-        state.light_map[state.player_level],
+        state.light_map[state.level_index],
         (MAX_OBS_DIM + 2, MAX_OBS_DIM + 2),
         constant_values=0.0,
     )
@@ -236,7 +236,7 @@ def render_craftax_symbolic(state: EnvState, static_params: StaticEnvParams):
         [
             state.light_level,
             state.player_level / 10.0,
-            state.monsters_killed[state.player_level] >= MONSTERS_KILLED_TO_CLEAR_LEVEL,
+            state.monsters_killed[state.level_index] >= MONSTERS_KILLED_TO_CLEAR_LEVEL,
             is_boss_vulnerable(state),
         ]
     )

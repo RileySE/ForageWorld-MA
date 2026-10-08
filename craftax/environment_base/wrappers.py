@@ -275,12 +275,12 @@ def add_logging_fields(info, env_state):
     # TODO why is this an array? It's supposed to be an int...
     #info['episode_id'] = env_state.env_id.squeeze()
 
-    melee_pos = env_state.melee_mobs.position[env_state.player_level]
-    melee_mask = env_state.melee_mobs.mask[env_state.player_level]
-    passive_pos = env_state.passive_mobs.position[env_state.player_level]
-    passive_mask = env_state.passive_mobs.mask[env_state.player_level]
-    ranged_pos = env_state.ranged_mobs.position[env_state.player_level]
-    ranged_mask = env_state.ranged_mobs.mask[env_state.player_level]
+    melee_pos = env_state.melee_mobs.position[env_state.level_index]
+    melee_mask = env_state.melee_mobs.mask[env_state.level_index]
+    passive_pos = env_state.passive_mobs.position[env_state.level_index]
+    passive_mask = env_state.passive_mobs.mask[env_state.level_index]
+    ranged_pos = env_state.ranged_mobs.position[env_state.level_index]
+    ranged_mask = env_state.ranged_mobs.mask[env_state.level_index]
 
     # Per-player mob distance / count metrics (multi-agent adapted)
     # player_position: (num_players, 2), mob_pos: (num_mobs, 2), mob_mask: (num_mobs,)
@@ -321,7 +321,7 @@ def add_logging_fields(info, env_state):
         ranged_on_screen = jnp.zeros((num_players,), dtype=bool)
         num_ranged_nearby = jnp.zeros((num_players,), dtype=jnp.int32)
 
-    num_monsters_killed = env_state.monsters_killed[env_state.player_level]
+    num_monsters_killed = env_state.monsters_killed[env_state.level_index]
 
     info['dist_to_melee_l1'] = dist_to_melee
     info['melee_on_screen'] = melee_on_screen.astype(jnp.float32)

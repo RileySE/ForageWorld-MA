@@ -20,9 +20,9 @@ def is_boss_spawn_wave(state, static_params):
 
 def is_boss_vulnerable(state):
     return jnp.logical_and(
-        state.melee_mobs.mask[state.player_level].sum() == 0,
+        state.melee_mobs.mask[state.level_index].sum() == 0,
         jnp.logical_and(
-            state.ranged_mobs.mask[state.player_level].sum() == 0,
+            state.ranged_mobs.mask[state.level_index].sum() == 0,
             state.boss_timesteps_to_spawn_this_round <= 0,
         ),
     )
@@ -47,8 +47,8 @@ def attack_mob_class(
         return mobs, empty_flags, empty_flags, jnp.asarray(0, dtype=jnp.int32), state.achievements
 
     def is_attacking_mob_at_index(mob_index):
-        in_mob = (mobs.position[state.player_level, mob_index] == position).all(axis=1)
-        return jnp.logical_and(in_mob, mobs.mask[state.player_level, mob_index])
+        in_mob = (mobs.position[state.level_index, mob_index] == position).all(axis=1)
+        return jnp.logical_and(in_mob, mobs.mask[state.level_index, mob_index])
 
     is_attacking_mob_array = jax.vmap(is_attacking_mob_at_index)(
         jnp.arange(mobs.mask.shape[1])
@@ -62,21 +62,21 @@ def attack_mob_class(
     damage = get_damage(
         damage_vector,
         MOB_TYPE_DEFENSE_MAPPING[
-            mobs.type_id[state.player_level, target_mob_index], mob_class_index
+            mobs.type_id[state.level_index, target_mob_index], mob_class_index
         ],
     )
 
-    new_mob_health = mobs.health.at[state.player_level, target_mob_index].add(
+    new_mob_health = mobs.health.at[state.level_index, target_mob_index].add(
         -damage * is_attacking_mob
     )
     mobs = mobs.replace(health=new_mob_health)
 
-    old_mask = mobs.mask[state.player_level]
+    old_mask = mobs.mask[state.level_index]
     mobs = mobs.replace(mask=jnp.logical_and(mobs.health > 0, mobs.mask))
     did_kill_mob = jnp.logical_and(
         jnp.logical_and(
             old_mask[target_mob_index],
-            jnp.logical_not(mobs.mask[state.player_level, target_mob_index]),
+            jnp.logical_not(mobs.mask[state.level_index, target_mob_index]),
         ),
         is_attacking_mob,
     )
@@ -84,12 +84,12 @@ def attack_mob_class(
     mobs_killed = jnp.sum(
         jnp.logical_and(
             old_mask,
-            jnp.logical_not(mobs.mask[state.player_level]),
+            jnp.logical_not(mobs.mask[state.level_index]),
         )
     )
 
     achievement_for_kill = MOB_ACHIEVEMENT_MAP[
-        mob_class_index, mobs.type_id[state.player_level, target_mob_index]
+        mob_class_index, mobs.type_id[state.level_index, target_mob_index]
     ]
 
     new_achievements = state.achievements.at[
@@ -154,7 +154,7 @@ def attack_mob(
         True,
         1,
     )
-    monsters_killed = monsters_killed.at[state.player_level].add(melee_mobs_killed)
+    monsters_killed = monsters_killed.at[state.level_index].add(melee_mobs_killed)
     melee_kill_credit = (
         jnp.zeros_like(state.log_melee_kills)
         .at[attacker_indices]
@@ -236,7 +236,7 @@ def attack_mob(
         2,
     )
 
-    monsters_killed = monsters_killed.at[state.player_level].add(ranged_mobs_killed)
+    monsters_killed = monsters_killed.at[state.level_index].add(ranged_mobs_killed)
 
     state = state.replace(
         ranged_mobs=new_ranged_mobs,
@@ -254,7 +254,7 @@ def attack_mob(
 
     state = state.replace(
         mob_map=state.mob_map.at[
-            state.player_level, position[:, 0], position[:, 1]
+            state.level_index, position[:, 0], position[:, 1]
         ].min(jnp.logical_not(did_kill_mob)),
         monsters_killed=monsters_killed,
     )
@@ -278,52 +278,52 @@ def spawn_projectile(
         return projectiles, projectile_directions, projectile_owners
 
     new_projectile_index = jnp.argmax(
-        jnp.logical_not(projectiles.mask[state.player_level])
+        jnp.logical_not(projectiles.mask[state.level_index])
     )
     new_projectile_position = jax.lax.select(
         is_spawning_projectile,
         new_projectile_position,
-        projectiles.position[state.player_level, new_projectile_index],
+        projectiles.position[state.level_index, new_projectile_index],
     )
     new_projectile_mask = jax.lax.select(
         is_spawning_projectile,
         True,
-        projectiles.mask[state.player_level, new_projectile_index],
+        projectiles.mask[state.level_index, new_projectile_index],
     )
     new_projectile_direction = jax.lax.select(
         is_spawning_projectile,
         direction,
-        projectile_directions[state.player_level, new_projectile_index],
+        projectile_directions[state.level_index, new_projectile_index],
     )
     new_projectile_owner = jax.lax.select(
         is_spawning_projectile,
         owner,
-        projectile_owners[state.player_level, new_projectile_index],
+        projectile_owners[state.level_index, new_projectile_index],
     )
     new_projectile_type = jax.lax.select(
         is_spawning_projectile,
         projectile_type,
-        projectiles.type_id[state.player_level, new_projectile_index],
+        projectiles.type_id[state.level_index, new_projectile_index],
     )
 
     new_projectiles = projectiles.replace(
-        position=projectiles.position.at[state.player_level, new_projectile_index].set(
+        position=projectiles.position.at[state.level_index, new_projectile_index].set(
             new_projectile_position
         ),
-        mask=projectiles.mask.at[state.player_level, new_projectile_index].set(
+        mask=projectiles.mask.at[state.level_index, new_projectile_index].set(
             new_projectile_mask
         ),
-        type_id=projectiles.type_id.at[state.player_level, new_projectile_index].set(
+        type_id=projectiles.type_id.at[state.level_index, new_projectile_index].set(
             new_projectile_type
         ),
     )
 
     new_projectile_directions = projectile_directions.at[
-        state.player_level, new_projectile_index
+        state.level_index, new_projectile_index
     ].set(new_projectile_direction)
 
     new_projectile_owners = projectile_owners.at[
-        state.player_level, new_projectile_index
+        state.level_index, new_projectile_index
     ].set(new_projectile_owner)
 
     return new_projectiles, new_projectile_directions, new_projectile_owners
@@ -423,14 +423,14 @@ def is_position_not_colliding_other_player(state, position):
 
 def is_position_in_bounds_not_in_mob_not_colliding(state, position, collision_map, static_params):
     pos_in_bounds = in_bounds(position, static_params)
-    in_solid_block = is_in_solid_block(state.map[state.player_level], position)
+    in_solid_block = is_in_solid_block(state.map[state.level_index], position)
     in_mob = is_in_mob(state, position)
     in_lava = (
-        state.map[state.player_level][position[:, 0], position[:, 1]]
+        state.map[state.level_index][position[:, 0], position[:, 1]]
         == BlockType.LAVA.value
     )
     in_water = (
-        state.map[state.player_level][position[:, 0], position[:, 1]]
+        state.map[state.level_index][position[:, 0], position[:, 1]]
         == BlockType.WATER.value
     )
     on_ground_block = jnp.logical_and(
@@ -472,7 +472,7 @@ def is_near_block(state, block_type, static_params):
     )
     in_bound_blocks = jax.vmap(in_bounds, in_axes=(0, None))(close_blocks, static_params)
     correct_blocks = (
-        state.map[state.player_level, close_blocks[:, :, 0], close_blocks[:, :, 1]]
+        state.map[state.level_index, close_blocks[:, :, 0], close_blocks[:, :, 1]]
         == block_type
     )
     return (jnp.logical_and(in_bound_blocks, correct_blocks)).any(axis=1)
@@ -490,7 +490,7 @@ def is_in_other_player(state: EnvState, position: chex.Array):
 
 
 def is_in_mob(state: EnvState, position: chex.Array):
-    return state.mob_map[state.player_level, position[:, 0], position[:, 1]]
+    return state.mob_map[state.level_index, position[:, 0], position[:, 1]]
 
 
 def get_max_health(state):
