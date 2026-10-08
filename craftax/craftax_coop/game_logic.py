@@ -2588,33 +2588,12 @@ def update_plants(state, static_params):
 
     finished_growing_plants = growing_plants_age >= 500
 
-    new_plant_blocks = jnp.where(
-        finished_growing_plants,
-        BlockType.RIPE_PLANT.value,
-        BlockType.PLANT.value,
-    )
-
-    def _set_plant_block(map, plant_index):
-        new_block = jax.lax.select(
-            finished_growing_plants[plant_index],
-            new_plant_blocks[plant_index],
-            map[
-                state.growing_plants_positions[plant_index][0],
-                state.growing_plants_positions[plant_index][1],
-            ],
-        )
-        map = map.at[
-            state.growing_plants_positions[plant_index][0],
-            state.growing_plants_positions[plant_index][1],
-        ].set(new_block)
-        return map, None
-
-    new_map, _ = jax.lax.scan(
-        _set_plant_block,
-        state.map[0],
-        jnp.arange(static_params.max_growing_plants),
-        unroll=ENV_SCAN_UNROLL,
-    )
+    # A finished plant's cell becomes a ripe plant. (Writing the cell's current block back for
+    # unfinished plants, as a per-plant loop would, changes nothing.)
+    is_ripe_cell = jnp.zeros(static_params.map_size, dtype=bool).at[
+        state.growing_plants_positions[:, 0], state.growing_plants_positions[:, 1]
+    ].max(finished_growing_plants)
+    new_map = jnp.where(is_ripe_cell, BlockType.RIPE_PLANT.value, state.map[0])
 
     new_whole_map = state.map.at[0].set(new_map)
 

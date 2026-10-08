@@ -25,6 +25,7 @@ from craftax_coop.game_logic import (
     move_mob_projectiles,
     move_passive_mobs,
     move_player_projectiles,
+    update_plants,
 )
 from craftax_coop.renderer.renderer_symbolic import add_mobs_to_obs_mob_map
 from craftax_coop.util.game_logic_utils import (
@@ -35,6 +36,7 @@ from craftax_coop.util.game_logic_utils import (
     is_position_in_bounds_not_in_mob_not_colliding,
 )
 from craftax_coop.util.maths_utils import random_choice
+
 
 def _assert_trees_equal(a, b):
     leaves_a, leaves_b = jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b)
@@ -608,4 +610,70 @@ def test_projectile_moves_match_sequential_loop():
     expected = jax.jit(jax.vmap(
         lambda s: _sequential_slots(move_player, s, static_params.max_player_projectiles)))(states)
     actual = jax.jit(jax.vmap(lambda s: move_player_projectiles(s, params, static_params)))(states)
+    _assert_trees_equal(actual, expected)
+
+
+def _sequential_update_plants(state, static_params):
+    """The original update_plants."""
+    growing_plants_age = state.growing_plants_age + 1
+    growing_plants_age *= state.growing_plants_mask
+
+    finished_growing_plants = growing_plants_age >= 500
+
+    new_plant_blocks = jnp.where(
+        finished_growing_plants,
+        BlockType.RIPE_PLANT.value,
+        BlockType.PLANT.value,
+    )
+
+    def _set_plant_block(map, plant_index):
+        new_block = jax.lax.select(
+            finished_growing_plants[plant_index],
+            new_plant_blocks[plant_index],
+            map[
+                state.growing_plants_positions[plant_index][0],
+                state.growing_plants_positions[plant_index][1],
+            ],
+        )
+        map = map.at[
+            state.growing_plants_positions[plant_index][0],
+            state.growing_plants_positions[plant_index][1],
+        ].set(new_block)
+        return map, None
+
+    new_map, _ = jax.lax.scan(
+        _set_plant_block,
+        state.map[0],
+        jnp.arange(static_params.max_growing_plants),
+    )
+
+    new_whole_map = state.map.at[0].set(new_map)
+
+    state = state.replace(
+        map=new_whole_map,
+        growing_plants_age=growing_plants_age,
+    )
+
+    return state
+
+
+def test_update_plants_matches_sequential_loop():
+    env = make_craftax_env_from_name("Craftax-Coop-Symbolic", num_teams=1, team_composition=(1, 1, 2))
+    static_params = env.static_env_params
+    num_envs, num_plants = 8, static_params.max_growing_plants
+    _, states = jax.vmap(env.reset)(jax.random.split(jax.random.PRNGKey(11), num_envs))
+
+    def plant(key, state):
+        keys = jax.random.split(key, 3)
+        # Few distinct cells, so several plants share a cell; ages straddle ripening at 500.
+        positions = state.player_position[0] + jax.random.randint(keys[0], (num_plants, 2), -2, 3)
+        return state.replace(
+            growing_plants_positions=positions,
+            growing_plants_age=jax.random.randint(keys[1], (num_plants,), 495, 505),
+            growing_plants_mask=jax.random.uniform(keys[2], (num_plants,)) < 0.7,
+        )
+
+    states = jax.vmap(plant)(jax.random.split(jax.random.PRNGKey(12), num_envs), states)
+    expected = jax.jit(jax.vmap(lambda s: _sequential_update_plants(s, static_params)))(states)
+    actual = jax.jit(jax.vmap(lambda s: update_plants(s, static_params)))(states)
     _assert_trees_equal(actual, expected)
