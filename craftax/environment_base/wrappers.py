@@ -453,6 +453,64 @@ class SelectiveResetVecEnvWrapper(object):
         _, obs, env_state = jax.lax.while_loop(has_pending, reset_chunk, (finished, obs, env_state))
         return obs, env_state
 
+    def init_reset_pool(self, key, size):
+        """A ResetPool of `size` freshly generated start states; size must be at least num_envs."""
+        key, worlds_key = jax.random.split(key)
+        obs, env_state = jax.vmap(self._env.reset)(jax.random.split(worlds_key, size))
+        return ResetPool(obs=obs, env_state=env_state, next_index=jnp.zeros((), jnp.int32), key=key)
+
+    def step_with_reset_pool(self, keys, state, actions, pool):
+        """Like step, but an env whose episode ended starts from the next unused state in the pool
+        instead of generating a world from its reset key; the pool is regenerated in one batched
+        call when it runs short. Returns the step outputs and the updated pool.
+
+        New episodes start from identically distributed worlds (only the random keys differ from
+        step), envs that did not finish are unaffected, and finished envs no longer each pay for
+        a latency-bound world generation.
+        """
+        obs, state, reward, done, info = jax.vmap(self._log_env.step)(keys, state, actions)
+        finished = done["__all__"]
+        pool_size = jax.tree_util.tree_leaves(pool.env_state)[0].shape[0]
+        pool = jax.lax.cond(
+            pool.next_index + finished.sum() > pool_size,
+            lambda pool: self.init_reset_pool(pool.key, pool_size),
+            lambda pool: pool,
+            pool,
+        )
+
+        num_envs = finished.shape[0]
+        chunk_size = min(64, num_envs)
+
+        def has_pending(carry):
+            return carry[0].any()
+
+        def take_chunk(carry):
+            pending, obs, env_state, next_index = carry
+            # Up to chunk_size pending env indices; padding points past the end and is dropped.
+            idx = jnp.nonzero(pending, size=chunk_size, fill_value=num_envs)[0]
+            entries = jnp.minimum(next_index + jnp.arange(chunk_size), pool_size - 1)
+            put = lambda old, new: old.at[idx].set(new[entries], mode="drop")
+            return (
+                pending.at[idx].set(False, mode="drop"),
+                jax.tree_util.tree_map(put, obs, pool.obs),
+                jax.tree_util.tree_map(put, env_state, pool.env_state),
+                next_index + (idx < num_envs).sum(),
+            )
+
+        _, obs, env_state, next_index = jax.lax.while_loop(
+            has_pending, take_chunk, (finished, obs, state.env_state, pool.next_index)
+        )
+        return obs, state.replace(env_state=env_state), reward, done, info, pool.replace(next_index=next_index)
+
+
+@struct.dataclass
+class ResetPool:
+    """Pre-generated start states for SelectiveResetVecEnvWrapper.step_with_reset_pool."""
+    obs: Any
+    env_state: Any
+    next_index: jnp.ndarray  # first unused entry
+    key: jnp.ndarray  # for generating the next pool
+
 
 # Class to progressively render visualization frames during test rollouts.
 # TODO remove residual cruft

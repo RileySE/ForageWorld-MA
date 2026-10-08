@@ -265,6 +265,15 @@ def make_train(config, env, wandb_start_step=-1):
             f"Got NUM_ENVS={config['NUM_ENVS']}, NUM_MINIBATCHES={config['NUM_MINIBATCHES']}."
         )
 
+    # Envs whose episode ended take start states from a pool generated in batches of this size
+    # (see SelectiveResetVecEnvWrapper.step_with_reset_pool); 0 generates each one from the env's
+    # own reset key instead.
+    reset_pool_size = int(config.get("RESET_POOL_SIZE", config["NUM_ENVS"]))
+    if reset_pool_size != 0 and reset_pool_size < config["NUM_ENVS"]:
+        raise ValueError(
+            f"RESET_POOL_SIZE must be 0 or >= NUM_ENVS, got {reset_pool_size} (NUM_ENVS={config['NUM_ENVS']})."
+        )
+
     logging_threads = int(config.get("LOGGING_THREADS", 1))
     if logging_threads <= 0:
         raise ValueError(f"LOGGING_THREADS must be >= 1, got {logging_threads}.")
@@ -463,6 +472,11 @@ def make_train(config, env, wandb_start_step=-1):
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = vec_env.reset(reset_rng)
+        reset_pool = (
+            vec_env.init_reset_pool(jax.random.fold_in(_rng, 1), reset_pool_size)
+            if reset_pool_size > 0
+            else None
+        )
         # Hidden state shape: (num_agents, num_envs, hidden_dim)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
         init_hstate = jnp.tile(init_hstate[np.newaxis, :, :], (env.num_agents, 1, 1))
@@ -491,7 +505,7 @@ def make_train(config, env, wandb_start_step=-1):
         # eliminate the dead code path entirely.
 
         def _env_step(runner_state, unused, detailed_logging=False, effective_cap=None):
-            train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+            train_state, env_state, last_obs, last_done, hstate, rng, reset_pool = runner_state
 
             # SELECT ACTION
             rng, _rng = jax.random.split(rng)
@@ -533,13 +547,17 @@ def make_train(config, env, wandb_start_step=-1):
             value = value.squeeze(axis=1)        # (num_agents, num_envs)
 
             env_action = policy_action_to_env_action(action)
-            env_act = unbatchify(env_action, env.agents)
-            env_act = {k: v.squeeze() for k, v in env_act.items()}
+            env_act = unbatchify(env_action, env.agents)  # {agent: (num_envs,)}
 
             # STEP ENV
             rng, _rng = jax.random.split(rng)
-            rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-            obsv, env_state, reward, done, info = vec_env.step(rng_step, env_state, env_act)
+            rng_step = jax.random.split(_rng, hstate.shape[1])
+            if reset_pool is None:
+                obsv, env_state, reward, done, info = vec_env.step(rng_step, env_state, env_act)
+            else:
+                obsv, env_state, reward, done, info, reset_pool = vec_env.step_with_reset_pool(
+                    rng_step, env_state, env_act, reset_pool
+                )
             # CSV fields (health, food, mob distances, etc.) are only needed during logging.
             if detailed_logging:
                 info = jax.vmap(add_logging_fields)(info, env_state.env_state)
@@ -623,7 +641,7 @@ def make_train(config, env, wandb_start_step=-1):
                     info['pred_delta_y'] = aux_pred_squeezed[:, :, 1] # (num_agents, num_envs)
 
             # Keep done as dict for next iteration (env returns dict)
-            runner_state = (train_state, env_state, obsv, done, hstate, rng)
+            runner_state = (train_state, env_state, obsv, done, hstate, rng, reset_pool)
             return runner_state, transition
 
         _early_episode_cap = config.get("EARLY_EPISODE_CAP", 0)
@@ -664,9 +682,9 @@ def make_train(config, env, wandb_start_step=-1):
         def _apply_episode_cap_to_runner_state(runner_state, effective_cap):
             if effective_cap is None:
                 return runner_state
-            train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+            train_state, env_state, last_obs, last_done, hstate, rng, reset_pool = runner_state
             env_state = _patch_episode_cap(env_state, effective_cap)
-            return (train_state, env_state, last_obs, last_done, hstate, rng)
+            return (train_state, env_state, last_obs, last_done, hstate, rng, reset_pool)
 
         def _update_step(update_runner_state, unused):
             runner_state, update_steps = update_runner_state
@@ -689,7 +707,7 @@ def make_train(config, env, wandb_start_step=-1):
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+            train_state, env_state, last_obs, last_done, hstate, rng, reset_pool = runner_state
             last_obs_batch = batchify(last_obs, env.agents)
             last_done_batch = batchify(last_done, env.agents)  # last_done is dict from env
             
@@ -1238,7 +1256,7 @@ def make_train(config, env, wandb_start_step=-1):
 
             jax.experimental.io_callback(callback, None, metric, update_steps, ordered=True)
             update_steps = update_steps + 1
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
+            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, reset_pool)
             return (runner_state, update_steps), metric
 
 
@@ -1483,6 +1501,7 @@ def make_train(config, env, wandb_start_step=-1):
             state, update_steps = runner_state
             effective_cap = _get_effective_episode_cap(update_steps)
             state = _apply_episode_cap_to_runner_state(state, effective_cap)
+
             # episode_count tracks cumulative episode IDs across logging steps: (num_agents, NUM_ENVS)
             episode_count = jnp.zeros((env.num_agents, config["NUM_ENVS"]), dtype=jnp.int32)
             (state, episode_count), empty = jax.lax.scan(
@@ -1505,7 +1524,7 @@ def make_train(config, env, wandb_start_step=-1):
                     video_length = min(video_length, _video_max_length)
 
                 # Unpack training state
-                train_state_v, env_state_v, obsv_v, done_v, hstate_v, rng_v = state
+                train_state_v, env_state_v, obsv_v, done_v, hstate_v, rng_v, reset_pool_v = state
 
                 # Fork RNG: one for video, one to continue training
                 rng_video, rng_continue = jax.random.split(rng_v)
@@ -1538,7 +1557,7 @@ def make_train(config, env, wandb_start_step=-1):
                 )
 
                 # Restore training state with updated RNG (video state discarded)
-                state = (train_state_v, env_state_v, obsv_v, done_v, hstate_v, rng_continue)
+                state = (train_state_v, env_state_v, obsv_v, done_v, hstate_v, rng_continue, reset_pool_v)
 
                 def save_video_from_buffer(step):
                     """Assemble streamed frames from buffer and save as video files."""
@@ -1624,6 +1643,7 @@ def make_train(config, env, wandb_start_step=-1):
             init_done,  # Keep as dict for consistency with env.step output
             init_hstate,
             _rng,
+            reset_pool,
         )
         init_carry = (runner_state, jnp.asarray(0, dtype=jnp.int32))
         return init_carry, _update_plot, _update_step
