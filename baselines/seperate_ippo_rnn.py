@@ -22,7 +22,7 @@ import functools
 import gzip
 import io
 import yaml
-from typing import Sequence, NamedTuple, Dict
+from typing import Callable, Sequence, NamedTuple, Dict
 
 import jax
 if not hasattr(jax, 'tree_map'):
@@ -53,30 +53,79 @@ import checkpoint_utils as ckpt
 # ===========================
 # Model Definitions
 # ===========================
+class _DenseParams(nn.Module):
+    """The parameters nn.Dense would create (same names, order, shapes and initializers)."""
+    in_features: int
+    features: int
+    kernel_init: Callable
+    use_bias: bool = True
+
+    @nn.compact
+    def __call__(self):
+        kernel = self.param("kernel", self.kernel_init, (self.in_features, self.features), jnp.float32)
+        if not self.use_bias:
+            return kernel, None
+        return kernel, self.param("bias", nn.initializers.zeros_init(), (self.features,), jnp.float32)
+
+
+class _GRUCellParams(nn.Module):
+    """The parameters of nn.GRUCell (same names and initial values), for ScannedRNN to apply."""
+    in_features: int
+    hidden_features: int
+
+    @nn.compact
+    def __call__(self):
+        input_dense = functools.partial(
+            _DenseParams, self.in_features, self.hidden_features, nn.initializers.lecun_normal()
+        )
+        hidden_dense = functools.partial(
+            _DenseParams, self.hidden_features, self.hidden_features, nn.initializers.orthogonal()
+        )
+        return {
+            "ir": input_dense(name="ir")(),
+            "iz": input_dense(name="iz")(),
+            "in": input_dense(name="in")(),
+            "hr": hidden_dense(use_bias=False, name="hr")(),
+            "hz": hidden_dense(use_bias=False, name="hz")(),
+            "hn": hidden_dense(name="hn")(),
+        }
+
+
 class ScannedRNN(nn.Module):
-    @functools.partial(
-        nn.scan,
-        variable_broadcast="params",
-        in_axes=0,
-        out_axes=0,
-        split_rngs={"params": False},
-    )
+    """nn.GRUCell run over a sequence, computed faster.
+
+    The input projections of all time steps are one matmul before the time loop, the three recurrent
+    projections are one matmul per step, and the loop is unrolled. Parameters (names and initial
+    values) are those of the nn.GRUCell this replaced; results differ only in float rounding.
+    """
+
     @nn.compact
     def __call__(self, carry, x):
-        rnn_state = carry
-        ins, resets = x
-        rnn_state = jnp.where(
-            resets[:, np.newaxis],
-            self.initialize_carry(*rnn_state.shape),
-            rnn_state,
-        )
-        new_rnn_state, y = nn.GRUCell(features=ins.shape[1])(rnn_state, ins)
-        return new_rnn_state, y
+        ins, resets = x  # (time, batch, features), (time, batch)
+        hidden = carry.shape[-1]
+        # Named like the nn.GRUCell this replaced, so the parameters are unchanged.
+        w = _GRUCellParams(ins.shape[-1], hidden, name="GRUCell_1")()
+        input_kernel = jnp.concatenate([w["ir"][0], w["iz"][0], w["in"][0]], axis=1)
+        input_bias = jnp.concatenate([w["ir"][1], w["iz"][1], w["in"][1]])
+        hidden_kernel = jnp.concatenate([w["hr"][0], w["hz"][0], w["hn"][0]], axis=1)
+        hidden_n_bias = w["hn"][1]
+        input_proj = ins @ input_kernel + input_bias
+
+        def step(h, inputs):
+            input_proj_t, reset = inputs
+            h = jnp.where(reset[:, np.newaxis], jnp.zeros_like(h), h)
+            hidden_proj = h @ hidden_kernel
+            r = nn.sigmoid(input_proj_t[:, :hidden] + hidden_proj[:, :hidden])
+            z = nn.sigmoid(input_proj_t[:, hidden:2 * hidden] + hidden_proj[:, hidden:2 * hidden])
+            n = jnp.tanh(input_proj_t[:, 2 * hidden:] + r * (hidden_proj[:, 2 * hidden:] + hidden_n_bias))
+            h = (1.0 - z) * n + z * h
+            return h, h
+
+        return jax.lax.scan(step, carry, (input_proj, resets), unroll=8)
 
     @staticmethod
     def initialize_carry(batch_size, hidden_size):
-        cell = nn.GRUCell(features=hidden_size)
-        return cell.initialize_carry(jax.random.PRNGKey(0), (batch_size, hidden_size))
+        return jnp.zeros((batch_size, hidden_size), dtype=jnp.float32)
 
 
 class ActorCriticRNN(nn.Module):
@@ -837,73 +886,25 @@ def make_train(config, env, wandb_start_step=-1):
                 # train_batch shapes: (num_steps, num_agents, num_envs, ...)
                 # advantages/targets: (num_steps, num_agents, num_envs)
                 
-                # Permute over num_envs dimension
+                # Permute over num_envs dimension; minibatch m uses envs
+                # permutation[m * MINIBATCH_SIZE:(m + 1) * MINIBATCH_SIZE]. Each minibatch is
+                # gathered when it is used rather than copying the whole shuffled batch first.
                 permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
+                minibatch_envs = permutation.reshape(config["NUM_MINIBATCHES"], config["MINIBATCH_SIZE"])
 
-                # Shuffle init_hstate: (num_agents, num_envs, hidden_dim) -> axis 1
-                init_hstate_shuffled = jnp.take(init_hstate, permutation, axis=1)
-                
-                # Shuffle train_batch components: (num_steps, num_agents, num_envs, ...) -> axis 2
-                def shuffle_batch(x):
-                    return jnp.take(x, permutation, axis=2)
-                
-                train_batch_shuffled = TrainBatch(
-                    global_done=shuffle_batch(train_batch.global_done),
-                    done=shuffle_batch(train_batch.done),
-                    alive=shuffle_batch(train_batch.alive),
-                    action=shuffle_batch(train_batch.action),
-                    value=shuffle_batch(train_batch.value),
-                    reward=shuffle_batch(train_batch.reward),
-                    log_prob=shuffle_batch(train_batch.log_prob),
-                    obs=shuffle_batch(train_batch.obs),
-                    deltas_to_start=shuffle_batch(train_batch.deltas_to_start),
-                )
-                
-                # Shuffle advantages/targets: (num_steps, num_agents, num_envs) -> axis 2
-                advantages_shuffled = jnp.take(advantages, permutation, axis=2)
-                targets_shuffled = jnp.take(targets, permutation, axis=2)
-                
-                # Create minibatches
-                def minibatch_hstate(x):
-                    # x: (num_agents, num_envs, hidden_dim)
-                    # -> (num_minibatches, num_agents, minibatch_size, hidden_dim)
-                    num_agents, num_envs, hidden_dim = x.shape
-                    minibatch_size = num_envs // config["NUM_MINIBATCHES"]
-                    return x.reshape(num_agents, config["NUM_MINIBATCHES"], minibatch_size, hidden_dim).swapaxes(0, 1)
-                
-                def minibatch_array(x):
-                    # x: (num_steps, num_agents, num_envs, ...) 
-                    # -> (num_minibatches, num_steps, num_agents, minibatch_size, ...)
-                    shape = list(x.shape)
-                    num_steps, num_agents, num_envs = shape[:3]
-                    rest = shape[3:]
-                    minibatch_size = num_envs // config["NUM_MINIBATCHES"]
-                    new_shape = [num_steps, num_agents, config["NUM_MINIBATCHES"], minibatch_size] + rest
-                    reshaped = x.reshape(new_shape)
-                    # Move minibatch axis to front
-                    return jnp.moveaxis(reshaped, 2, 0)
-                
-                init_hstate_mb = minibatch_hstate(init_hstate_shuffled)
-                
-                train_batch_mb = TrainBatch(
-                    global_done=minibatch_array(train_batch_shuffled.global_done),
-                    done=minibatch_array(train_batch_shuffled.done),
-                    alive=minibatch_array(train_batch_shuffled.alive),
-                    action=minibatch_array(train_batch_shuffled.action),
-                    value=minibatch_array(train_batch_shuffled.value),
-                    reward=minibatch_array(train_batch_shuffled.reward),
-                    log_prob=minibatch_array(train_batch_shuffled.log_prob),
-                    obs=minibatch_array(train_batch_shuffled.obs),
-                    deltas_to_start=minibatch_array(train_batch_shuffled.deltas_to_start),
-                )
-                
-                advantages_mb = minibatch_array(advantages_shuffled)
-                targets_mb = minibatch_array(targets_shuffled)
-                
-                minibatches = (init_hstate_mb, train_batch_mb, advantages_mb, targets_mb)
+                def _gather_and_update_minbatch(train_state, envs):
+                    # init_hstate: (num_agents, num_envs, hidden_dim) -> axis 1
+                    # train_batch, advantages, targets: (num_steps, num_agents, num_envs, ...) -> axis 2
+                    batch_info = (
+                        jnp.take(init_hstate, envs, axis=1),
+                        jax.tree.map(lambda x: jnp.take(x, envs, axis=2), train_batch),
+                        jnp.take(advantages, envs, axis=2),
+                        jnp.take(targets, envs, axis=2),
+                    )
+                    return _update_minbatch(train_state, batch_info)
 
                 train_state, total_loss = jax.lax.scan(
-                    _update_minbatch, train_state, minibatches
+                    _gather_and_update_minbatch, train_state, minibatch_envs
                 )
                 update_state = (
                     train_state,
