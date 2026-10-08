@@ -21,9 +21,9 @@ from craftax_coop.craftax_state import Mobs
 from craftax_coop.game_logic import (
     _move_mob_projectile,
     _move_player_projectile,
-    move_melee_mobs,
+    _move_melee_mobs_with_keys,
     move_mob_projectiles,
-    move_passive_mobs,
+    _move_passive_mobs_with_keys,
     move_player_projectiles,
 )
 from craftax_coop.renderer.renderer_symbolic import add_mobs_to_obs_mob_map
@@ -35,6 +35,30 @@ from craftax_coop.util.game_logic_utils import (
     is_position_in_bounds_not_in_mob_not_colliding,
 )
 from craftax_coop.util.maths_utils import random_choice
+
+
+def _chained_passive_mob_keys(rng, num_mobs):
+    """The keys the original passive-mob loop drew: one split of the carried key per mob."""
+    keys = []
+    for _ in range(num_mobs):
+        rng, key = jax.random.split(rng)
+        keys.append(key)
+    return rng, jnp.stack(keys)
+
+
+def _chained_melee_mob_keys(rng, num_mobs):
+    """The keys the original melee-mob loop drew: four splits of the carried key per mob, the
+    second half of the last one being carried to the next mob."""
+    move_keys, axis_keys, chase_keys = [], [], []
+    for _ in range(num_mobs):
+        rng, move_key = jax.random.split(rng)
+        rng, axis_key = jax.random.split(rng)
+        rng, chase_key = jax.random.split(rng)
+        _, rng = jax.random.split(rng)
+        move_keys.append(move_key)
+        axis_keys.append(axis_key)
+        chase_keys.append(chase_key)
+    return rng, jnp.stack(move_keys), jnp.stack(axis_keys), jnp.stack(chase_keys)
 
 
 def _assert_trees_equal(a, b):
@@ -167,11 +191,18 @@ def test_move_passive_mobs_matches_sequential_loop():
     rngs = jax.random.split(jax.random.PRNGKey(4), num_envs)
     for passive_mobs_static in (False, True):
         params = env.default_params.replace(passive_mobs_static=passive_mobs_static)
-        expected = jax.jit(jax.vmap(lambda r, s: _sequential_move_passive_mobs(r, s, params, static_params)))(
-            rngs, states
-        )
-        actual = jax.jit(jax.vmap(lambda r, s: move_passive_mobs(r, s, params, static_params)))(rngs, states)
-        _assert_trees_equal(actual, expected)
+        expected_rng, expected_state = jax.jit(jax.vmap(
+            lambda r, s: _sequential_move_passive_mobs(r, s, params, static_params)
+        ))(rngs, states)
+        chained_rng, mob_keys = jax.vmap(
+            lambda r: _chained_passive_mob_keys(r, static_params.max_passive_mobs)
+        )(rngs)
+        actual_state = jax.jit(jax.vmap(
+            lambda k, s: _move_passive_mobs_with_keys(k, s, params, static_params)
+        ))(mob_keys, states)
+        _assert_trees_equal(actual_state, expected_state)
+        # The loop draws no keys for static mobs.
+        _assert_trees_equal(rngs if passive_mobs_static else chained_rng, expected_rng)
 
 
 def _sequential_add_mobs_to_obs_mob_map(mob_map, mobs, mob_class_index, player_position):
@@ -486,11 +517,16 @@ def test_move_melee_mobs_matches_sequential_loop():
     rngs = jax.random.split(jax.random.PRNGKey(8), num_envs)
     for despawn_when_far in (False, True):
         params = env.default_params.replace(melee_mobs_despawn_when_far=despawn_when_far)
-        expected = jax.jit(jax.vmap(lambda r, s: _sequential_move_melee_mobs(r, s, params, static_params)))(
-            rngs, states
-        )
-        actual = jax.jit(jax.vmap(lambda r, s: move_melee_mobs(r, s, params, static_params)))(rngs, states)
-        _assert_trees_equal(actual, expected)
+        expected = jax.jit(jax.vmap(
+            lambda r, s: _sequential_move_melee_mobs(r, s, params, static_params)
+        ))(rngs, states)
+        chained_rng, move_keys, axis_keys, chase_keys = jax.vmap(
+            lambda r: _chained_melee_mob_keys(r, static_params.max_melee_mobs)
+        )(rngs)
+        actual_state = jax.jit(jax.vmap(
+            lambda a, b, c, s: _move_melee_mobs_with_keys(a, b, c, s, params, static_params)
+        ))(move_keys, axis_keys, chase_keys, states)
+        _assert_trees_equal((chained_rng, actual_state), expected)
 
 
 def _sequential_slots(move_one, state, num_slots):

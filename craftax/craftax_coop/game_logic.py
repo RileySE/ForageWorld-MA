@@ -1565,34 +1565,40 @@ def _apply_mob_map_moves(mob_map, position, new_position, mask, new_mask):
 
 
 def move_passive_mobs(rng, state, params, static_params):
-    """Move every passive mob; same result as moving them one at a time in index order.
+    """Move every passive mob. Mob i draws its random move with the i-th key of one split of rng.
+
+    (The original per-mob loop chained one split per mob, which made generating the keys
+    sequential; the draws are identically distributed either way.)
+    """
+    if static_params.max_passive_mobs == 0:
+        return rng, state
+    keys = jax.random.split(rng, static_params.max_passive_mobs + 1)
+    return keys[0], _move_passive_mobs_with_keys(keys[1:], state, params, static_params)
+
+
+def _move_passive_mobs_with_keys(mob_keys, state, params, static_params):
+    """Same result as moving the passive mobs one at a time in index order, mob i drawing its
+    random move with mob_keys[i].
 
     A passive mob's move depends on earlier mobs only through mob_map occupancy, so moves are
-    proposed for all mobs at once (with the same per-mob keys as the sequential loop) and the
-    occupancy is resolved exactly by _resolve_sequential_moves.
+    proposed for all mobs at once and the occupancy is resolved exactly by
+    _resolve_sequential_moves.
     """
-    num_mobs = static_params.max_passive_mobs
-    if num_mobs == 0:
-        return rng, state
     level = state.level_index
     mobs = state.passive_mobs
     position = mobs.position[level]
     mask = mobs.mask[level]
 
-    def propose_random_moves(rng):
-        mob_keys = []
-        for _ in range(num_mobs):  # the sequential loop splits the carried key once per mob
-            rng, mob_key = jax.random.split(rng)
-            mob_keys.append(mob_key)
+    def propose_random_moves(mob_keys):
         valid_directions = jax.vmap(lambda pos: in_bounds(DIRECTIONS_PASSIVE + pos, static_params))(position)
         directions = jax.vmap(lambda key, p: random_choice(key, DIRECTIONS_PASSIVE, p=p))(
-            jnp.stack(mob_keys), valid_directions
+            mob_keys, valid_directions
         )
-        return rng, position + directions
+        return position + directions
 
     # Static mobs propose their current cell, which resolves to staying put.
-    rng, proposed = jax.lax.cond(
-        params.passive_mobs_static, lambda rng: (rng, position), propose_random_moves, rng
+    proposed = jax.lax.cond(
+        params.passive_mobs_static, lambda mob_keys: position, propose_random_moves, mob_keys
     )
 
     no_mobs = state.replace(mob_map=jnp.zeros_like(state.mob_map))
@@ -1623,11 +1629,28 @@ def move_passive_mobs(rng, state, params, static_params):
             _apply_mob_map_moves(level_mob_map, position, new_position, mask, new_mask)
         ),
     )
-    return rng, state
+    return state
 
 
 def move_melee_mobs(rng, state, params, static_params):
-    """Move every melee mob and resolve its attacks; same result as one at a time in index order.
+    """Move every melee mob and resolve its attacks. Mob i's three random draws use keys 3i+1,
+    3i+2 and 3i+3 of one split of rng.
+
+    (The original per-mob loop chained four splits per mob, which made generating the keys
+    sequential; the draws are identically distributed either way.)
+    """
+    num_mobs = static_params.max_melee_mobs
+    if num_mobs == 0:
+        return rng, state
+    keys = jax.random.split(rng, 3 * num_mobs + 1)
+    return keys[0], _move_melee_mobs_with_keys(
+        keys[1::3], keys[2::3], keys[3::3], state, params, static_params
+    )
+
+
+def _move_melee_mobs_with_keys(move_keys, axis_keys, chase_keys, state, params, static_params):
+    """Same result as moving the melee mobs one at a time in index order, mob i drawing its random
+    step, chase axis and chase decision with move_keys[i], axis_keys[i] and chase_keys[i].
 
     Each mob reads only its own slot, so its random draws, target, attack decision and proposed
     move can be computed for all mobs at once. Four things depend on earlier mobs: mob_map
@@ -1637,25 +1660,11 @@ def move_melee_mobs(rng, state, params, static_params):
     flags.
     """
     num_mobs = static_params.max_melee_mobs
-    if num_mobs == 0:
-        return rng, state
     level = state.level_index
     mobs = state.melee_mobs
     position = mobs.position[level]
     mask = mobs.mask[level]
     attack_cooldown = mobs.attack_cooldown[level]
-
-    # The sequential loop splits its carried key four times per mob and hands the second half
-    # of the last split to the next mob.
-    move_keys, axis_keys, chase_keys = [], [], []
-    for _ in range(num_mobs):
-        rng, move_key = jax.random.split(rng)
-        rng, axis_key = jax.random.split(rng)
-        rng, chase_key = jax.random.split(rng)
-        _, rng = jax.random.split(rng)
-        move_keys.append(move_key)
-        axis_keys.append(axis_key)
-        chase_keys.append(chase_key)
 
     def propose_move(pos, move_key, axis_key, chase_key):
         valid_random_moves = in_bounds(DIRECTIONS[1:5] + pos, static_params)
@@ -1686,9 +1695,7 @@ def move_melee_mobs(rng, state, params, static_params):
         )
         return proposed_position, distance_to_players
 
-    proposed, distance_to_players = jax.vmap(propose_move)(
-        position, jnp.stack(move_keys), jnp.stack(axis_keys), jnp.stack(chase_keys)
-    )
+    proposed, distance_to_players = jax.vmap(propose_move)(position, move_keys, axis_keys, chase_keys)
 
     # Attacks (mob, player); an attacking mob stays put.
     is_attacking_player = (
@@ -1765,7 +1772,7 @@ def move_melee_mobs(rng, state, params, static_params):
             _apply_mob_map_moves(level_mob_map, position, new_position, mask, new_mask)
         ),
     )
-    return rng, state
+    return state
 
 
 def _for_each_active_slot(state, active, move_one):
