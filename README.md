@@ -48,5 +48,23 @@ To use, following the steps below:
 python baselines/<training-script> --config_file=<config-file-name>
 ```
 
+### Static arena frames (separate IPPO RNN)
+
+CSV logging also saves one full terrain PNG per logged episode in
+`<run-output>/arenas/arena_<update>_<env>_<episode_id>.png`.
+For `scalars_<update>_<agent>_<env>.csv.gz`, use its `episode_id` column to select
+the image. IDs start over in each logging phase and are scoped by update and env.
+The images contain terrain only: no agents, passive mobs, predators, item overlays
+or lighting effects. Static map tiles (including resource blocks) are retained.
+`SAVE_ARENA_FRAMES: false` disables them; `SAVE_VIDEO` is independent.
+Resolution is map size times `VIDEO_PIXEL_SIZE`, with no crop, padding or labels.
+For overlays, CSV `player_position_x` is the row and `player_position_y` the column;
+pixel centers are `(column + 0.5, row + 0.5) * VIDEO_PIXEL_SIZE`.
+The first logged state of each episode supplies the frame. CSV positions come from
+the post-step state, so `episode_id` advances on the auto-reset row (`done=1`).
+
+A small CPU smoke run with two environments, episode resets and no videos:
+`JAX_PLATFORMS=cpu python baselines/seperate_ippo_rnn.py --config_file test_arena_frame_shot.yaml`
+
 ## License
 Code is licenced under the MIT license provided in the `LICENSE` document.

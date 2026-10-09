@@ -92,6 +92,7 @@ LOGGING_STEPS_PER_CALL: 1024  # Number of env steps per logging_step call
 LOGGING_THREADS: 1            # Number of env threads to log
 
 # Video recording parameters
+SAVE_ARENA_FRAMES: true       # Static terrain PNG per logged episode, independent of SAVE_VIDEO
 SAVE_VIDEO: true             # Whether to record and save videos during logging
 VIDEO_LENGTH: 1000  # Number of env steps per video (rollout continues from current state)
 VIDEO_PIXEL_SIZE: 16  # Pixel size for rendering (7=agent, 16=medium, 64=large)

@@ -1237,12 +1237,52 @@ def make_train(config, env, wandb_start_step=-1):
         def _logging_step(carry, unused, logging_threads, update_step, effective_cap=None):
             runner_state, episode_count = carry
             runner_state = _apply_episode_cap_to_runner_state(runner_state, effective_cap)
+
+            def save_arena_frame(frame, increment, env_index, episode_id):
+                arena_dir = os.path.join(get_run_output_dir(), 'arenas')
+                os.makedirs(arena_dir, exist_ok=True)
+                path = os.path.join(
+                    arena_dir, f'arena_{int(increment)}_{int(env_index)}_{int(episode_id)}.png'
+                )
+                # An episode can span multiple logging chunks; keep its first frame.
+                if not os.path.exists(path):
+                    imageio.imwrite(path, np.asarray(frame))
+
+            def logging_env_step(carry, step_index):
+                state, counts = carry
+                state, transition = _env_step(
+                    state, None, detailed_logging=True, effective_cap=effective_cap
+                )
+                # CSV positions are post-step (already reset on done), so their
+                # episode ID must advance on the reset row itself.
+                counts = counts + transition.info['done'].astype(counts.dtype)
+                transition.info['episode_id'] = counts.astype(jnp.float32)
+                if config.get("SAVE_ARENA_FRAMES", True):
+                    for env_index in range(logging_threads):
+                        def capture_frame(_):
+                            arena_state = jax.tree_util.tree_map(
+                                lambda x: x[env_index], state[1].env_state
+                            )
+                            frame = render_full_map(
+                                arena_state, _video_static_params,
+                                _video_textures[_video_pixel_size], _video_player_textures,
+                                _video_pixel_size, env_name=_video_env_name, terrain_only=True,
+                            )
+                            jax.experimental.io_callback(
+                                save_arena_frame, None, frame.astype(jnp.uint8),
+                                update_step, env_index, counts[0, env_index], ordered=True,
+                            )
+
+                        jax.lax.cond(
+                            (step_index == 0) | transition.global_done[0, env_index],
+                            capture_frame, lambda _: None, operand=None,
+                        )
+                return (state, counts), transition
+
             # Visualization rollouts (with detailed logging for CSV)
-            runner_state, traj_batch = jax.lax.scan(
-                functools.partial(_env_step, detailed_logging=True, effective_cap=effective_cap),
-                runner_state,
-                None,
-                config["LOGGING_STEPS_PER_CALL"],
+            (runner_state, episode_count), traj_batch = jax.lax.scan(
+                logging_env_step, (runner_state, episode_count),
+                jnp.arange(config["LOGGING_STEPS_PER_CALL"]),
             )
 
             # Finally, log data associated with the visualization runs
@@ -1254,19 +1294,6 @@ def make_train(config, env, wandb_start_step=-1):
                 # No reshape needed - it's already in the correct format
             # Null this for memory savings
             traj_batch.info['hidden_state'] = None
-
-            # Compute a pseudo episode_id from cumulative done flags
-            # done shape: (T, num_agents, NUM_ENVS)  (network output field)
-            # episode_count shape: (num_agents, NUM_ENVS) — carried across logging steps
-            # Shift by 1 so the done step itself still belongs to the old episode
-            done_shifted = jnp.concatenate([
-                jnp.zeros((1,) + traj_batch.info['done'].shape[1:]),
-                traj_batch.info['done'][:-1]
-            ], axis=0)
-            local_episode_id = jnp.cumsum(done_shifted, axis=0)  # (T, num_agents, NUM_ENVS)
-            traj_batch.info['episode_id'] = (episode_count[None, :, :] + local_episode_id).astype(jnp.float32)
-            # Update episode_count for next logging step: add total dones in this chunk
-            episode_count = episode_count + traj_batch.info['done'].sum(axis=0).astype(episode_count.dtype)
 
             # Add new logging fields here
             fields_to_log = ['health', 'food', 'drink', 'energy', 'done', 'is_sleeping', 'is_resting',

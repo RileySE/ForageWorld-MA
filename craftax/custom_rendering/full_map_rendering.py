@@ -2,7 +2,15 @@ import jax
 import jax.numpy as jnp
 
 
-def render_full_map(state, static_params, textures, player_specific_textures, block_pixel_size=16, env_name="Craftax-Coop-Symbolic"):
+def render_full_map(state, static_params, textures, player_specific_textures, block_pixel_size=16, env_name="Craftax-Coop-Symbolic", terrain_only=False):
+    """Render the full level; terrain_only omits entities, items and lighting."""
+    if terrain_only:
+        terrain = state.map[state.player_level]
+        tiles = textures["block_textures"][terrain]
+        return tiles.transpose(0, 2, 1, 3, 4).reshape(
+            terrain.shape[0] * block_pixel_size, terrain.shape[1] * block_pixel_size, 3
+        )
+
     if "Coop" in env_name:
         from craftax.craftax_coop.constants import (
             BlockType, ItemType, MONSTERS_KILLED_TO_CLEAR_LEVEL
