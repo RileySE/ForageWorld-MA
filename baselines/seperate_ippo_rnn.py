@@ -1745,6 +1745,8 @@ def build_env(config):
     forager_passive_food_gain = int(config.get("FORAGER_PASSIVE_FOOD_GAIN", 3))
     forager_food_capacity = int(config.get("FORAGER_FOOD_CAPACITY", 27))
     forager_predator_damage_multiplier = float(config.get("FORAGER_PREDATOR_DAMAGE_MULTIPLIER", 1.0))
+    melee_mob_health_override = float(config.get("MELEE_MOB_HEALTH", 0.0))  # 0 = per-mob-type default
+    melee_mob_damage_override = float(config.get("MELEE_MOB_DAMAGE", 0.0))  # 0 = per-mob-type default
     forager_to_warrior_food_trade_reward = config.get("FORAGER_TO_WARRIOR_FOOD_TRADE_REWARD", 0.0)
     forager_to_warrior_drink_trade_reward = config.get("FORAGER_TO_WARRIOR_DRINK_TRADE_REWARD", 0.0)
     warrior_to_warrior_food_trade_reward = config.get("WARRIOR_TO_WARRIOR_FOOD_TRADE_REWARD", 0.0)
@@ -1801,6 +1803,10 @@ def build_env(config):
             "FORAGER_PREDATOR_DAMAGE_MULTIPLIER must be >= 0, "
             f"got {forager_predator_damage_multiplier}."
         )
+    if melee_mob_health_override < 0:
+        raise ValueError(f"MELEE_MOB_HEALTH must be >= 0 (0 = default), got {melee_mob_health_override}.")
+    if melee_mob_damage_override < 0:
+        raise ValueError(f"MELEE_MOB_DAMAGE must be >= 0 (0 = default), got {melee_mob_damage_override}.")
     if max_melee_mobs < 0:
         raise ValueError(f"MAX_MELEE_MOBS must be >= 0, got {max_melee_mobs}.")
     if max_passive_mobs < 1:
@@ -1834,6 +1840,8 @@ def build_env(config):
         "forager_passive_food_gain": forager_passive_food_gain,
         "forager_food_capacity": forager_food_capacity,
         "forager_predator_damage_multiplier": forager_predator_damage_multiplier,
+        "melee_mob_health_override": melee_mob_health_override,
+        "melee_mob_damage_override": melee_mob_damage_override,
         "forager_to_warrior_food_trade_reward": forager_to_warrior_food_trade_reward,
         "forager_to_warrior_drink_trade_reward": forager_to_warrior_drink_trade_reward,
         "warrior_to_warrior_food_trade_reward": warrior_to_warrior_food_trade_reward,

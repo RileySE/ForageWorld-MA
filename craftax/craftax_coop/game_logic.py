@@ -1711,6 +1711,12 @@ def _move_melee_mobs_with_keys(move_keys, axis_keys, chase_keys, state, params, 
     earlier_attacks = jnp.cumsum(is_attacking_player, axis=0) - is_attacking_player
     is_sleeping = jnp.logical_and(state.is_sleeping[None, :], earlier_attacks == 0)
     melee_mob_base_damage = MOB_TYPE_DAMAGE_MAPPING[mobs.type_id[level], MobType.MELEE.value]
+    # MELEE_MOB_DAMAGE override: replace the physical damage and zero the elemental parts.
+    melee_mob_base_damage = jnp.where(
+        params.melee_mob_damage_override > 0,
+        jnp.zeros_like(melee_mob_base_damage).at[:, 0].set(params.melee_mob_damage_override),
+        melee_mob_base_damage,
+    )
     melee_mob_damage = jax.vmap(
         lambda base_damage, sleeping: get_damage_done_to_player(
             state, static_params, base_damage * (1 + 2.5 * sleeping[:, None])
@@ -2886,7 +2892,11 @@ def spawn_mobs(state, rng, params, static_params):
 
     new_melee_mob_health = jax.lax.select(
         can_spawn_melee_mob,
-        MOB_TYPE_HEALTH_MAPPING[new_melee_mob_type, MobType.MELEE.value],
+        jnp.where(  # MELEE_MOB_HEALTH override
+            params.melee_mob_health_override > 0,
+            params.melee_mob_health_override,
+            MOB_TYPE_HEALTH_MAPPING[new_melee_mob_type, MobType.MELEE.value],
+        ).astype(state.melee_mobs.health.dtype),
         state.melee_mobs.health[state.level_index, new_melee_mob_index],
     )
 

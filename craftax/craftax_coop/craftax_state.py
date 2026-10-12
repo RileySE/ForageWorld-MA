@@ -223,6 +223,8 @@ class EnvParams:
     forager_passive_food_gain: int = 3  # Food a forager gains when eating a killed passive mob.
     forager_food_capacity: int = 27  # Maximum food capacity for foragers.
     forager_predator_damage_multiplier: float = 1.0  # Multiplier for forager damage against melee/ranged mobs.
+    melee_mob_health_override: float = 0.0  # >0 sets the HP of every melee predator (spawned and t=0); 0 keeps MOB_TYPE_HEALTH_MAPPING.
+    melee_mob_damage_override: float = 0.0  # >0 sets melee predators' physical damage per hit (elemental parts zeroed); 0 keeps MOB_TYPE_DAMAGE_MAPPING.
     forager_to_warrior_food_trade_reward: float = 0.0  # Bonus given to foragers for successfully feeding a warrior.
     forager_to_warrior_drink_trade_reward: float = 0.0  # Bonus given to foragers for successfully hydrating a warrior.
     warrior_to_warrior_drink_trade_reward: float = 0.0 #Bonus given to warriors for successfully hydrating another warrior

@@ -965,6 +965,9 @@ def generate_world(rng, params, static_params):
     # this t=0 seeding to the room where the warrior actually starts.
     melee_type_id = FLOOR_MOB_MAPPING[START_LEVEL, MobType.MELEE.value]
     melee_health = MOB_TYPE_HEALTH_MAPPING[melee_type_id, MobType.MELEE.value]
+    melee_health = jnp.where(  # MELEE_MOB_HEALTH override
+        params.melee_mob_health_override > 0, params.melee_mob_health_override, melee_health
+    ).astype(melee_health.dtype)
     melee_spawn_offsets = jnp.array(
         [
             [0, 1],
