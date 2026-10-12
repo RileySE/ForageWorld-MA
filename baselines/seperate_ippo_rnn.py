@@ -1010,8 +1010,11 @@ def make_train(config, env, wandb_start_step=-1):
             _sps_state = {'last_time':None, 'last_env_step': None}
 
             def callback(metrics, step):
+                # Python int: update_steps arrives as an int32 array, and the product
+                # overflows int32 once it passes 2**31 env steps (update 65536 in the
+                # canonical config).
                 env_step = (
-                    metrics["update_steps"]
+                    int(metrics["update_steps"])
                     * config["NUM_ENVS"]
                     * config["NUM_STEPS"]
                 )
