@@ -44,7 +44,7 @@ MAX_BLOCKS_THIS_RUN: 0
 
 Launch the run; if it stops, launch the same config again. `RESUME: "auto"` resumes from the latest checkpoint (you'll see a `[resume] ...` line at startup). To restart from scratch instead, set `RESUME: false` or point `CHECKPOINT_DIR` at an empty directory.
 
-If you resume with a config that changed the model size, number of agents, or environment dimensions, the run stops with a clear error instead of loading a mismatched checkpoint — start a fresh run in that case.
+If you resume with a config that changed the model size, number of agents, environment dimensions, or pruning settings (`SPARSE_ALG`, `SPARSITY`, `PRUNE_STEP`), the run stops with a clear error instead of loading a mismatched checkpoint — start a fresh run in that case.
 
 ## Wall-time-limited jobs (SLURM)
 

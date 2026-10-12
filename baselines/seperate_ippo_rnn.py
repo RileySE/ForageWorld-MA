@@ -50,6 +50,7 @@ from craftax.custom_rendering.ego_rendering import render_ego_perspective
 from craftax.custom_rendering.full_map_rendering import render_full_map
 
 import checkpoint_utils as ckpt
+import pruning_utils as pruning
 
 # ===========================
 # Model Definitions
@@ -236,6 +237,8 @@ def make_train(config, env, wandb_start_step=-1):
     # Note: In separate IPPO, minibatching is done over NUM_ENVS per agent
     # Each minibatch has shape (num_steps, num_agents, num_envs // NUM_MINIBATCHES, ...)
     config["MINIBATCH_SIZE"] = config["NUM_ENVS"] // config["NUM_MINIBATCHES"]
+    pruning.validate_config(config)
+    _prune = pruning.pruning_enabled(config)
 
     # Load rendering resources BEFORE wrapping (need base env's static_env_params)
     _video_env_name = config.get("ENV_NAME", "Craftax-Coop-Symbolic")
@@ -405,6 +408,11 @@ def make_train(config, env, wandb_start_step=-1):
             tx = optax.chain(
                 per_agent_clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(config["LR"], eps=1e-5),
+            )
+        if _prune:
+            # Each agent's network is pruned independently, all at the same step, once.
+            tx = pruning.wrap_optax_per_agent(
+                tx, pruning.make_updater(config), env.num_agents, pruning.prune_count(config), config["SEED"]
             )
         train_state = TrainState.create(
             apply_fn=network.apply,
@@ -825,6 +833,10 @@ def make_train(config, env, wandb_start_step=-1):
                         train_state.params, init_hstate, train_batch, advantages, targets
                     )
                     train_state = train_state.apply_gradients(grads=grads)
+                    if _prune:
+                        train_state = train_state.replace(
+                            params=pruning.apply_masks(train_state.params, train_state.opt_state.masks)
+                        )
                     return train_state, total_loss
 
                 (
@@ -974,6 +986,8 @@ def make_train(config, env, wandb_start_step=-1):
                     "aux_loss": aux_loss_per_agent,          # (num_agents,)
                 },
             }
+            if _prune:
+                metric["sparsity_per_agent"] = pruning.mask_sparsity(train_state.opt_state.masks)  # (num_agents,)
 
             rng = update_state[-1]
 
@@ -1031,6 +1045,13 @@ def make_train(config, env, wandb_start_step=-1):
                 for i in range(num_agents):
                     for k in ["total_loss", "value_loss", "actor_loss", "entropy", "aux_loss"]:
                         to_log[f"agent_{i}/{k}"] = np.asarray(metrics["loss_per_agent"][k][i]).item()
+
+                # ── Pruning: fraction of each agent's prunable weights that are pruned ──
+                if "sparsity_per_agent" in metrics:
+                    sparsity_per_agent = np.asarray(metrics["sparsity_per_agent"])
+                    for i in range(num_agents):
+                        to_log[f"agent_{i}/sparsity"] = sparsity_per_agent[i].item()
+                    to_log["overview/sparsity"] = sparsity_per_agent.mean().item()
 
                 # ── Episode-level metrics (only when episodes returned) ──
                 if metrics["returned_episode"].any():
@@ -1235,7 +1256,7 @@ def make_train(config, env, wandb_start_step=-1):
         # Do one "step" of logging, writing the result to a file.
         # Several steps can be run in series using --logging_steps_per_viz to do long rollouts without hitting memory limits
         def _logging_step(carry, unused, logging_threads, update_step, effective_cap=None):
-            runner_state, episode_count = carry
+            runner_state, episode_count, ep_time_last, episode_id_last = carry
             runner_state = _apply_episode_cap_to_runner_state(runner_state, effective_cap)
             # Visualization rollouts (with detailed logging for CSV)
             runner_state, traj_batch = jax.lax.scan(
@@ -1265,6 +1286,29 @@ def make_train(config, env, wandb_start_step=-1):
             ], axis=0)
             local_episode_id = jnp.cumsum(done_shifted, axis=0)  # (T, num_agents, NUM_ENVS)
             traj_batch.info['episode_id'] = (episode_count[None, :, :] + local_episode_id).astype(jnp.float32)
+
+            # ep_time: steps since the current episode started, one value per row.
+            # Rows of the episode already running when this logging window opened
+            # (episode_id == 0) get -1, because its true start is unknown. Otherwise
+            # it is 0 on an episode's first row (the row after the previous episode's
+            # done row, same boundary as episode_id) and counts up by 1 per row.
+            # ep_time_last / episode_id_last hold the previous chunk's last row so the
+            # count continues across logging steps.
+            episode_id_int = (episode_count[None, :, :] + local_episode_id).astype(jnp.int32)  # (T, num_agents, NUM_ENVS)
+            prev_episode_id = jnp.concatenate([episode_id_last[None, :, :], episode_id_int[:-1]], axis=0)
+            episode_start = episode_id_int != prev_episode_id  # True on each episode's first row
+            row_idx = jnp.arange(episode_id_int.shape[0], dtype=jnp.int32)[:, None, None]
+            last_start_row = jax.lax.cummax(jnp.where(episode_start, row_idx, -1), axis=0)
+            ep_time = jnp.where(
+                last_start_row >= 0,
+                row_idx - last_start_row,                 # episode started inside this chunk
+                ep_time_last[None, :, :] + 1 + row_idx,   # episode continues from the previous chunk
+            )
+            ep_time = jnp.where(episode_id_int == 0, -1, ep_time)
+            traj_batch.info['ep_time'] = ep_time.astype(jnp.float32)
+            ep_time_last = ep_time[-1]
+            episode_id_last = episode_id_int[-1]
+
             # Update episode_count for next logging step: add total dones in this chunk
             episode_count = episode_count + traj_batch.info['done'].sum(axis=0).astype(episode_count.dtype)
 
@@ -1284,7 +1328,7 @@ def make_train(config, env, wandb_start_step=-1):
                                   if _use_teammate_aux else []) + [
                              'num_monsters_killed',
                              'has_sword', 'has_pick', 'bow', 'arrows', 'held_iron', 'value',
-                             'entropy', 'log_prob', 'episode_id',
+                             'entropy', 'log_prob', 'episode_id', 'ep_time',
                             ]
 
             # Callback function for logging hidden states
@@ -1306,7 +1350,7 @@ def make_train(config, env, wandb_start_step=-1):
                                            if _use_teammate_aux else []) + [
                                       'num_monsters_killed',
                                       'has_sword',
-                                      'has_pick', 'bow', 'arrows', 'held_iron', 'value', 'entropy', 'log_prob', 'episode_id',
+                                      'has_pick', 'bow', 'arrows', 'held_iron', 'value', 'entropy', 'log_prob', 'episode_id', 'ep_time',
                                         ]
 
                 run_out_path = get_run_output_dir()
@@ -1333,7 +1377,7 @@ def make_train(config, env, wandb_start_step=-1):
             # In seperate_ippo_rnn:
             # - Network outputs (action, done, value, entropy, log_prob) have shape (T, num_agents, NUM_ENVS)
             # - Environment fields (health, food, etc.) have shape (T, NUM_ENVS, num_agents)
-            network_output_fields = {'value', 'entropy', 'log_prob', 'done', 'action', 'episode_id',
+            network_output_fields = {'value', 'entropy', 'log_prob', 'done', 'action', 'episode_id', 'ep_time',
                                      'delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y'} | (
                                      {f'{k}_{j}' for j in range(_agents_per_team)
                                       for k in ('delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y')}
@@ -1375,7 +1419,7 @@ def make_train(config, env, wandb_start_step=-1):
                     write_rnn_hstate, None, agent_hidden_states, log_array, update_step, agent_n, ordered=True
                 )
 
-            return (runner_state, episode_count), None
+            return (runner_state, episode_count, ep_time_last, episode_id_last), None
 
             # Func to interleave update steps and plotting
 
@@ -1477,14 +1521,18 @@ def make_train(config, env, wandb_start_step=-1):
             state = _apply_episode_cap_to_runner_state(state, effective_cap)
             # episode_count tracks cumulative episode IDs across logging steps: (num_agents, NUM_ENVS)
             episode_count = jnp.zeros((env.num_agents, config["NUM_ENVS"]), dtype=jnp.int32)
-            (state, episode_count), empty = jax.lax.scan(
+            # ep_time / episode_id of the last logged row, carried across logging steps.
+            # Starting at -1 / 0 marks the window's first episode as having an unknown start.
+            ep_time_last = jnp.full((env.num_agents, config["NUM_ENVS"]), -1, dtype=jnp.int32)
+            episode_id_last = jnp.zeros((env.num_agents, config["NUM_ENVS"]), dtype=jnp.int32)
+            (state, episode_count, ep_time_last, episode_id_last), empty = jax.lax.scan(
                 functools.partial(
                     _logging_step,
                     logging_threads=config["LOGGING_THREADS"],
                     update_step=update_steps,
                     effective_cap=effective_cap,
                 ),
-                (state, episode_count), None,
+                (state, episode_count, ep_time_last, episode_id_last), None,
                 config["LOGGING_NUM_CALLS"],
             )
 
@@ -1852,6 +1900,7 @@ def single_run(config):
                     "update_steps": 0,
                     "logging_updates_interval": config["LOGGING_UPDATES_INTERVAL"],
                     "num_updates": config["NUM_UPDATES"],
+                    "pruning": pruning.pruning_settings(config),
                     "final": False,
                 },
             )
