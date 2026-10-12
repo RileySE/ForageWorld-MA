@@ -5,6 +5,25 @@ import jax.numpy as jnp
 # With the additional constraint that the functions make no reference (i.e. don't import from) any Craftax code
 
 
+def random_choice(key, a, p, shape=()):
+    """Same result as jax.random.choice(key, a, shape, replace=True, p=p), without its search loop.
+
+    jax.random.choice draws via jnp.searchsorted, whose default method is a binary search of
+    ceil(log2(len(a) + 1)) sequential loop steps; inside the per-mob scans and world generation
+    those loops dominated the run time. This repeats jax's arithmetic but searches with
+    method="compare_all" (one vectorized comparison using the same comparator), so it returns the
+    same element for the same key. As in jax.random.choice, an integer `a` means arange(a).
+    """
+    a = jnp.asarray(a)
+    p = jnp.asarray(p)
+    if not jnp.issubdtype(p.dtype, jnp.inexact):
+        p = p.astype(jnp.result_type(float))
+    p_cuml = jnp.cumsum(p)
+    r = p_cuml[-1] * (1 - jax.random.uniform(key, shape, dtype=p_cuml.dtype))
+    index = jnp.searchsorted(p_cuml, r, method="compare_all").astype(int)
+    return index if a.ndim == 0 else jnp.take(a, index, axis=0)
+
+
 def get_distance_map(position, map_size):
     dist_x = jnp.abs(jnp.arange(0, map_size[0]) - position[0])
     dist_x = jnp.expand_dims(dist_x, axis=1)

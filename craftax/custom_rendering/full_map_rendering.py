@@ -15,7 +15,7 @@ def render_full_map(state, static_params, textures, player_specific_textures, bl
         from craftax.craftax_ma.util.game_logic_utils import is_boss_vulnerable
     
     # Get the full map for current floor (no viewport slicing)
-    map_full = state.map[state.player_level]  # Shape: (48, 48)
+    map_full = state.map[state.level_index]  # Shape: (48, 48)
     map_size = map_full.shape
     
     # Boss block handling
@@ -79,11 +79,11 @@ def render_full_map(state, static_params, textures, player_specific_textures, bl
     )
     
     # Add items
-    item_map_full = state.item_map[state.player_level]
+    item_map_full = state.item_map[state.level_index]
     
     # Insert blocked/open ladders
     is_ladder_down_open = (
-        state.monsters_killed[state.player_level] >= MONSTERS_KILLED_TO_CLEAR_LEVEL
+        state.monsters_killed[state.level_index] >= MONSTERS_KILLED_TO_CLEAR_LEVEL
     )
     ladder_down_item = jax.lax.select(
         is_ladder_down_open,
@@ -197,11 +197,11 @@ def render_full_map(state, static_params, textures, player_specific_textures, bl
     # Render mobs (melee, ranged, passive)
     def _add_mob_to_pixels(carry, mob_index):
         pixels, mobs, texture_name, alpha_texture_name = carry
-        position = mobs.position[state.player_level, mob_index]
-        is_on_map = mobs.mask[state.player_level, mob_index]
+        position = mobs.position[state.level_index, mob_index]
+        is_on_map = mobs.mask[state.level_index, mob_index]
         
-        mob_texture = texture_name[mobs.type_id[state.player_level, mob_index]]
-        mob_texture_alpha = alpha_texture_name[mobs.type_id[state.player_level, mob_index]]
+        mob_texture = texture_name[mobs.type_id[state.level_index, mob_index]]
+        mob_texture_alpha = alpha_texture_name[mobs.type_id[state.level_index, mob_index]]
         
         # Only render if mob is active
         background = _slice_pixel_map(pixels, position)
@@ -259,7 +259,7 @@ def render_full_map(state, static_params, textures, player_specific_textures, bl
         )
     
     # Apply lighting (underground darkness)
-    light_map = state.light_map[state.player_level]
+    light_map = state.light_map[state.level_index]
     light_map_pixels = light_map.repeat(block_pixel_size, axis=0).repeat(
         block_pixel_size, axis=1
     )

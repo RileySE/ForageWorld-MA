@@ -18,7 +18,7 @@ def render_craftax_pixels(state, block_pixel_size, static_params, player_specifi
 
     # RENDER MAP
     # Get view of map
-    map = state.map[state.player_level]
+    map = state.map[state.level_index]
     padded_grid = jnp.pad(
         map,
         (MAX_OBS_DIM + 2, MAX_OBS_DIM + 2),
@@ -108,7 +108,7 @@ def render_craftax_pixels(state, block_pixel_size, static_params, player_specifi
 
     # Items
     padded_item_map = jnp.pad(
-        state.item_map[state.player_level],
+        state.item_map[state.level_index],
         (MAX_OBS_DIM + 2, MAX_OBS_DIM + 2),
         constant_values=ItemType.NONE.value,
     )
@@ -119,7 +119,7 @@ def render_craftax_pixels(state, block_pixel_size, static_params, player_specifi
 
     # Insert blocked ladders
     is_ladder_down_open = (
-        state.monsters_killed[state.player_level] >= MONSTERS_KILLED_TO_CLEAR_LEVEL
+        state.monsters_killed[state.level_index] >= MONSTERS_KILLED_TO_CLEAR_LEVEL
     )
     ladder_down_item = jax.lax.select(
         is_ladder_down_open,
@@ -233,18 +233,18 @@ def render_craftax_pixels(state, block_pixel_size, static_params, player_specifi
     def _add_mob_to_pixels(carry, mob_index):
         pixels, mobs, texture_name, alpha_texture_name = carry
         local_position = (
-            mobs.position[state.player_level, mob_index]
+            mobs.position[state.level_index, mob_index]
             - state.player_position
             + jnp.ones((2,), dtype=jnp.int32) * (obs_dim_array // 2)
         )
         on_screen = jnp.logical_and(
             local_position >= 0, local_position < obs_dim_array
         ).all(axis=-1)
-        on_screen *= mobs.mask[state.player_level, mob_index]
+        on_screen *= mobs.mask[state.level_index, mob_index]
 
-        mob_texture = texture_name[mobs.type_id[state.player_level, mob_index]]
+        mob_texture = texture_name[mobs.type_id[state.level_index, mob_index]]
         mob_texture_alpha = alpha_texture_name[
-            mobs.type_id[state.player_level, mob_index]
+            mobs.type_id[state.level_index, mob_index]
         ]
 
         mob_texture = jax.vmap(jnp.multiply, in_axes=(None, 0))(mob_texture, on_screen)
@@ -306,27 +306,27 @@ def render_craftax_pixels(state, block_pixel_size, static_params, player_specifi
     def _add_projectile_to_pixels(carry, projectile_index):
         pixels, projectiles, projectile_directions = carry
         local_position = (
-            projectiles.position[state.player_level, projectile_index]
+            projectiles.position[state.level_index, projectile_index]
             - state.player_position
             + jnp.ones((2,), dtype=jnp.int32) * (obs_dim_array // 2)
         )
         on_screen = jnp.logical_and(
             local_position >= 0, local_position < obs_dim_array
         ).all(axis=-1)
-        on_screen *= projectiles.mask[state.player_level, projectile_index]
+        on_screen *= projectiles.mask[state.level_index, projectile_index]
 
         projectile_texture = textures["projectile_textures"][
-            projectiles.type_id[state.player_level, projectile_index]
+            projectiles.type_id[state.level_index, projectile_index]
         ]
         projectile_texture_alpha = textures["projectile_texture_alphas"][
-            projectiles.type_id[state.player_level, projectile_index]
+            projectiles.type_id[state.level_index, projectile_index]
         ]
 
         flipped_projectile_texture = jnp.flip(projectile_texture, axis=0)
         flipped_projectile_texture_alpha = jnp.flip(projectile_texture_alpha, axis=0)
         flip_projectile = jnp.logical_or(
-            projectile_directions[state.player_level, projectile_index, 0] > 0,
-            projectile_directions[state.player_level, projectile_index, 1] > 0,
+            projectile_directions[state.level_index, projectile_index, 0] > 0,
+            projectile_directions[state.level_index, projectile_index, 1] > 0,
         )
 
         projectile_texture = jax.lax.select(
@@ -346,12 +346,12 @@ def render_craftax_pixels(state, block_pixel_size, static_params, player_specifi
         )
 
         projectile_texture = jax.lax.select(
-            projectile_directions[state.player_level, projectile_index, 1] != 0,
+            projectile_directions[state.level_index, projectile_index, 1] != 0,
             transposed_projectile_texture,
             projectile_texture,
         )
         projectile_texture_alpha = jax.lax.select(
-            projectile_directions[state.player_level, projectile_index, 1] != 0,
+            projectile_directions[state.level_index, projectile_index, 1] != 0,
             transposed_projectile_texture_alpha,
             projectile_texture_alpha,
         )
@@ -394,7 +394,7 @@ def render_craftax_pixels(state, block_pixel_size, static_params, player_specifi
         )
 
     # Apply darkness (underground)
-    light_map = state.light_map[state.player_level]
+    light_map = state.light_map[state.level_index]
     padded_light_map = jnp.pad(
         light_map,
         (MAX_OBS_DIM + 2, MAX_OBS_DIM + 2),

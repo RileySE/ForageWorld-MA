@@ -41,6 +41,13 @@ class Mobs:
 #     lifetimes: jnp.ndarray
 
 
+# Floor changes are disabled and every episode is played on one level (player_level, the logical
+# level number used by the game rules and the observation). The per-level arrays (map, item_map,
+# mob_map, light_map, ladders, chests_opened, monsters_killed, mobs and projectiles) store only that
+# level, at this index of their leading axis.
+LEVEL_INDEX = 0
+
+
 @struct.dataclass
 class EnvState:
     map: jnp.ndarray
@@ -166,6 +173,11 @@ class EnvState:
     effective_max_timesteps: float = 100000.0
 
     fractal_noise_angles: tuple[int, int, int, int] = (None, None, None, None)
+
+    @property
+    def level_index(self):
+        """Index of the played level in the per-level arrays (see LEVEL_INDEX)."""
+        return LEVEL_INDEX
 
 
 @struct.dataclass

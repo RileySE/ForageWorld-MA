@@ -22,7 +22,7 @@ import functools
 import gzip
 import io
 import yaml
-from typing import Sequence, NamedTuple, Dict
+from typing import Callable, Sequence, NamedTuple, Dict
 
 import jax
 if not hasattr(jax, 'tree_map'):
@@ -41,10 +41,9 @@ import wandb
 
 import imageio
 
-from jaxmarl.wrappers.baselines import LogWrapper
 from craftax.craftax_env import make_craftax_env_from_name
 from craftax.craftax_coop.constants import reduced_action_ids
-from craftax.environment_base.wrappers import VideoPlotWrapper
+from craftax.environment_base.wrappers import SelectiveResetVecEnvWrapper, add_logging_fields
 from craftax.custom_rendering.base_rendering import load_rendering_resources
 from craftax.custom_rendering.ego_rendering import render_ego_perspective
 from craftax.custom_rendering.full_map_rendering import render_full_map
@@ -55,30 +54,79 @@ import pruning_utils as pruning
 # ===========================
 # Model Definitions
 # ===========================
+class _DenseParams(nn.Module):
+    """The parameters nn.Dense would create (same names, order, shapes and initializers)."""
+    in_features: int
+    features: int
+    kernel_init: Callable
+    use_bias: bool = True
+
+    @nn.compact
+    def __call__(self):
+        kernel = self.param("kernel", self.kernel_init, (self.in_features, self.features), jnp.float32)
+        if not self.use_bias:
+            return kernel, None
+        return kernel, self.param("bias", nn.initializers.zeros_init(), (self.features,), jnp.float32)
+
+
+class _GRUCellParams(nn.Module):
+    """The parameters of nn.GRUCell (same names and initial values), for ScannedRNN to apply."""
+    in_features: int
+    hidden_features: int
+
+    @nn.compact
+    def __call__(self):
+        input_dense = functools.partial(
+            _DenseParams, self.in_features, self.hidden_features, nn.initializers.lecun_normal()
+        )
+        hidden_dense = functools.partial(
+            _DenseParams, self.hidden_features, self.hidden_features, nn.initializers.orthogonal()
+        )
+        return {
+            "ir": input_dense(name="ir")(),
+            "iz": input_dense(name="iz")(),
+            "in": input_dense(name="in")(),
+            "hr": hidden_dense(use_bias=False, name="hr")(),
+            "hz": hidden_dense(use_bias=False, name="hz")(),
+            "hn": hidden_dense(name="hn")(),
+        }
+
+
 class ScannedRNN(nn.Module):
-    @functools.partial(
-        nn.scan,
-        variable_broadcast="params",
-        in_axes=0,
-        out_axes=0,
-        split_rngs={"params": False},
-    )
+    """nn.GRUCell run over a sequence, computed faster.
+
+    The input projections of all time steps are one matmul before the time loop, the three recurrent
+    projections are one matmul per step, and the loop is unrolled. Parameters (names and initial
+    values) are those of the nn.GRUCell this replaced; results differ only in float rounding.
+    """
+
     @nn.compact
     def __call__(self, carry, x):
-        rnn_state = carry
-        ins, resets = x
-        rnn_state = jnp.where(
-            resets[:, np.newaxis],
-            self.initialize_carry(*rnn_state.shape),
-            rnn_state,
-        )
-        new_rnn_state, y = nn.GRUCell(features=ins.shape[1])(rnn_state, ins)
-        return new_rnn_state, y
+        ins, resets = x  # (time, batch, features), (time, batch)
+        hidden = carry.shape[-1]
+        # Named like the nn.GRUCell this replaced, so the parameters are unchanged.
+        w = _GRUCellParams(ins.shape[-1], hidden, name="GRUCell_1")()
+        input_kernel = jnp.concatenate([w["ir"][0], w["iz"][0], w["in"][0]], axis=1)
+        input_bias = jnp.concatenate([w["ir"][1], w["iz"][1], w["in"][1]])
+        hidden_kernel = jnp.concatenate([w["hr"][0], w["hz"][0], w["hn"][0]], axis=1)
+        hidden_n_bias = w["hn"][1]
+        input_proj = ins @ input_kernel + input_bias
+
+        def step(h, inputs):
+            input_proj_t, reset = inputs
+            h = jnp.where(reset[:, np.newaxis], jnp.zeros_like(h), h)
+            hidden_proj = h @ hidden_kernel
+            r = nn.sigmoid(input_proj_t[:, :hidden] + hidden_proj[:, :hidden])
+            z = nn.sigmoid(input_proj_t[:, hidden:2 * hidden] + hidden_proj[:, hidden:2 * hidden])
+            n = jnp.tanh(input_proj_t[:, 2 * hidden:] + r * (hidden_proj[:, 2 * hidden:] + hidden_n_bias))
+            h = (1.0 - z) * n + z * h
+            return h, h
+
+        return jax.lax.scan(step, carry, (input_proj, resets), unroll=8)
 
     @staticmethod
     def initialize_carry(batch_size, hidden_size):
-        cell = nn.GRUCell(features=hidden_size)
-        return cell.initialize_carry(jax.random.PRNGKey(0), (batch_size, hidden_size))
+        return jnp.zeros((batch_size, hidden_size), dtype=jnp.float32)
 
 
 class ActorCriticRNN(nn.Module):
@@ -218,6 +266,15 @@ def make_train(config, env, wandb_start_step=-1):
             f"Got NUM_ENVS={config['NUM_ENVS']}, NUM_MINIBATCHES={config['NUM_MINIBATCHES']}."
         )
 
+    # Envs whose episode ended take start states from a pool generated in batches of this size
+    # (see SelectiveResetVecEnvWrapper.step_with_reset_pool); 0 generates each one from the env's
+    # own reset key instead.
+    reset_pool_size = int(config.get("RESET_POOL_SIZE", config["NUM_ENVS"]))
+    if reset_pool_size != 0 and reset_pool_size < config["NUM_ENVS"]:
+        raise ValueError(
+            f"RESET_POOL_SIZE must be 0 or >= NUM_ENVS, got {reset_pool_size} (NUM_ENVS={config['NUM_ENVS']})."
+        )
+
     logging_threads = int(config.get("LOGGING_THREADS", 1))
     if logging_threads <= 0:
         raise ValueError(f"LOGGING_THREADS must be >= 1, got {logging_threads}.")
@@ -268,13 +325,12 @@ def make_train(config, env, wandb_start_step=-1):
         print(f"Run artifacts will be written to: {run_output_dir}")
         return run_output_dir
 
-    # Two env references to avoid VideoPlotWrapper overhead during training:
-    # env_train: LogWrapper only — used for training steps (no mob distance calculations)
-    # env_log:   LogWrapper + VideoPlotWrapper — used for CSV logging steps (adds health, food, mob distances etc.)
-    # Both share the same state structure (VideoPlotWrapper is a pass-through for state).
-    env_train = LogWrapper(env)
-    env_log = VideoPlotWrapper(env_train, os.path.join(get_run_output_dir(), 'debug_output'), 256, False)
-    env = env_log  # default reference for property access (agents, num_agents, action_space, etc.)
+    # vec_env steps all NUM_ENVS envs at once and only regenerates worlds for envs whose episode
+    # ended (bit-identical to vmapping jaxmarl's LogWrapper.step, which regenerates every env's
+    # world every step). Logging iterations add the extra CSV fields with add_logging_fields.
+    vec_env = SelectiveResetVecEnvWrapper(env)
+    env = vec_env  # default reference for property access (agents, num_agents, action_space, etc.)
+    get_run_output_dir()  # pick (and print) the run output directory at startup
 
     # Auxiliary loss configuration
     _n = env.num_agents
@@ -423,7 +479,12 @@ def make_train(config, env, wandb_start_step=-1):
         # INIT ENV
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env_train.reset, in_axes=(0,))(reset_rng)
+        obsv, env_state = vec_env.reset(reset_rng)
+        reset_pool = (
+            vec_env.init_reset_pool(jax.random.fold_in(_rng, 1), reset_pool_size)
+            if reset_pool_size > 0
+            else None
+        )
         # Hidden state shape: (num_agents, num_envs, hidden_dim)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
         init_hstate = jnp.tile(init_hstate[np.newaxis, :, :], (env.num_agents, 1, 1))
@@ -452,7 +513,7 @@ def make_train(config, env, wandb_start_step=-1):
         # eliminate the dead code path entirely.
 
         def _env_step(runner_state, unused, detailed_logging=False, effective_cap=None):
-            train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+            train_state, env_state, last_obs, last_done, hstate, rng, reset_pool = runner_state
 
             # SELECT ACTION
             rng, _rng = jax.random.split(rng)
@@ -494,19 +555,20 @@ def make_train(config, env, wandb_start_step=-1):
             value = value.squeeze(axis=1)        # (num_agents, num_envs)
 
             env_action = policy_action_to_env_action(action)
-            env_act = unbatchify(env_action, env.agents)
-            env_act = {k: v.squeeze() for k, v in env_act.items()}
+            env_act = unbatchify(env_action, env.agents)  # {agent: (num_envs,)}
 
             # STEP ENV
-            # Use env_log (with VideoPlotWrapper) only during logging to get CSV fields
-            # (health, food, mob distances, etc.). During training, use env_train
-            # (LogWrapper only) to skip expensive mob distance calculations.
             rng, _rng = jax.random.split(rng)
-            rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-            step_fn = env_log.step if detailed_logging else env_train.step
-            obsv, env_state, reward, done, info = jax.vmap(
-                step_fn, in_axes=(0, 0, 0)
-            )(rng_step, env_state, env_act)
+            rng_step = jax.random.split(_rng, hstate.shape[1])
+            if reset_pool is None:
+                obsv, env_state, reward, done, info = vec_env.step(rng_step, env_state, env_act)
+            else:
+                obsv, env_state, reward, done, info, reset_pool = vec_env.step_with_reset_pool(
+                    rng_step, env_state, env_act, reset_pool
+                )
+            # CSV fields (health, food, mob distances, etc.) are only needed during logging.
+            if detailed_logging:
+                info = jax.vmap(add_logging_fields)(info, env_state.env_state)
 
             # Re-apply the episode cap: env.step may have reset an episode and
             # restored effective_max_timesteps to the default.
@@ -587,7 +649,7 @@ def make_train(config, env, wandb_start_step=-1):
                     info['pred_delta_y'] = aux_pred_squeezed[:, :, 1] # (num_agents, num_envs)
 
             # Keep done as dict for next iteration (env returns dict)
-            runner_state = (train_state, env_state, obsv, done, hstate, rng)
+            runner_state = (train_state, env_state, obsv, done, hstate, rng, reset_pool)
             return runner_state, transition
 
         _early_episode_cap = config.get("EARLY_EPISODE_CAP", 0)
@@ -628,9 +690,9 @@ def make_train(config, env, wandb_start_step=-1):
         def _apply_episode_cap_to_runner_state(runner_state, effective_cap):
             if effective_cap is None:
                 return runner_state
-            train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+            train_state, env_state, last_obs, last_done, hstate, rng, reset_pool = runner_state
             env_state = _patch_episode_cap(env_state, effective_cap)
-            return (train_state, env_state, last_obs, last_done, hstate, rng)
+            return (train_state, env_state, last_obs, last_done, hstate, rng, reset_pool)
 
         def _update_step(update_runner_state, unused):
             runner_state, update_steps = update_runner_state
@@ -653,7 +715,7 @@ def make_train(config, env, wandb_start_step=-1):
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+            train_state, env_state, last_obs, last_done, hstate, rng, reset_pool = runner_state
             last_obs_batch = batchify(last_obs, env.agents)
             last_done_batch = batchify(last_done, env.agents)  # last_done is dict from env
             
@@ -854,73 +916,25 @@ def make_train(config, env, wandb_start_step=-1):
                 # train_batch shapes: (num_steps, num_agents, num_envs, ...)
                 # advantages/targets: (num_steps, num_agents, num_envs)
                 
-                # Permute over num_envs dimension
+                # Permute over num_envs dimension; minibatch m uses envs
+                # permutation[m * MINIBATCH_SIZE:(m + 1) * MINIBATCH_SIZE]. Each minibatch is
+                # gathered when it is used rather than copying the whole shuffled batch first.
                 permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
+                minibatch_envs = permutation.reshape(config["NUM_MINIBATCHES"], config["MINIBATCH_SIZE"])
 
-                # Shuffle init_hstate: (num_agents, num_envs, hidden_dim) -> axis 1
-                init_hstate_shuffled = jnp.take(init_hstate, permutation, axis=1)
-                
-                # Shuffle train_batch components: (num_steps, num_agents, num_envs, ...) -> axis 2
-                def shuffle_batch(x):
-                    return jnp.take(x, permutation, axis=2)
-                
-                train_batch_shuffled = TrainBatch(
-                    global_done=shuffle_batch(train_batch.global_done),
-                    done=shuffle_batch(train_batch.done),
-                    alive=shuffle_batch(train_batch.alive),
-                    action=shuffle_batch(train_batch.action),
-                    value=shuffle_batch(train_batch.value),
-                    reward=shuffle_batch(train_batch.reward),
-                    log_prob=shuffle_batch(train_batch.log_prob),
-                    obs=shuffle_batch(train_batch.obs),
-                    deltas_to_start=shuffle_batch(train_batch.deltas_to_start),
-                )
-                
-                # Shuffle advantages/targets: (num_steps, num_agents, num_envs) -> axis 2
-                advantages_shuffled = jnp.take(advantages, permutation, axis=2)
-                targets_shuffled = jnp.take(targets, permutation, axis=2)
-                
-                # Create minibatches
-                def minibatch_hstate(x):
-                    # x: (num_agents, num_envs, hidden_dim)
-                    # -> (num_minibatches, num_agents, minibatch_size, hidden_dim)
-                    num_agents, num_envs, hidden_dim = x.shape
-                    minibatch_size = num_envs // config["NUM_MINIBATCHES"]
-                    return x.reshape(num_agents, config["NUM_MINIBATCHES"], minibatch_size, hidden_dim).swapaxes(0, 1)
-                
-                def minibatch_array(x):
-                    # x: (num_steps, num_agents, num_envs, ...) 
-                    # -> (num_minibatches, num_steps, num_agents, minibatch_size, ...)
-                    shape = list(x.shape)
-                    num_steps, num_agents, num_envs = shape[:3]
-                    rest = shape[3:]
-                    minibatch_size = num_envs // config["NUM_MINIBATCHES"]
-                    new_shape = [num_steps, num_agents, config["NUM_MINIBATCHES"], minibatch_size] + rest
-                    reshaped = x.reshape(new_shape)
-                    # Move minibatch axis to front
-                    return jnp.moveaxis(reshaped, 2, 0)
-                
-                init_hstate_mb = minibatch_hstate(init_hstate_shuffled)
-                
-                train_batch_mb = TrainBatch(
-                    global_done=minibatch_array(train_batch_shuffled.global_done),
-                    done=minibatch_array(train_batch_shuffled.done),
-                    alive=minibatch_array(train_batch_shuffled.alive),
-                    action=minibatch_array(train_batch_shuffled.action),
-                    value=minibatch_array(train_batch_shuffled.value),
-                    reward=minibatch_array(train_batch_shuffled.reward),
-                    log_prob=minibatch_array(train_batch_shuffled.log_prob),
-                    obs=minibatch_array(train_batch_shuffled.obs),
-                    deltas_to_start=minibatch_array(train_batch_shuffled.deltas_to_start),
-                )
-                
-                advantages_mb = minibatch_array(advantages_shuffled)
-                targets_mb = minibatch_array(targets_shuffled)
-                
-                minibatches = (init_hstate_mb, train_batch_mb, advantages_mb, targets_mb)
+                def _gather_and_update_minbatch(train_state, envs):
+                    # init_hstate: (num_agents, num_envs, hidden_dim) -> axis 1
+                    # train_batch, advantages, targets: (num_steps, num_agents, num_envs, ...) -> axis 2
+                    batch_info = (
+                        jnp.take(init_hstate, envs, axis=1),
+                        jax.tree.map(lambda x: jnp.take(x, envs, axis=2), train_batch),
+                        jnp.take(advantages, envs, axis=2),
+                        jnp.take(targets, envs, axis=2),
+                    )
+                    return _update_minbatch(train_state, batch_info)
 
                 train_state, total_loss = jax.lax.scan(
-                    _update_minbatch, train_state, minibatches
+                    _gather_and_update_minbatch, train_state, minibatch_envs
                 )
                 update_state = (
                     train_state,
@@ -945,7 +959,6 @@ def make_train(config, env, wandb_start_step=-1):
             )
             train_state = update_state[0]
             
-            # traj_info is a FrozenDict from LogWrapper - create new dict to avoid mutation issues
             loss_aux = loss_info[1]  # LossAux with fields stacked (num_epochs, num_minibatches, ...)
             # ratio_0: get before mean reduction (like original)
             ratio_0 = loss_aux.ratio.at[0, 0].get().mean()
@@ -963,9 +976,16 @@ def make_train(config, env, wandb_start_step=-1):
             loss_info_mean = jax.tree.map(lambda x: x.mean(), loss_info)
             loss_aux_mean = loss_info_mean[1]
 
-            # Create new metric dict (don't mutate FrozenDict from LogWrapper)
+            # Episode metrics are reduced on device to per-agent means over the episodes that
+            # finished during this rollout, so the per-update host callback receives a few
+            # hundred scalars instead of every (step, env, agent) value of every info field.
+            finished = traj_info["returned_episode"]  # (num_steps, num_envs, num_agents)
+            finished_count = finished.sum(axis=(0, 1))  # (num_agents,)
+
+            def _finished_episode_mean(x):
+                return jnp.where(finished, x, 0.0).sum(axis=(0, 1)) / jnp.maximum(finished_count, 1)
+
             metric = {
-                **dict(traj_info),  # Convert FrozenDict to regular dict
                 "update_steps": update_steps,
                 "loss": {
                     "total_loss": loss_info_mean[0],
@@ -985,6 +1005,15 @@ def make_train(config, env, wandb_start_step=-1):
                     "entropy": entropy_per_agent,            # (num_agents,)
                     "aux_loss": aux_loss_per_agent,          # (num_agents,)
                 },
+                "finished_episodes": finished_count,  # (num_agents,)
+                "episode_means": jax.tree.map(  # every leaf: (num_agents,)
+                    _finished_episode_mean,
+                    {
+                        "user_info": traj_info["user_info"],
+                        "returned_episode_returns": traj_info["returned_episode_returns"],
+                        "returned_episode_lengths": traj_info["returned_episode_lengths"],
+                    },
+                ),
             }
             if _prune:
                 metric["sparsity_per_agent"] = pruning.mask_sparsity(train_state.opt_state.masks)  # (num_agents,)
@@ -995,8 +1024,11 @@ def make_train(config, env, wandb_start_step=-1):
             _sps_state = {'last_time':None, 'last_env_step': None}
 
             def callback(metrics, step):
+                # Python int: update_steps arrives as an int32 array, and the product
+                # overflows int32 once it passes 2**31 env steps (update 65536 in the
+                # canonical config).
                 env_step = (
-                    metrics["update_steps"]
+                    int(metrics["update_steps"])
                     * config["NUM_ENVS"]
                     * config["NUM_STEPS"]
                 )
@@ -1054,21 +1086,25 @@ def make_train(config, env, wandb_start_step=-1):
                     to_log["overview/sparsity"] = sparsity_per_agent.mean().item()
 
                 # ── Episode-level metrics (only when episodes returned) ──
-                if metrics["returned_episode"].any():
-                    info = metrics["user_info"]
-                    ep_mask = metrics["returned_episode"]  # (num_steps, num_envs, num_agents)
+                if metrics["finished_episodes"].any():
+                    finished_count = np.asarray(metrics["finished_episodes"])  # (num_agents,)
+                    episode_means = metrics["episode_means"]
+                    info = episode_means["user_info"]
 
                     def _team_agent_indices(team_idx):
                         start = team_idx * agents_per_team
                         end = min(start + agents_per_team, num_agents)
                         return range(start, end)
 
+                    def _finished_mean(per_agent_means, agent_idx):
+                        """Mean over this agent's returned episodes, or None if none returned."""
+                        if finished_count[agent_idx] == 0:
+                            return None
+                        return np.asarray(per_agent_means[agent_idx]).item()
+
                     def _agent_mean(key, agent_idx):
                         """Mean of metric for agent over returned episodes."""
-                        mask = ep_mask[:, :, agent_idx]
-                        if not mask.any():
-                            return None
-                        return np.asarray(info[key][:, :, agent_idx][mask].mean()).item()
+                        return _finished_mean(info[key], agent_idx)
 
                     def _team_mean(key, team_idx):
                         """Mean of metric across team members over returned episodes."""
@@ -1090,17 +1126,13 @@ def make_train(config, env, wandb_start_step=-1):
 
                     def _global_mean(key):
                         """Mean of metric over all returned episodes (agent 0, broadcast metric)."""
-                        mask = ep_mask[:, :, 0]
-                        if not mask.any():
-                            return None
-                        return np.asarray(info[key][:, :, 0][mask].mean()).item()
+                        return _agent_mean(key, 0)
 
                     # overview/ episode metrics
-                    ep_lengths = metrics["returned_episode_lengths"]
-                    ep_returns = metrics["returned_episode_returns"]
-                    mask0 = ep_mask[:, :, 0]
-                    if mask0.any():
-                        to_log["overview/episode_length"] = np.asarray(ep_lengths[:, :, 0][mask0].mean()).item()
+                    ep_returns = episode_means["returned_episode_returns"]
+                    episode_length = _finished_mean(episode_means["returned_episode_lengths"], 0)
+                    if episode_length is not None:
+                        to_log["overview/episode_length"] = episode_length
 
                     # Overview shared/team reward as mean across all agent returns.
                     # When SHARED_REWARD=True, all per-agent returns are identical and
@@ -1108,9 +1140,8 @@ def make_train(config, env, wandb_start_step=-1):
                     # this stays a useful team-level overview metric.
                     all_agent_returns = []
                     for ai in range(num_agents):
-                        mask_ai = ep_mask[:, :, ai]
-                        if mask_ai.any():
-                            agent_return = np.asarray(ep_returns[:, :, ai][mask_ai].mean()).item()
+                        agent_return = _finished_mean(ep_returns, ai)
+                        if agent_return is not None:
                             all_agent_returns.append(agent_return)
                             to_log[f"agent_{ai}/episode_return"] = agent_return
                             individual_reward = _agent_mean("Reward/individual_reward", ai)
@@ -1191,9 +1222,9 @@ def make_train(config, env, wandb_start_step=-1):
                         # shared_reward (= episode_returns averaged over team members)
                         team_ret = []
                         for idx in _team_agent_indices(ti):
-                            mask_ai = ep_mask[:, :, idx]
-                            if mask_ai.any():
-                                team_ret.append(np.asarray(ep_returns[:, :, idx][mask_ai].mean()).item())
+                            v = _finished_mean(ep_returns, idx)
+                            if v is not None:
+                                team_ret.append(v)
                         if team_ret:
                             to_log[f"{tp}/shared_reward"] = np.mean(team_ret)
 
@@ -1249,7 +1280,7 @@ def make_train(config, env, wandb_start_step=-1):
 
             jax.experimental.io_callback(callback, None, metric, update_steps, ordered=True)
             update_steps = update_steps + 1
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
+            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, reset_pool)
             return (runner_state, update_steps), metric
 
 
@@ -1278,7 +1309,7 @@ def make_train(config, env, wandb_start_step=-1):
 
             # Compute a pseudo episode_id from cumulative done flags
             # done shape: (T, num_agents, NUM_ENVS)  (network output field)
-            # episode_count shape: (num_agents, NUM_ENVS) — carried across logging steps
+            # episode_count shape: (num_agents, logging envs) — carried across logging steps
             # Shift by 1 so the done step itself still belongs to the old episode
             done_shifted = jnp.concatenate([
                 jnp.zeros((1,) + traj_batch.info['done'].shape[1:]),
@@ -1405,7 +1436,7 @@ def make_train(config, env, wandb_start_step=-1):
             # No reshape needed - shapes are already correct
             for agent_n in range(env.num_agents):
                 # Network outputs have shape (T, num_agents, NUM_ENVS) - extract agent_n -> (T, NUM_ENVS)
-                log_array = traj_batch.info['action'][:, agent_n, :].reshape((traj_batch.info['action'].shape[0], config['NUM_ENVS'], 1))
+                log_array = traj_batch.info['action'][:, agent_n, :, None]  # (T, logging envs, 1)
                 # Yes this is a for loop in the JAX code but this stuff was getting done in serial before anyway and it's cheap operations
                 for field_to_log in fields_to_log:
                     log_array = add_field_to_log_array(traj_batch.info, log_array, field_to_log, agent_n)
@@ -1480,12 +1511,10 @@ def make_train(config, env, wandb_start_step=-1):
             env_action = policy_action_to_env_action(action)
             env_act = unbatchify(env_action, env.agents)  # {agent: (1,)}
 
-            # STEP 1 env (use env_train — video doesn't need CSV fields)
+            # STEP 1 env (video doesn't need CSV fields)
             rng, _rng = jax.random.split(rng)
             rng_step = jax.random.split(_rng, 1)
-            obsv, env_state, reward, done, info = jax.vmap(
-                env_train.step, in_axes=(0, 0, 0)
-            )(rng_step, env_state, env_act)
+            obsv, env_state, reward, done, info = vec_env.step(rng_step, env_state, env_act)
             if effective_cap is not None:
                 env_state = _patch_episode_cap(env_state, effective_cap)
 
@@ -1519,20 +1548,36 @@ def make_train(config, env, wandb_start_step=-1):
             state, update_steps = runner_state
             effective_cap = _get_effective_episode_cap(update_steps)
             state = _apply_episode_cap_to_runner_state(state, effective_cap)
-            # episode_count tracks cumulative episode IDs across logging steps: (num_agents, NUM_ENVS)
-            episode_count = jnp.zeros((env.num_agents, config["NUM_ENVS"]), dtype=jnp.int32)
+
+            # The logging rollout runs on a copy of the first LOGGING_THREADS envs (the ones
+            # written to the CSVs). The training envs do not advance; their RNG is split once.
+            train_state_l, env_state_l, obsv_l, done_l, hstate_l, rng_l, reset_pool_l = state
+            rng_l, rng_logging = jax.random.split(rng_l)
+            logging_envs = lambda x: x[:config["LOGGING_THREADS"]]
+            logging_runner = (
+                train_state_l,
+                jax.tree.map(logging_envs, env_state_l),
+                jax.tree.map(logging_envs, obsv_l),
+                jax.tree.map(logging_envs, done_l),
+                hstate_l[:, :config["LOGGING_THREADS"]],
+                rng_logging,
+                None,  # finished logging envs generate their own new world
+            )
+            state = (train_state_l, env_state_l, obsv_l, done_l, hstate_l, rng_l, reset_pool_l)
+            # episode_count tracks cumulative episode IDs across logging steps: (num_agents, LOGGING_THREADS)
+            episode_count = jnp.zeros((env.num_agents, config["LOGGING_THREADS"]), dtype=jnp.int32)
             # ep_time / episode_id of the last logged row, carried across logging steps.
             # Starting at -1 / 0 marks the window's first episode as having an unknown start.
-            ep_time_last = jnp.full((env.num_agents, config["NUM_ENVS"]), -1, dtype=jnp.int32)
-            episode_id_last = jnp.zeros((env.num_agents, config["NUM_ENVS"]), dtype=jnp.int32)
-            (state, episode_count, ep_time_last, episode_id_last), empty = jax.lax.scan(
+            ep_time_last = jnp.full((env.num_agents, config["LOGGING_THREADS"]), -1, dtype=jnp.int32)
+            episode_id_last = jnp.zeros((env.num_agents, config["LOGGING_THREADS"]), dtype=jnp.int32)
+            jax.lax.scan(
                 functools.partial(
                     _logging_step,
                     logging_threads=config["LOGGING_THREADS"],
                     update_step=update_steps,
                     effective_cap=effective_cap,
                 ),
-                (state, episode_count, ep_time_last, episode_id_last), None,
+                (logging_runner, episode_count, ep_time_last, episode_id_last), None,
                 config["LOGGING_NUM_CALLS"],
             )
 
@@ -1545,14 +1590,14 @@ def make_train(config, env, wandb_start_step=-1):
                     video_length = min(video_length, _video_max_length)
 
                 # Unpack training state
-                train_state_v, env_state_v, obsv_v, done_v, hstate_v, rng_v = state
+                train_state_v, env_state_v, obsv_v, done_v, hstate_v, rng_v, reset_pool_v = state
 
                 # Fork RNG: one for video, one to continue training
                 rng_video, rng_continue = jax.random.split(rng_v)
 
                 # Reset only 1 env for video (saves ~NUM_ENVS × video_length env-state memory)
                 video_reset_rngs = jax.random.split(rng_video, 1)
-                video_obsv, video_env_state = jax.vmap(env_train.reset, in_axes=(0,))(video_reset_rngs)
+                video_obsv, video_env_state = vec_env.reset(video_reset_rngs)
                 if effective_cap is not None:
                     video_env_state = _patch_episode_cap(video_env_state, effective_cap)
 
@@ -1578,7 +1623,7 @@ def make_train(config, env, wandb_start_step=-1):
                 )
 
                 # Restore training state with updated RNG (video state discarded)
-                state = (train_state_v, env_state_v, obsv_v, done_v, hstate_v, rng_continue)
+                state = (train_state_v, env_state_v, obsv_v, done_v, hstate_v, rng_continue, reset_pool_v)
 
                 def save_video_from_buffer(step):
                     """Assemble streamed frames from buffer and save as video files."""
@@ -1664,6 +1709,7 @@ def make_train(config, env, wandb_start_step=-1):
             init_done,  # Keep as dict for consistency with env.step output
             init_hstate,
             _rng,
+            reset_pool,
         )
         init_carry = (runner_state, jnp.asarray(0, dtype=jnp.int32))
         return init_carry, _update_plot, _update_step

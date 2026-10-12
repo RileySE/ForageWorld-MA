@@ -247,7 +247,7 @@ def add_items_from_chest(rng, state, inventory, is_opening_chest):
     rng, _rng = jax.random.split(rng)
     is_looting_ore = jax.random.uniform(_rng) < collect_prob * is_opening_chest
     rng, _rng = jax.random.split(rng)
-    ore_loot_id = jax.random.choice(
+    ore_loot_id = random_choice(
         _rng,
         jnp.arange(5, dtype=jnp.int32),
         shape=(),
@@ -313,7 +313,7 @@ def add_items_from_chest(rng, state, inventory, is_opening_chest):
     )
     rng, _rng = jax.random.split(rng)
     pickaxe_loot_level = (
-        jax.random.choice(
+        random_choice(
             _rng,
             (jnp.arange(4) + 1).astype(int),
             shape=(),
@@ -335,13 +335,13 @@ def add_items_from_chest(rng, state, inventory, is_opening_chest):
         ),
         jnp.logical_and(
             state.player_level == 1,
-            jnp.logical_not(state.chests_opened[state.player_level]),
+            jnp.logical_not(state.chests_opened[state.level_index]),
         )
     )
     new_bow_level = is_looting_bow * 1 + (1 - is_looting_bow) * inventory.bow
 
     can_loot_book = jnp.logical_and(
-        jnp.logical_not(state.chests_opened[state.player_level]),
+        jnp.logical_not(state.chests_opened[state.level_index]),
         jnp.logical_or(state.player_level == 3, state.player_level == 4),
     )
     is_looting_book = jnp.logical_and(
@@ -400,15 +400,15 @@ def do_action(rng, state, action, env_params, static_params):
     # Tree
     can_mine_tree = True
     is_block_tree = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.TREE.value
     )
     is_block_fire_tree = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.FIRE_TREE.value
     )
     is_block_ice_shrub = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.ICE_SHRUB.value
     )
 
@@ -434,10 +434,10 @@ def do_action(rng, state, action, env_params, static_params):
     mined_tree_block = jnp.where(
         is_any_player_mining_tree,
         tree_replacement_block,
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]],
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]],
     )
     new_map = (
-        state.map[state.player_level]
+        state.map[state.level_index]
         .at[block_position[:, 0], block_position[:, 1]]
         .set(mined_tree_block)
     )
@@ -448,7 +448,7 @@ def do_action(rng, state, action, env_params, static_params):
     # Stone
     can_mine_stone = state.inventory.pickaxe >= 1
     is_block_stone = (
-        state.map[state.player_level][block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index][block_position[:, 0], block_position[:, 1]]
         == BlockType.STONE.value
     )
     is_mining_stone = jnp.logical_and(
@@ -474,7 +474,7 @@ def do_action(rng, state, action, env_params, static_params):
 
     # Furnace
     is_block_furnace = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.FURNACE.value
     )
     is_mining_furnace = jnp.logical_and(
@@ -494,7 +494,7 @@ def do_action(rng, state, action, env_params, static_params):
 
     # Crafting Bench
     is_block_crafting_table = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.CRAFTING_TABLE.value
     )
     is_mining_crafting_table = jnp.logical_and(
@@ -517,7 +517,7 @@ def do_action(rng, state, action, env_params, static_params):
     # Coal
     can_mine_coal = state.inventory.pickaxe >= 1
     is_block_coal = (
-        state.map[state.player_level][block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index][block_position[:, 0], block_position[:, 1]]
         == BlockType.COAL.value
     )
     is_mining_coal = jnp.logical_and(
@@ -544,7 +544,7 @@ def do_action(rng, state, action, env_params, static_params):
     # Iron
     can_mine_iron = state.inventory.pickaxe >= 2
     is_block_iron = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.IRON.value
     )
     is_mining_iron = jnp.logical_and(
@@ -571,7 +571,7 @@ def do_action(rng, state, action, env_params, static_params):
     # Diamond  
     can_mine_diamond = state.inventory.pickaxe >= 3
     is_block_diamond = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.DIAMOND.value
     )
     is_mining_diamond = jnp.logical_and(
@@ -598,7 +598,7 @@ def do_action(rng, state, action, env_params, static_params):
     # Sapphire
     can_mine_sapphire = state.inventory.pickaxe >= 4
     is_block_sapphire = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.SAPPHIRE.value
     )
     is_mining_sapphire = jnp.logical_and(
@@ -625,7 +625,7 @@ def do_action(rng, state, action, env_params, static_params):
     # Ruby
     can_mine_ruby = state.inventory.pickaxe >= 4
     is_block_ruby = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.RUBY.value
     )
     is_mining_ruby = jnp.logical_and(
@@ -652,7 +652,7 @@ def do_action(rng, state, action, env_params, static_params):
     # Sapling
     rng, _rng = jax.random.split(rng)
     is_block_grass = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.GRASS.value
     )
     sapling_prob = 0.2 * is_forager # only foragers can collect saplings
@@ -670,9 +670,9 @@ def do_action(rng, state, action, env_params, static_params):
 
     # Water
     is_block_water = jnp.logical_or(
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.WATER.value,
-        state.map[state.player_level][block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index][block_position[:, 0], block_position[:, 1]]
         == BlockType.FOUNTAIN.value,
     )
     is_drinking_water = jnp.logical_and(
@@ -706,7 +706,7 @@ def do_action(rng, state, action, env_params, static_params):
 
     # Plant
     is_block_plant = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.RIPE_PLANT.value
     )
     is_eating_plant = jnp.logical_and(
@@ -740,7 +740,7 @@ def do_action(rng, state, action, env_params, static_params):
     # Stalagmite
     can_mine_stalagmite = state.inventory.pickaxe >= 1
     is_block_stalagmite = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.STALAGMITE.value
     )
     is_mining_stalagmite = jnp.logical_and(
@@ -766,7 +766,7 @@ def do_action(rng, state, action, env_params, static_params):
 
     # Chest
     is_block_chest = (
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.CHEST.value
     )
     is_opening_chest = jnp.logical_and(
@@ -787,8 +787,8 @@ def do_action(rng, state, action, env_params, static_params):
     rng, _rng = jax.random.split(rng)
     new_inventory = add_items_from_chest(_rng, state, new_inventory, is_opening_chest)
 
-    new_chests_opened = state.chests_opened.at[state.player_level].set(
-        jnp.logical_or(state.chests_opened[state.player_level], is_opening_chest)
+    new_chests_opened = state.chests_opened.at[state.level_index].set(
+        jnp.logical_or(state.chests_opened[state.level_index], is_opening_chest)
     )
 
     new_achievements = new_achievements.at[:, Achievement.OPEN_CHEST.value].set(
@@ -799,7 +799,7 @@ def do_action(rng, state, action, env_params, static_params):
 
     # Boss
     is_attacking_boss = jnp.logical_and(
-        state.map[state.player_level, block_position[:, 0], block_position[:, 1]]
+        state.map[state.level_index, block_position[:, 0], block_position[:, 1]]
         == BlockType.NECROMANCER.value,
         doing_action,
     )
@@ -823,7 +823,7 @@ def do_action(rng, state, action, env_params, static_params):
         )
     )
 
-    new_whole_map = state.map.at[state.player_level].set(new_map)
+    new_whole_map = state.map.at[state.level_index].set(new_map)
 
     state = state.replace(
         map=new_whole_map,
@@ -1196,8 +1196,8 @@ def place_block(state, action, static_params):
     placing_block_position = state.player_position + DIRECTIONS[state.player_direction]
     equal_block_placement = (jnp.expand_dims(placing_block_position, axis=1) == jnp.expand_dims(placing_block_position, axis=0)).all(axis=2)
 
-    new_map = state.map[state.player_level]
-    new_item_map = state.item_map[state.player_level]
+    new_map = state.map[state.level_index]
+    new_item_map = state.item_map[state.level_index]
 
     is_block_in_other_player = is_in_other_player(state, placing_block_position)
     is_block_in_mob = is_in_mob(state, placing_block_position)
@@ -1400,7 +1400,7 @@ def place_block(state, action, static_params):
     
     light_map_padding = 6
     padded_light_map_floor = jnp.pad(
-        state.light_map[state.player_level],
+        state.light_map[state.level_index],
         (light_map_padding, light_map_padding),
         constant_values=0,
     )
@@ -1412,7 +1412,7 @@ def place_block(state, action, static_params):
     new_light_map_floor = padded_light_map_floor[
         light_map_padding:-light_map_padding, light_map_padding:-light_map_padding
     ]
-    new_light_map = state.light_map.at[state.player_level].set(new_light_map_floor)
+    new_light_map = state.light_map.at[state.level_index].set(new_light_map_floor)
 
     new_inventory = new_inventory.replace(
         torches=new_inventory.torches - 1 * is_player_placing_torch
@@ -1494,8 +1494,8 @@ def place_block(state, action, static_params):
     )
 
     # Do?
-    new_whole_map = state.map.at[state.player_level].set(new_map)
-    new_whole_item_map = state.item_map.at[state.player_level].set(new_item_map)
+    new_whole_map = state.map.at[state.level_index].set(new_map)
+    new_whole_item_map = state.item_map.at[state.level_index].set(new_item_map)
     state = state.replace(
         map=new_whole_map,
         item_map=new_whole_item_map,
@@ -1510,340 +1510,627 @@ def place_block(state, action, static_params):
     return state
 
 
-def update_mobs(rng, state, params, env_params, static_params):
+def _resolve_sequential_moves(position, proposed, valid_without_mobs, mask, new_mask, mob_map):
+    """Final positions of mobs that move one at a time in index order, computed in parallel.
 
-    # Move melee_mobs
-    def _move_melee_mob(rng_and_state, melee_mob_index):
-        rng, state = rng_and_state
-        melee_mobs = state.melee_mobs
+    Moving sequentially, mob i takes proposed[i] iff valid_without_mobs[i] and that cell of mob_map
+    is empty on its turn. The cell's value then is the last write to it by an earlier mob j < i
+    (mob j clears position[j] if mask[j], then sets its new position if new_mask[j]), or its
+    initial value if no earlier mob wrote it. Each mob's outcome depends only on earlier mobs'
+    outcomes, so recomputing every outcome from the previous guess reaches the sequential result
+    after at most num_mobs passes (in practice 1-3) and then stops changing.
+    """
+    num_mobs = position.shape[0]
+    mob_index = jnp.arange(num_mobs)
+    earlier = mob_index[None, :] < mob_index[:, None]  # [i, j]: mob j moves before mob i
 
-        # Random move
-        rng, _rng = jax.random.split(rng)
-        valid_random_moves = in_bounds(
-            DIRECTIONS[1:5] + melee_mobs.position[state.player_level, melee_mob_index], 
-            static_params
+    def last_write(writes):
+        return jnp.max(jnp.where(writes, mob_index[None, :], -1), axis=1)
+
+    hits_proposed = lambda cells: (cells[None, :, :] == proposed[:, None, :]).all(axis=-1)
+    last_clear = last_write(earlier & mask[None, :] & hits_proposed(position))
+    initially_occupied = mob_map[proposed[:, 0], proposed[:, 1]]
+
+    def outcome(moves):
+        last_set = last_write(
+            earlier & new_mask[None, :] & hits_proposed(jnp.where(moves[:, None], proposed, position))
         )
-        random_move_direction = jax.random.choice(
-            _rng,
-            DIRECTIONS[1:5],
-            p=valid_random_moves
+        # A mob's set follows its own clear, so a set by the same mob wins the tie.
+        occupied = jnp.where(
+            (last_set >= 0) | (last_clear >= 0), last_set >= last_clear, initially_occupied
         )
-        random_move_proposed_position = (
-            melee_mobs.position[state.player_level, melee_mob_index]
-            + random_move_direction
+        return valid_without_mobs & ~occupied
+
+    def refine(carry):
+        moves, _ = carry
+        new_moves = outcome(moves)
+        return new_moves, (new_moves != moves).any()
+
+    moves, _ = jax.lax.while_loop(
+        lambda carry: carry[1], refine, (valid_without_mobs & ~initially_occupied, jnp.asarray(True))
+    )
+    return jnp.where(moves[:, None], proposed, position)
+
+
+def _apply_mob_map_moves(mob_map, position, new_position, mask, new_mask):
+    """mob_map after each mob, in index order, clears its old cell (if mask) and sets its new cell (if new_mask)."""
+    mob_index = jnp.arange(position.shape[0])
+    last_write = jnp.full(mob_map.shape, -1, dtype=jnp.int32)
+    last_write = last_write.at[position[:, 0], position[:, 1]].max(jnp.where(mask, 2 * mob_index, -1))
+    last_write = last_write.at[new_position[:, 0], new_position[:, 1]].max(
+        jnp.where(new_mask, 2 * mob_index + 1, -1)
+    )
+    # Odd stamps are sets (a mob's set follows its own clear); cells nobody wrote keep their value.
+    return jnp.where(last_write >= 0, last_write % 2 == 1, mob_map)
+
+
+def move_passive_mobs(rng, state, params, static_params):
+    """Move every passive mob. Mob i draws its random move with the i-th key of one split of rng.
+
+    (The original per-mob loop chained one split per mob, which made generating the keys
+    sequential; the draws are identically distributed either way.)
+    """
+    if static_params.max_passive_mobs == 0:
+        return rng, state
+    keys = jax.random.split(rng, static_params.max_passive_mobs + 1)
+    return keys[0], _move_passive_mobs_with_keys(keys[1:], state, params, static_params)
+
+
+def _move_passive_mobs_with_keys(mob_keys, state, params, static_params):
+    """Same result as moving the passive mobs one at a time in index order, mob i drawing its
+    random move with mob_keys[i].
+
+    A passive mob's move depends on earlier mobs only through mob_map occupancy, so moves are
+    proposed for all mobs at once and the occupancy is resolved exactly by
+    _resolve_sequential_moves.
+    """
+    level = state.level_index
+    mobs = state.passive_mobs
+    position = mobs.position[level]
+    mask = mobs.mask[level]
+
+    def propose_random_moves(mob_keys):
+        valid_directions = jax.vmap(lambda pos: in_bounds(DIRECTIONS_PASSIVE + pos, static_params))(position)
+        directions = jax.vmap(lambda key, p: random_choice(key, DIRECTIONS_PASSIVE, p=p))(
+            mob_keys, valid_directions
         )
+        return position + directions
+
+    # Static mobs propose their current cell, which resolves to staying put.
+    proposed = jax.lax.cond(
+        params.passive_mobs_static, lambda mob_keys: position, propose_random_moves, mob_keys
+    )
+
+    no_mobs = state.replace(mob_map=jnp.zeros_like(state.mob_map))
+    valid_without_mobs = jax.vmap(
+        lambda pos, collision_map: is_position_in_bounds_not_in_mob_not_colliding(
+            no_mobs, pos[None, :], collision_map, static_params
+        )[0]
+    )(proposed, MOB_TYPE_COLLISION_MAPPING[mobs.type_id[level], 0])
+    in_other_player = jax.vmap(lambda pos: is_in_other_player(state, pos[None, :])[0])(proposed)
+    valid_without_mobs = jnp.logical_and(valid_without_mobs, jnp.logical_not(in_other_player))
+
+    distance_to_players = jnp.abs(state.player_position[None, :, :] - position[:, None, :]).sum(axis=-1)
+    should_not_despawn = jnp.logical_and(
+        distance_to_players < params.mob_despawn_distance, state.player_alive[None, :]
+    ).any(axis=-1)
+    new_mask = jnp.logical_and(mask, should_not_despawn)
+
+    level_mob_map = state.mob_map[level]
+    new_position = _resolve_sequential_moves(
+        position, proposed, valid_without_mobs, mask, new_mask, level_mob_map
+    )
+    state = state.replace(
+        passive_mobs=mobs.replace(
+            position=mobs.position.at[level].set(new_position),
+            mask=mobs.mask.at[level].set(new_mask),
+        ),
+        mob_map=state.mob_map.at[level].set(
+            _apply_mob_map_moves(level_mob_map, position, new_position, mask, new_mask)
+        ),
+    )
+    return state
+
+
+def move_melee_mobs(rng, state, params, static_params):
+    """Move every melee mob and resolve its attacks. Mob i's three random draws use keys 3i+1,
+    3i+2 and 3i+3 of one split of rng.
+
+    (The original per-mob loop chained four splits per mob, which made generating the keys
+    sequential; the draws are identically distributed either way.)
+    """
+    num_mobs = static_params.max_melee_mobs
+    if num_mobs == 0:
+        return rng, state
+    keys = jax.random.split(rng, 3 * num_mobs + 1)
+    return keys[0], _move_melee_mobs_with_keys(
+        keys[1::3], keys[2::3], keys[3::3], state, params, static_params
+    )
+
+
+def _move_melee_mobs_with_keys(move_keys, axis_keys, chase_keys, state, params, static_params):
+    """Same result as moving the melee mobs one at a time in index order, mob i drawing its random
+    step, chase axis and chase decision with move_keys[i], axis_keys[i] and chase_keys[i].
+
+    Each mob reads only its own slot, so its random draws, target, attack decision and proposed
+    move can be computed for all mobs at once. Four things depend on earlier mobs: mob_map
+    occupancy (resolved by _resolve_sequential_moves), whether an attacked player is still asleep
+    (a running OR over earlier attacks), player health and damage_taken_melee (subtracted and
+    added in mob order, so float rounding matches), and the order-free sleep/rest/achievement/log
+    flags.
+    """
+    num_mobs = static_params.max_melee_mobs
+    level = state.level_index
+    mobs = state.melee_mobs
+    position = mobs.position[level]
+    mask = mobs.mask[level]
+    attack_cooldown = mobs.attack_cooldown[level]
+
+    def propose_move(pos, move_key, axis_key, chase_key):
+        valid_random_moves = in_bounds(DIRECTIONS[1:5] + pos, static_params)
+        random_move_proposed_position = pos + random_choice(move_key, DIRECTIONS[1:5], p=valid_random_moves)
 
         # Move towards closest player
-        player_move_direction = jnp.zeros((2,), dtype=jnp.int32)
-        all_players_move_direction_abs = jnp.abs(
-            state.player_position
-            - melee_mobs.position[state.player_level, melee_mob_index]
-        )
+        all_players_move_direction_abs = jnp.abs(state.player_position - pos)
         distance_to_players = all_players_move_direction_abs.sum(axis=1)
-        player_targetted = jnp.argmin(jnp.where(
-            state.player_alive,
-            distance_to_players,
-            jnp.inf
-        ))
+        player_targetted = jnp.argmin(jnp.where(state.player_alive, distance_to_players, jnp.inf))
         player_move_direction_abs = all_players_move_direction_abs[player_targetted]
-
         player_move_direction_index_p = (
             player_move_direction_abs == player_move_direction_abs.max()
         ) / player_move_direction_abs.sum()
-        rng, _rng = jax.random.split(rng)
-        player_move_direction_index = jax.random.choice(
-            _rng,
-            jnp.arange(2),
-            p=player_move_direction_index_p,
-        )
-
-        player_move_direction = player_move_direction.at[
-            player_move_direction_index
-        ].set(
+        player_move_direction_index = random_choice(axis_key, jnp.arange(2), p=player_move_direction_index_p)
+        player_move_direction = jnp.zeros((2,), dtype=jnp.int32).at[player_move_direction_index].set(
             jnp.sign(
                 state.player_position[player_targetted, player_move_direction_index]
-                - melee_mobs.position[state.player_level, melee_mob_index, player_move_direction_index]
+                - pos[player_move_direction_index]
             ).astype(jnp.int32)
-        )
-        player_move_proposed_position = (
-            melee_mobs.position[state.player_level, melee_mob_index]
-            + player_move_direction
         )
 
         # Choose movement
-        close_to_player = distance_to_players < 10
-        close_to_player = jnp.logical_and(
-            close_to_player,
-            state.player_alive
-        ).any()
-        close_to_player = jnp.logical_or(
-            close_to_player, is_fighting_boss(state, static_params)
-        )
-        rng, _rng = jax.random.split(rng)
-        close_to_player = jnp.logical_and(
-            close_to_player, jax.random.uniform(_rng) < 0.75
-        )
+        close_to_player = jnp.logical_and(distance_to_players < 10, state.player_alive).any()
+        close_to_player = jnp.logical_or(close_to_player, is_fighting_boss(state, static_params))
+        close_to_player = jnp.logical_and(close_to_player, jax.random.uniform(chase_key) < 0.75)
         proposed_position = jax.lax.select(
-            close_to_player,
-            player_move_proposed_position,
-            random_move_proposed_position,
+            close_to_player, pos + player_move_direction, random_move_proposed_position
         )
+        return proposed_position, distance_to_players
 
-        # Choose attack or not
-        is_attacking_player = distance_to_players == 1
-        is_attacking_player = jnp.logical_and(
-            is_attacking_player,
-            state.player_alive
-        )
-        is_attacking_player = jnp.logical_and(
-            is_attacking_player,
-            melee_mobs.attack_cooldown[state.player_level, melee_mob_index] <= 0,
-        )
-        is_attacking_player = jnp.logical_and(
-            is_attacking_player, melee_mobs.mask[state.player_level, melee_mob_index]
-        )
+    proposed, distance_to_players = jax.vmap(propose_move)(position, move_keys, axis_keys, chase_keys)
 
-        proposed_position = jax.lax.select(
-            is_attacking_player.any(),
-            melee_mobs.position[state.player_level, melee_mob_index],
-            proposed_position,
-        )
-
-        melee_mob_base_damage = MOB_TYPE_DAMAGE_MAPPING[
-            melee_mobs.type_id[state.player_level, melee_mob_index], MobType.MELEE.value
-        ]
-
-        melee_mob_damage = get_damage_done_to_player(
-            state, static_params, melee_mob_base_damage * (1 + 2.5 * state.is_sleeping[:, None])
-        )
-
-        new_cooldown = jnp.where(
-            is_attacking_player.any(),
-            5,
-            melee_mobs.attack_cooldown[state.player_level, melee_mob_index] - 1,
-        )
-
-        is_waking_player = jnp.logical_and(state.is_sleeping, is_attacking_player)
-
-        melee_damage_taken = melee_mob_damage * is_attacking_player
-
-        state = state.replace(
-            player_health=state.player_health - melee_mob_damage * is_attacking_player,
-            is_sleeping=jnp.logical_and(
-                state.is_sleeping, jnp.logical_not(is_attacking_player)
-            ),
-            is_resting=jnp.logical_and(
-                state.is_resting, jnp.logical_not(is_attacking_player)
-            ),
-            achievements=state.achievements.at[:, Achievement.WAKE_UP.value].set(
-                jnp.logical_or(
-                    state.achievements[:, Achievement.WAKE_UP.value], is_waking_player
-                )
-            ),
-            damage_taken_melee=state.damage_taken_melee + melee_damage_taken,
-            log_predator_hit=jnp.maximum(
-                state.log_predator_hit,
-                is_attacking_player.astype(state.log_predator_hit.dtype),
-            ),
-        )
-
-        mob_type = melee_mobs.type_id[state.player_level, melee_mob_index]
-        collision_map = MOB_TYPE_COLLISION_MAPPING[mob_type, 1]
-        valid_move = is_position_in_bounds_not_in_mob_not_colliding(
-            state, proposed_position[None, :], collision_map, static_params
-        )[0]
-        in_other_player = is_in_other_player(state, proposed_position[None, :])[0]
-        valid_move = jnp.logical_and(
-            valid_move,
-            jnp.logical_not(in_other_player)
-        )
-
-        
-        position = jax.lax.select(
-            valid_move,
-            proposed_position,
-            melee_mobs.position[state.player_level, melee_mob_index],
-        )
-
-        # Melee despawn behavior depends on config flag
-        # Passive mobs (including snails) use their own logic and are unchanged.
-        should_not_despawn = jax.lax.select(
-            params.melee_mobs_despawn_when_far,
-            (distance_to_players < params.melee_mob_despawn_distance).any(),  # if flag=True. distance-gated and can despawn
-            jnp.asarray(True), # if flag=False always persist
-        )
-
-        rng, _rng = jax.random.split(rng)
-
-        # Clear our old entry if we are alive
-        new_mob_map = state.mob_map.at[
-            state.player_level,
-            state.melee_mobs.position[state.player_level, melee_mob_index, 0],
-            state.melee_mobs.position[state.player_level, melee_mob_index, 1],
-        ].set(
-            jnp.logical_and(
-                state.mob_map[
-                    state.player_level,
-                    state.melee_mobs.position[state.player_level, melee_mob_index, 0],
-                    state.melee_mobs.position[state.player_level, melee_mob_index, 1],
-                ],
-                jnp.logical_not(melee_mobs.mask[state.player_level, melee_mob_index]),
-            )
-        )
-        new_mask = jnp.logical_and(
-            state.melee_mobs.mask[state.player_level, melee_mob_index],
-            should_not_despawn,
-        )
-        # Enter new entry if we are alive and not despawning this timestep
-        new_mob_map = new_mob_map.at[state.player_level, position[0], position[1]].set(
-            jnp.logical_or(
-                new_mob_map[state.player_level, position[0], position[1]], new_mask
-            )
-        )
-
-        state = state.replace(
-            melee_mobs=state.melee_mobs.replace(
-                position=state.melee_mobs.position.at[
-                    state.player_level, melee_mob_index
-                ].set(position),
-                attack_cooldown=state.melee_mobs.attack_cooldown.at[
-                    state.player_level, melee_mob_index
-                ].set(new_cooldown),
-                mask=state.melee_mobs.mask.at[state.player_level, melee_mob_index].set(
-                    new_mask
-                ),
-            ),
-            mob_map=new_mob_map,
-        )
-
-        return (_rng, state), None
-
-    rng, _rng = jax.random.split(rng)
-    (rng, state), _ = jax.lax.scan(
-        _move_melee_mob, (rng, state), jnp.arange(static_params.max_melee_mobs)
+    # Attacks (mob, player); an attacking mob stays put.
+    is_attacking_player = (
+        (distance_to_players == 1)
+        & state.player_alive[None, :]
+        & (attack_cooldown <= 0)[:, None]
+        & mask[:, None]
     )
+    is_attacking = is_attacking_player.any(axis=1)
+    proposed = jnp.where(is_attacking[:, None], position, proposed)
+
+    # A player is still asleep on mob i's turn iff no earlier mob attacked them.
+    earlier_attacks = jnp.cumsum(is_attacking_player, axis=0) - is_attacking_player
+    is_sleeping = jnp.logical_and(state.is_sleeping[None, :], earlier_attacks == 0)
+    melee_mob_base_damage = MOB_TYPE_DAMAGE_MAPPING[mobs.type_id[level], MobType.MELEE.value]
+    melee_mob_damage = jax.vmap(
+        lambda base_damage, sleeping: get_damage_done_to_player(
+            state, static_params, base_damage * (1 + 2.5 * sleeping[:, None])
+        )
+    )(melee_mob_base_damage, is_sleeping)
+    melee_damage_taken = melee_mob_damage * is_attacking_player
+
+    player_health = state.player_health
+    damage_taken_melee = state.damage_taken_melee
+    for mob_index in range(num_mobs):  # in mob order, so float rounding matches the loop
+        player_health = player_health - melee_damage_taken[mob_index]
+        damage_taken_melee = damage_taken_melee + melee_damage_taken[mob_index]
+
+    attacked = is_attacking_player.any(axis=0)
+    is_waking_player = jnp.logical_and(is_sleeping, is_attacking_player).any(axis=0)
+    state = state.replace(
+        player_health=player_health,
+        is_sleeping=jnp.logical_and(state.is_sleeping, jnp.logical_not(attacked)),
+        is_resting=jnp.logical_and(state.is_resting, jnp.logical_not(attacked)),
+        achievements=state.achievements.at[:, Achievement.WAKE_UP.value].set(
+            jnp.logical_or(state.achievements[:, Achievement.WAKE_UP.value], is_waking_player)
+        ),
+        damage_taken_melee=damage_taken_melee,
+        log_predator_hit=jnp.maximum(
+            state.log_predator_hit, attacked.astype(state.log_predator_hit.dtype)
+        ),
+    )
+
+    no_mobs = state.replace(mob_map=jnp.zeros_like(state.mob_map))
+    valid_without_mobs = jax.vmap(
+        lambda pos, collision_map: is_position_in_bounds_not_in_mob_not_colliding(
+            no_mobs, pos[None, :], collision_map, static_params
+        )[0]
+    )(proposed, MOB_TYPE_COLLISION_MAPPING[mobs.type_id[level], 1])
+    in_other_player = jax.vmap(lambda pos: is_in_other_player(state, pos[None, :])[0])(proposed)
+    valid_without_mobs = jnp.logical_and(valid_without_mobs, jnp.logical_not(in_other_player))
+
+    # Melee despawn behavior depends on config flag
+    should_not_despawn = jnp.where(
+        params.melee_mobs_despawn_when_far,
+        (distance_to_players < params.melee_mob_despawn_distance).any(axis=1),
+        True,
+    )
+    new_mask = jnp.logical_and(mask, should_not_despawn)
+
+    level_mob_map = state.mob_map[level]
+    new_position = _resolve_sequential_moves(
+        position, proposed, valid_without_mobs, mask, new_mask, level_mob_map
+    )
+    state = state.replace(
+        melee_mobs=mobs.replace(
+            position=mobs.position.at[level].set(new_position),
+            attack_cooldown=mobs.attack_cooldown.at[level].set(
+                jnp.where(is_attacking, 5, attack_cooldown - 1)
+            ),
+            mask=mobs.mask.at[level].set(new_mask),
+        ),
+        mob_map=state.mob_map.at[level].set(
+            _apply_mob_map_moves(level_mob_map, position, new_position, mask, new_mask)
+        ),
+    )
+    return state
+
+
+def _for_each_active_slot(state, active, move_one):
+    """move_one(state, i) for each slot i with active[i], one at a time in index order.
+
+    Under vmap the loop runs as many times as the env with the most active slots.
+    """
+    num_slots = active.shape[0]
+    order = jnp.nonzero(active, size=num_slots, fill_value=num_slots)[0]
+    num_active = active.sum()
+
+    def move_next(carry):
+        k, state = carry
+        return k + 1, move_one(state, order[k])
+
+    _, state = jax.lax.while_loop(
+        lambda carry: carry[0] < num_active, move_next, (jnp.zeros_like(num_active), state)
+    )
+    return state
+
+
+def _move_mob_projectile(state, projectile_index, static_params):
+    projectiles = state.mob_projectiles
+
+    proposed_position = (
+        projectiles.position[state.level_index, projectile_index]
+        + state.mob_projectile_directions[state.level_index, projectile_index]
+    )
+
+
+    proposed_position_in_bounds = in_bounds(proposed_position[None, :], static_params)[0]
+    in_wall = is_in_solid_block(state.map[state.level_index], proposed_position[None, :])[0]
+    in_wall = jnp.logical_and(
+        in_wall,
+        jnp.logical_not(
+            state.map[state.level_index][
+                proposed_position[0], proposed_position[1]
+            ]
+            == BlockType.WATER.value
+        ),
+    )  # Arrows can go over water
+    in_mob = is_in_mob(state, proposed_position[None, :])[0]
+
+    continue_move = jnp.logical_and(
+        proposed_position_in_bounds, jnp.logical_not(in_wall)
+    )
+    continue_move = jnp.logical_and(continue_move, jnp.logical_not(in_mob))
+
+    hit_player0 = jnp.logical_and(
+        (
+            projectiles.position[state.level_index, projectile_index]
+            == state.player_position
+        ).all(axis=1),
+        projectiles.mask[state.level_index, projectile_index],
+    )
+
+    proposed_position_in_player = (proposed_position == state.player_position).all(axis=1)
+    hit_player1 = jnp.logical_and(
+        proposed_position_in_player,
+        projectiles.mask[state.level_index, projectile_index],
+    )
+    hit_player = jnp.logical_or(hit_player0, hit_player1)
+    hit_player = jnp.logical_and(hit_player, state.player_alive)
+
+    continue_move = jnp.logical_and(continue_move, jnp.logical_not(hit_player.any()))
+
+    position = proposed_position
+
+    # Clear our old entry if we are alive
+    new_mask = jnp.logical_and(
+        continue_move, projectiles.mask[state.level_index, projectile_index]
+    )
+
+    hit_bench_or_furnace = jnp.logical_or(
+        state.map[state.level_index, position[0], position[1]]
+        == BlockType.FURNACE.value,
+        state.map[state.level_index, position[0], position[1]]
+        == BlockType.CRAFTING_TABLE.value,
+    )
+    removing_block = jnp.logical_and(
+        hit_bench_or_furnace, projectiles.mask[state.level_index, projectile_index]
+    )
+
+    new_block = jax.lax.select(
+        removing_block,
+        BlockType.PATH.value,
+        state.map[state.level_index, position[0], position[1]],
+    )
+
+    projectile_type = state.mob_projectiles.type_id[
+        state.level_index, projectile_index
+    ]
+    projectile_damage = get_damage_done_to_player(
+        state,
+        static_params,
+        MOB_TYPE_DAMAGE_MAPPING[projectile_type, MobType.PROJECTILE.value][None, :],
+    )
+
+    ranged_damage_taken = projectile_damage * hit_player
+
+    state = state.replace(
+        mob_projectiles=state.mob_projectiles.replace(
+            position=state.mob_projectiles.position.at[
+                state.level_index, projectile_index
+            ].set(position),
+            mask=state.mob_projectiles.mask.at[
+                state.level_index, projectile_index
+            ].set(new_mask),
+        ),
+        player_health=state.player_health - projectile_damage * hit_player,
+        is_sleeping=jnp.logical_and(state.is_sleeping, jnp.logical_not(hit_player)),
+        is_resting=jnp.logical_and(state.is_resting, jnp.logical_not(hit_player)),
+        log_predator_hit=jnp.maximum(
+            state.log_predator_hit,
+            hit_player.astype(state.log_predator_hit.dtype),
+        ),
+        map=state.map.at[state.level_index, position[0], position[1]].set(
+            new_block
+        ),
+    )
+
+    return state
+
+
+def move_mob_projectiles(state, static_params):
+    """Move every mob projectile; same result as moving them one at a time in slot order.
+
+    For an inactive slot the loop only advanced its position by its direction (everything else
+    it did added zero or OR-ed False), so the active slots are moved one at a time in order and
+    the inactive ones are advanced together. In most envs no slot is active.
+    """
+    if static_params.max_mob_projectiles == 0:
+        return state
+
+    level = state.level_index
+    active = state.mob_projectiles.mask[level]
+    state = _for_each_active_slot(
+        state, active, lambda state, i: _move_mob_projectile(state, i, static_params)
+    )
+    inactive_step = jnp.where(
+        jnp.logical_not(active)[:, None], state.mob_projectile_directions[level], 0
+    )
+    return state.replace(
+        mob_projectiles=state.mob_projectiles.replace(
+            position=state.mob_projectiles.position.at[level].add(inactive_step)
+        )
+    )
+
+
+def _move_player_projectile(state, projectile_index, env_params, static_params):
+    projectiles = state.player_projectiles
+
+    projectile_owner = state.player_projectile_owners[
+        state.level_index, projectile_index
+    ]
+
+    projectile_type = state.player_projectiles.type_id[
+        state.level_index, projectile_index
+    ]
+
+    projectile_damage_vector = (
+        MOB_TYPE_DAMAGE_MAPPING[projectile_type, MobType.PROJECTILE.value]
+        * projectiles.mask[state.level_index, projectile_index]
+    )
+
+    is_arrow = jnp.logical_or(
+        projectile_type == ProjectileType.ARROW.value,
+        projectile_type == ProjectileType.ARROW2.value,
+    )
+
+    # Bow enchantment
+    arrow_damage_add = jnp.zeros(3, dtype=jnp.float32)
+    arrow_damage_add = arrow_damage_add.at[state.bow_enchantment[projectile_owner]].set(
+        projectile_damage_vector[0] / 2
+    )
+    arrow_damage_add = arrow_damage_add.at[0].set(0)
+
+    projectile_damage_vector += jax.lax.select(
+        is_arrow,
+        arrow_damage_add,
+        jnp.zeros(3, dtype=jnp.float32),
+    )
+
+    # Apply attribute scaling
+    arrow_damage_coeff = 1 + 0.2 * (state.player_dexterity[projectile_owner] - 1)
+    magic_damage_coeff = 1 + 0.5 * (state.player_intelligence[projectile_owner] - 1)
+
+    projectile_damage_vector *= jax.lax.select(
+        is_arrow,
+        arrow_damage_coeff,
+        1.0,
+    )
+
+    projectile_damage_vector *= jax.lax.select(
+        projectile_type == ProjectileType.FIREBALL.value,
+        magic_damage_coeff,
+        1.0,
+    )
+
+    proposed_position = (
+        projectiles.position[state.level_index, projectile_index]
+        + state.player_projectile_directions[state.level_index, projectile_index]
+    )
+
+    proposed_position_in_bounds = in_bounds(proposed_position[None, :], static_params)[0]
+    in_wall = is_in_solid_block(state.map[state.level_index], proposed_position[None, :])[0]
+    in_wall = jnp.logical_and(
+        in_wall,
+        jnp.logical_not(
+            state.map[state.level_index][
+                proposed_position[0], proposed_position[1]
+            ]
+            == BlockType.WATER.value
+        ),
+    )  # Arrows can go over water
+
+    # Check if we hit a player
+    deal_damage = projectiles.mask[state.level_index, projectile_index]
+
+    per_player_contact = (state.player_position == proposed_position[None, :]).all(axis=-1)
+    did_attack_player = per_player_contact.any()    
+    player_attack_index = jnp.argmax(per_player_contact)
+
+    player_defense_vector = get_player_defense_vector(state)[player_attack_index]
+    # Match melee interaction semantics: only damage opposing team (different subclass)
+    shooter_team = state.player_sc[projectile_owner]
+    victim_team = state.player_sc[player_attack_index]
+    is_cross_team_hit = shooter_team != victim_team
+    player_damage_dealt = (
+        get_damage(projectile_damage_vector, player_defense_vector)
+        * did_attack_player
+        * env_params.friendly_fire
+        * is_cross_team_hit
+    )
+    new_player_health = state.player_health.at[player_attack_index].add(-player_damage_dealt)
+
+    # Track projectile kills between teams
+    shooter_index = state.player_projectile_owners[state.level_index, projectile_index]
+    was_alive_victim = state.player_health[player_attack_index] > 0
+    is_now_dead_victim = new_player_health[player_attack_index] <= 0
+    # Only count if this projectile damage was the killing blow
+    death_caused_by_projectile = jnp.logical_and(
+        jnp.logical_and(was_alive_victim, is_now_dead_victim),
+        player_damage_dealt >= state.player_health[player_attack_index]  # Killing blow check
+    )
+    just_killed_projectile = jnp.logical_and(
+        death_caused_by_projectile,
+        shooter_team != victim_team  # Only count cross-team kills
+    )
+    # Attribute projectile kill to shooter's team
+    new_team_kills_projectile = state.team_kills.at[shooter_team].add(just_killed_projectile.astype(jnp.int32))
+
+    state, did_attack_mob0, did_kill_mob0 = attack_mob(
+        state,
+        deal_damage,
+        projectiles.position[None, state.level_index, projectile_index],
+        projectile_damage_vector[None, :],
+        jnp.array([False]),
+        jnp.array([projectile_owner], dtype=jnp.int32),
+        env_params,
+    )
+    did_attack_mob0 = did_attack_mob0[0]
+
+    did_attack_mob = jnp.logical_or(did_attack_player, did_attack_mob0)
+
+    projectile_damage_vector = projectile_damage_vector * (1 - did_attack_mob0)
+
+    state, did_attack_mob1, did_kill_mob1 = attack_mob(
+        state,
+        deal_damage,
+        proposed_position[None, :],
+        projectile_damage_vector[None, :],
+        jnp.array([False]),
+        jnp.array([projectile_owner], dtype=jnp.int32),
+        env_params,
+    )
+    did_attack_mob1 = did_attack_mob1[0]
+
+    did_attack_mob = jnp.logical_or(did_attack_mob, did_attack_mob1)
+
+    continue_move = jnp.logical_and(
+        proposed_position_in_bounds, jnp.logical_not(in_wall)
+    )
+    continue_move = jnp.logical_and(continue_move, jnp.logical_not(did_attack_mob))
+    position = proposed_position
+
+    # Clear our old entry if we are alive
+    new_mask = jnp.logical_and(
+        continue_move, projectiles.mask[state.level_index, projectile_index]
+    )
+
+    ff_ranged_damage_taken = jnp.zeros(static_params.player_count, dtype=jnp.float32).at[
+        player_attack_index
+    ].add(player_damage_dealt)
+
+    # Track damage dealt to other team by shooter's team (projectile)
+    new_damage_dealt_projectile = state.damage_dealt_to_other_team.at[shooter_team].add(
+        player_damage_dealt * is_cross_team_hit
+    )
+
+    state = state.replace(
+        player_health=new_player_health,
+        team_kills=new_team_kills_projectile,
+        player_projectiles=state.player_projectiles.replace(
+            position=state.player_projectiles.position.at[
+                state.level_index, projectile_index
+            ].set(position),
+            mask=state.player_projectiles.mask.at[
+                state.level_index, projectile_index
+            ].set(new_mask),
+        ),
+        damage_taken_ff=state.damage_taken_ff + ff_ranged_damage_taken,
+        damage_dealt_to_other_team=new_damage_dealt_projectile,
+    )
+
+    return state
+
+
+def move_player_projectiles(state, env_params, static_params):
+    """Move every player projectile; same result as moving them one at a time in slot order.
+
+    For an inactive slot the loop advanced its position by its direction and called attack_mob
+    without attacking, which still deactivates any active mob whose health is <= 0 (attack_mob
+    otherwise does that as it deals damage, so it changes nothing in reachable states). Slot 0
+    is always moved first so that clean-up happens exactly where the loop did it; after that an
+    inactive slot only advances, so the active slots are moved one at a time in order and the
+    inactive ones are advanced together. In most envs no slot is active.
+    """
+    if static_params.max_player_projectiles == 0:
+        return state
+
+    level = state.level_index
+    after_first = jnp.arange(static_params.max_player_projectiles) > 0
+    active = state.player_projectiles.mask[level]
+    move_one = lambda state, i: _move_player_projectile(state, i, env_params, static_params)
+    state = move_one(state, 0)
+    state = _for_each_active_slot(state, jnp.logical_and(active, after_first), move_one)
+    inactive_step = jnp.where(
+        jnp.logical_and(jnp.logical_not(active), after_first)[:, None],
+        state.player_projectile_directions[level],
+        0,
+    )
+    return state.replace(
+        player_projectiles=state.player_projectiles.replace(
+            position=state.player_projectiles.position.at[level].add(inactive_step)
+        )
+    )
+
+
+def update_mobs(rng, state, params, env_params, static_params):
+
+    # Move melee_mobs
+    rng, _rng = jax.random.split(rng)
+    rng, state = move_melee_mobs(rng, state, params, static_params)
 
     # Move passive_mobs
-    def _move_passive_mob(rng_and_state, passive_mob_index):
-        rng, state = rng_and_state
-        passive_mobs = state.passive_mobs
-
-        def _move_it(rng_and_state):
-            rng, state = rng_and_state
-            passive_mobs = state.passive_mobs
-
-            # Random move
-            rng, _rng = jax.random.split(rng)
-            valid_random_moves = in_bounds(
-                DIRECTIONS_PASSIVE + passive_mobs.position[state.player_level, passive_mob_index],
-                static_params
-            )
-            random_move_direction = jax.random.choice(
-                _rng,
-                DIRECTIONS_PASSIVE,
-                p=valid_random_moves
-            )
-            proposed_position = (
-                passive_mobs.position[state.player_level, passive_mob_index]
-                + random_move_direction
-            )
-
-            mob_type = passive_mobs.type_id[state.player_level, passive_mob_index]
-            collision_map = MOB_TYPE_COLLISION_MAPPING[mob_type, 0]
-            valid_move = is_position_in_bounds_not_in_mob_not_colliding(
-                state, proposed_position[None, :], collision_map, static_params
-            )[0]
-            in_other_player = is_in_other_player(state, proposed_position[None, :])[0]
-            valid_move = jnp.logical_and(
-                valid_move,
-                jnp.logical_not(in_other_player)
-            )
-            position = jax.lax.select(
-                valid_move,
-                proposed_position,
-                passive_mobs.position[state.player_level, passive_mob_index],
-            )
-            
-            return position, rng
-        
-        def _stay_static(rng_and_state):
-            rng, state = rng_and_state
-            passive_mobs = state.passive_mobs
-            position = passive_mobs.position[state.player_level, passive_mob_index]
-            
-            return position, rng
-        
-        position, rng = jax.lax.cond(
-            params.passive_mobs_static,
-            _stay_static,
-            _move_it,
-            rng_and_state,
-        )
-
-        distance_to_players = jnp.abs(
-            state.player_position
-            - passive_mobs.position[state.player_level, passive_mob_index]
-        ).sum(axis=1)
-        should_not_despawn = jnp.logical_and(
-            distance_to_players < params.mob_despawn_distance,
-            state.player_alive
-        ).any()
-
-        # Clear our old entry if we are alive
-        new_mob_map = state.mob_map.at[
-            state.player_level,
-            state.passive_mobs.position[state.player_level, passive_mob_index, 0],
-            state.passive_mobs.position[state.player_level, passive_mob_index, 1],
-        ].set(
-            jnp.logical_and(
-                state.mob_map[
-                    state.player_level,
-                    state.passive_mobs.position[
-                        state.player_level, passive_mob_index, 0
-                    ],
-                    state.passive_mobs.position[
-                        state.player_level, passive_mob_index, 1
-                    ],
-                ],
-                jnp.logical_not(
-                    passive_mobs.mask[state.player_level, passive_mob_index]
-                ),
-            )
-        )
-        new_mask = jnp.logical_and(
-            state.passive_mobs.mask[state.player_level, passive_mob_index],
-            should_not_despawn,
-        )
-        # Enter new entry if we are alive and not despawning this timestep
-        new_mob_map = new_mob_map.at[state.player_level, position[0], position[1]].set(
-            jnp.logical_or(
-                new_mob_map[state.player_level, position[0], position[1]], new_mask
-            )
-        )
-
-        state = state.replace(
-            passive_mobs=state.passive_mobs.replace(
-                position=state.passive_mobs.position.at[
-                    state.player_level, passive_mob_index
-                ].set(position),
-                mask=state.passive_mobs.mask.at[
-                    state.player_level, passive_mob_index
-                ].set(
-                    jnp.logical_and(
-                        state.passive_mobs.mask[state.player_level, passive_mob_index],
-                        should_not_despawn,
-                    )
-                ),
-            ),
-            mob_map=new_mob_map,
-        )
-
-        return (rng, state), None
-
     rng, _rng = jax.random.split(rng)
-    (rng, state), _ = jax.lax.scan(
-        _move_passive_mob, (rng, state), jnp.arange(static_params.max_passive_mobs)
-    )
+    rng, state = move_passive_mobs(rng, state, params, static_params)
 
     # Move ranged_mobs
 
@@ -1854,16 +2141,16 @@ def update_mobs(rng, state, params, env_params, static_params):
         # Random move
         rng, _rng = jax.random.split(rng)
         valid_random_moves = in_bounds(
-            DIRECTIONS[1:5] + ranged_mobs.position[state.player_level, ranged_mob_index], 
+            DIRECTIONS[1:5] + ranged_mobs.position[state.level_index, ranged_mob_index], 
             static_params
         )
-        random_move_direction = jax.random.choice(
+        random_move_direction = random_choice(
             _rng,
             DIRECTIONS[1:5],
             p=valid_random_moves
         )
         random_move_proposed_position = (
-            ranged_mobs.position[state.player_level, ranged_mob_index]
+            ranged_mobs.position[state.level_index, ranged_mob_index]
             + random_move_direction
         )
 
@@ -1871,7 +2158,7 @@ def update_mobs(rng, state, params, env_params, static_params):
         player_move_direction = jnp.zeros((2,), dtype=jnp.int32)
         all_players_move_direction_abs = jnp.abs(
             state.player_position
-            - ranged_mobs.position[state.player_level, ranged_mob_index]
+            - ranged_mobs.position[state.level_index, ranged_mob_index]
         )
         distance_to_players = all_players_move_direction_abs.sum(axis=1)
         player_targetted = jnp.argmin(jnp.where(
@@ -1884,7 +2171,7 @@ def update_mobs(rng, state, params, env_params, static_params):
             player_move_direction_abs == player_move_direction_abs.max()
         ) / player_move_direction_abs.sum()
         rng, _rng = jax.random.split(rng)
-        player_move_direction_index = jax.random.choice(
+        player_move_direction_index = random_choice(
             _rng,
             jnp.arange(2),
             p=player_move_direction_index_p,
@@ -1895,15 +2182,15 @@ def update_mobs(rng, state, params, env_params, static_params):
         ].set(
             jnp.sign(
                 state.player_position[player_targetted, player_move_direction_index]
-                - ranged_mobs.position[state.player_level, ranged_mob_index, player_move_direction_index]
+                - ranged_mobs.position[state.level_index, ranged_mob_index, player_move_direction_index]
             ).astype(jnp.int32)
         )
         player_move_towards_proposed_position = (
-            ranged_mobs.position[state.player_level, ranged_mob_index]
+            ranged_mobs.position[state.level_index, ranged_mob_index]
             + player_move_direction
         )
         player_move_away_proposed_position = (
-            ranged_mobs.position[state.player_level, ranged_mob_index]
+            ranged_mobs.position[state.level_index, ranged_mob_index]
             - player_move_direction
         )
 
@@ -1934,19 +2221,19 @@ def update_mobs(rng, state, params, env_params, static_params):
         is_attacking_player = jnp.logical_not(far_from_player)
         is_attacking_player = jnp.logical_and(
             is_attacking_player,
-            ranged_mobs.attack_cooldown[state.player_level, ranged_mob_index] <= 0,
+            ranged_mobs.attack_cooldown[state.level_index, ranged_mob_index] <= 0,
         )
         is_attacking_player = jnp.logical_and(
-            is_attacking_player, ranged_mobs.mask[state.player_level, ranged_mob_index]
+            is_attacking_player, ranged_mobs.mask[state.level_index, ranged_mob_index]
         )
 
         # Spawn projectile
         can_spawn_projectile = (
-            state.mob_projectiles.mask[state.player_level].sum()
+            state.mob_projectiles.mask[state.level_index].sum()
             < static_params.max_mob_projectiles
         )
         new_projectile_position = ranged_mobs.position[
-            state.player_level, ranged_mob_index
+            state.level_index, ranged_mob_index
         ]
 
         is_spawning_projectile = jnp.logical_and(
@@ -1964,7 +2251,7 @@ def update_mobs(rng, state, params, env_params, static_params):
             ranged_mob_index,
             player_move_direction,
             RANGED_MOB_TYPE_TO_PROJECTILE_TYPE_MAPPING[
-                ranged_mobs.type_id[state.player_level, ranged_mob_index]
+                ranged_mobs.type_id[state.level_index, ranged_mob_index]
             ],
         )
 
@@ -1976,17 +2263,17 @@ def update_mobs(rng, state, params, env_params, static_params):
 
         proposed_position = jax.lax.select(
             is_attacking_player,
-            ranged_mobs.position[state.player_level, ranged_mob_index],
+            ranged_mobs.position[state.level_index, ranged_mob_index],
             proposed_position,
         )
 
         new_cooldown = jax.lax.select(
             is_attacking_player,
             4,
-            ranged_mobs.attack_cooldown[state.player_level, ranged_mob_index] - 1,
+            ranged_mobs.attack_cooldown[state.level_index, ranged_mob_index] - 1,
         )
 
-        mob_type = ranged_mobs.type_id[state.player_level, ranged_mob_index]
+        mob_type = ranged_mobs.type_id[state.level_index, ranged_mob_index]
         collision_map = MOB_TYPE_COLLISION_MAPPING[mob_type, 2]
         valid_move = is_position_in_bounds_not_in_mob_not_colliding(
             state, proposed_position[None, :], collision_map, static_params
@@ -2000,7 +2287,7 @@ def update_mobs(rng, state, params, env_params, static_params):
         position = jax.lax.select(
             valid_move,
             proposed_position,
-            ranged_mobs.position[state.player_level, ranged_mob_index],
+            ranged_mobs.position[state.level_index, ranged_mob_index],
         )
 
         should_not_despawn = distance_to_players < params.mob_despawn_distance
@@ -2014,43 +2301,43 @@ def update_mobs(rng, state, params, env_params, static_params):
 
         # Clear our old entry if we are alive
         new_mob_map = state.mob_map.at[
-            state.player_level,
-            state.ranged_mobs.position[state.player_level, ranged_mob_index, 0],
-            state.ranged_mobs.position[state.player_level, ranged_mob_index, 1],
+            state.level_index,
+            state.ranged_mobs.position[state.level_index, ranged_mob_index, 0],
+            state.ranged_mobs.position[state.level_index, ranged_mob_index, 1],
         ].set(
             jnp.logical_and(
                 state.mob_map[
-                    state.player_level,
-                    state.ranged_mobs.position[state.player_level, ranged_mob_index, 0],
-                    state.ranged_mobs.position[state.player_level, ranged_mob_index, 1],
+                    state.level_index,
+                    state.ranged_mobs.position[state.level_index, ranged_mob_index, 0],
+                    state.ranged_mobs.position[state.level_index, ranged_mob_index, 1],
                 ],
-                jnp.logical_not(ranged_mobs.mask[state.player_level, ranged_mob_index]),
+                jnp.logical_not(ranged_mobs.mask[state.level_index, ranged_mob_index]),
             )
         )
         new_mask = jnp.logical_and(
-            state.ranged_mobs.mask[state.player_level, ranged_mob_index],
+            state.ranged_mobs.mask[state.level_index, ranged_mob_index],
             should_not_despawn,
         )
         # Enter new entry if we are alive and not despawning this timestep
-        new_mob_map = new_mob_map.at[state.player_level, position[0], position[1]].set(
+        new_mob_map = new_mob_map.at[state.level_index, position[0], position[1]].set(
             jnp.logical_or(
-                new_mob_map[state.player_level, position[0], position[1]], new_mask
+                new_mob_map[state.level_index, position[0], position[1]], new_mask
             )
         )
 
         state = state.replace(
             ranged_mobs=state.ranged_mobs.replace(
                 position=state.ranged_mobs.position.at[
-                    state.player_level, ranged_mob_index
+                    state.level_index, ranged_mob_index
                 ].set(position),
                 attack_cooldown=state.ranged_mobs.attack_cooldown.at[
-                    state.player_level, ranged_mob_index
+                    state.level_index, ranged_mob_index
                 ].set(new_cooldown),
                 mask=state.ranged_mobs.mask.at[
-                    state.player_level, ranged_mob_index
+                    state.level_index, ranged_mob_index
                 ].set(
                     jnp.logical_and(
-                        state.ranged_mobs.mask[state.player_level, ranged_mob_index],
+                        state.ranged_mobs.mask[state.level_index, ranged_mob_index],
                         should_not_despawn,
                     )
                 ),
@@ -2066,294 +2353,15 @@ def update_mobs(rng, state, params, env_params, static_params):
             _move_ranged_mob,
             (rng, state),
             jnp.arange(static_params.max_ranged_mobs),
+            unroll=ENV_SCAN_UNROLL,
         )
 
     # Move projectiles
-    def _move_mob_projectile(rng_and_state, projectile_index):
-        rng, state = rng_and_state
-        projectiles = state.mob_projectiles
-
-        proposed_position = (
-            projectiles.position[state.player_level, projectile_index]
-            + state.mob_projectile_directions[state.player_level, projectile_index]
-        )
-
-
-        proposed_position_in_bounds = in_bounds(proposed_position[None, :], static_params)[0]
-        in_wall = is_in_solid_block(state.map[state.player_level], proposed_position[None, :])[0]
-        in_wall = jnp.logical_and(
-            in_wall,
-            jnp.logical_not(
-                state.map[state.player_level][
-                    proposed_position[0], proposed_position[1]
-                ]
-                == BlockType.WATER.value
-            ),
-        )  # Arrows can go over water
-        in_mob = is_in_mob(state, proposed_position[None, :])[0]
-
-        continue_move = jnp.logical_and(
-            proposed_position_in_bounds, jnp.logical_not(in_wall)
-        )
-        continue_move = jnp.logical_and(continue_move, jnp.logical_not(in_mob))
-
-        hit_player0 = jnp.logical_and(
-            (
-                projectiles.position[state.player_level, projectile_index]
-                == state.player_position
-            ).all(axis=1),
-            projectiles.mask[state.player_level, projectile_index],
-        )
-
-        proposed_position_in_player = (proposed_position == state.player_position).all(axis=1)
-        hit_player1 = jnp.logical_and(
-            proposed_position_in_player,
-            projectiles.mask[state.player_level, projectile_index],
-        )
-        hit_player = jnp.logical_or(hit_player0, hit_player1)
-        hit_player = jnp.logical_and(hit_player, state.player_alive)
-
-        continue_move = jnp.logical_and(continue_move, jnp.logical_not(hit_player.any()))
-
-        position = proposed_position
-
-        # Clear our old entry if we are alive
-        new_mask = jnp.logical_and(
-            continue_move, projectiles.mask[state.player_level, projectile_index]
-        )
-
-        hit_bench_or_furnace = jnp.logical_or(
-            state.map[state.player_level, position[0], position[1]]
-            == BlockType.FURNACE.value,
-            state.map[state.player_level, position[0], position[1]]
-            == BlockType.CRAFTING_TABLE.value,
-        )
-        removing_block = jnp.logical_and(
-            hit_bench_or_furnace, projectiles.mask[state.player_level, projectile_index]
-        )
-
-        new_block = jax.lax.select(
-            removing_block,
-            BlockType.PATH.value,
-            state.map[state.player_level, position[0], position[1]],
-        )
-
-        projectile_type = state.mob_projectiles.type_id[
-            state.player_level, projectile_index
-        ]
-        projectile_damage = get_damage_done_to_player(
-            state,
-            static_params,
-            MOB_TYPE_DAMAGE_MAPPING[projectile_type, MobType.PROJECTILE.value][None, :],
-        )
-
-        ranged_damage_taken = projectile_damage * hit_player
-
-        state = state.replace(
-            mob_projectiles=state.mob_projectiles.replace(
-                position=state.mob_projectiles.position.at[
-                    state.player_level, projectile_index
-                ].set(position),
-                mask=state.mob_projectiles.mask.at[
-                    state.player_level, projectile_index
-                ].set(new_mask),
-            ),
-            player_health=state.player_health - projectile_damage * hit_player,
-            is_sleeping=jnp.logical_and(state.is_sleeping, jnp.logical_not(hit_player)),
-            is_resting=jnp.logical_and(state.is_resting, jnp.logical_not(hit_player)),
-            log_predator_hit=jnp.maximum(
-                state.log_predator_hit,
-                hit_player.astype(state.log_predator_hit.dtype),
-            ),
-            map=state.map.at[state.player_level, position[0], position[1]].set(
-                new_block
-            ),
-        )
-
-        return (rng, state), None
+    rng, _rng = jax.random.split(rng)
+    state = move_mob_projectiles(state, static_params)
 
     rng, _rng = jax.random.split(rng)
-    (rng, state), _ = jax.lax.scan(
-        _move_mob_projectile,
-        (rng, state),
-        jnp.arange(static_params.max_mob_projectiles),
-    )
-
-    def _move_player_projectile(rng_and_state, projectile_index):
-        rng, state = rng_and_state
-        projectiles = state.player_projectiles
-
-        projectile_owner = state.player_projectile_owners[
-            state.player_level, projectile_index
-        ]
-
-        projectile_type = state.player_projectiles.type_id[
-            state.player_level, projectile_index
-        ]
-
-        projectile_damage_vector = (
-            MOB_TYPE_DAMAGE_MAPPING[projectile_type, MobType.PROJECTILE.value]
-            * projectiles.mask[state.player_level, projectile_index]
-        )
-
-        is_arrow = jnp.logical_or(
-            projectile_type == ProjectileType.ARROW.value,
-            projectile_type == ProjectileType.ARROW2.value,
-        )
-
-        # Bow enchantment
-        arrow_damage_add = jnp.zeros(3, dtype=jnp.float32)
-        arrow_damage_add = arrow_damage_add.at[state.bow_enchantment[projectile_owner]].set(
-            projectile_damage_vector[0] / 2
-        )
-        arrow_damage_add = arrow_damage_add.at[0].set(0)
-
-        projectile_damage_vector += jax.lax.select(
-            is_arrow,
-            arrow_damage_add,
-            jnp.zeros(3, dtype=jnp.float32),
-        )
-
-        # Apply attribute scaling
-        arrow_damage_coeff = 1 + 0.2 * (state.player_dexterity[projectile_owner] - 1)
-        magic_damage_coeff = 1 + 0.5 * (state.player_intelligence[projectile_owner] - 1)
-
-        projectile_damage_vector *= jax.lax.select(
-            is_arrow,
-            arrow_damage_coeff,
-            1.0,
-        )
-
-        projectile_damage_vector *= jax.lax.select(
-            projectile_type == ProjectileType.FIREBALL.value,
-            magic_damage_coeff,
-            1.0,
-        )
-
-        proposed_position = (
-            projectiles.position[state.player_level, projectile_index]
-            + state.player_projectile_directions[state.player_level, projectile_index]
-        )
-        
-        proposed_position_in_bounds = in_bounds(proposed_position[None, :], static_params)[0]
-        in_wall = is_in_solid_block(state.map[state.player_level], proposed_position[None, :])[0]
-        in_wall = jnp.logical_and(
-            in_wall,
-            jnp.logical_not(
-                state.map[state.player_level][
-                    proposed_position[0], proposed_position[1]
-                ]
-                == BlockType.WATER.value
-            ),
-        )  # Arrows can go over water
-
-        # Check if we hit a player
-        deal_damage = projectiles.mask[state.player_level, projectile_index]
-
-        per_player_contact = (state.player_position == proposed_position[None, :]).all(axis=-1)
-        did_attack_player = per_player_contact.any()    
-        player_attack_index = jnp.argmax(per_player_contact)
-
-        player_defense_vector = get_player_defense_vector(state)[player_attack_index]
-        # Match melee interaction semantics: only damage opposing team (different subclass)
-        shooter_team = state.player_sc[projectile_owner]
-        victim_team = state.player_sc[player_attack_index]
-        is_cross_team_hit = shooter_team != victim_team
-        player_damage_dealt = (
-            get_damage(projectile_damage_vector, player_defense_vector)
-            * did_attack_player
-            * env_params.friendly_fire
-            * is_cross_team_hit
-        )
-        new_player_health = state.player_health.at[player_attack_index].add(-player_damage_dealt)
-        
-        # Track projectile kills between teams
-        shooter_index = state.player_projectile_owners[state.player_level, projectile_index]
-        was_alive_victim = state.player_health[player_attack_index] > 0
-        is_now_dead_victim = new_player_health[player_attack_index] <= 0
-        # Only count if this projectile damage was the killing blow
-        death_caused_by_projectile = jnp.logical_and(
-            jnp.logical_and(was_alive_victim, is_now_dead_victim),
-            player_damage_dealt >= state.player_health[player_attack_index]  # Killing blow check
-        )
-        just_killed_projectile = jnp.logical_and(
-            death_caused_by_projectile,
-            shooter_team != victim_team  # Only count cross-team kills
-        )
-        # Attribute projectile kill to shooter's team
-        new_team_kills_projectile = state.team_kills.at[shooter_team].add(just_killed_projectile.astype(jnp.int32))
-        
-        state, did_attack_mob0, did_kill_mob0 = attack_mob(
-            state,
-            deal_damage,
-            projectiles.position[None, state.player_level, projectile_index],
-            projectile_damage_vector[None, :],
-            jnp.array([False]),
-            jnp.array([projectile_owner], dtype=jnp.int32),
-            env_params,
-        )
-        did_attack_mob0 = did_attack_mob0[0]
-
-        did_attack_mob = jnp.logical_or(did_attack_player, did_attack_mob0)
-
-        projectile_damage_vector = projectile_damage_vector * (1 - did_attack_mob0)
-
-        state, did_attack_mob1, did_kill_mob1 = attack_mob(
-            state,
-            deal_damage,
-            proposed_position[None, :],
-            projectile_damage_vector[None, :],
-            jnp.array([False]),
-            jnp.array([projectile_owner], dtype=jnp.int32),
-            env_params,
-        )
-        did_attack_mob1 = did_attack_mob1[0]
-
-        did_attack_mob = jnp.logical_or(did_attack_mob, did_attack_mob1)
-
-        continue_move = jnp.logical_and(
-            proposed_position_in_bounds, jnp.logical_not(in_wall)
-        )
-        continue_move = jnp.logical_and(continue_move, jnp.logical_not(did_attack_mob))
-        position = proposed_position
-
-        # Clear our old entry if we are alive
-        new_mask = jnp.logical_and(
-            continue_move, projectiles.mask[state.player_level, projectile_index]
-        )
-
-        ff_ranged_damage_taken = jnp.zeros(static_params.player_count, dtype=jnp.float32).at[
-            player_attack_index
-        ].add(player_damage_dealt)
-
-        # Track damage dealt to other team by shooter's team (projectile)
-        new_damage_dealt_projectile = state.damage_dealt_to_other_team.at[shooter_team].add(
-            player_damage_dealt * is_cross_team_hit
-        )
-
-        state = state.replace(
-            player_health=new_player_health,
-            team_kills=new_team_kills_projectile,
-            player_projectiles=state.player_projectiles.replace(
-                position=state.player_projectiles.position.at[
-                    state.player_level, projectile_index
-                ].set(position),
-                mask=state.player_projectiles.mask.at[
-                    state.player_level, projectile_index
-                ].set(new_mask),
-            ),
-            damage_taken_ff=state.damage_taken_ff + ff_ranged_damage_taken,
-            damage_dealt_to_other_team=new_damage_dealt_projectile,
-        )
-
-        return (rng, state), None
-
-    rng, _rng = jax.random.split(rng)
-    (rng, state), _ = jax.lax.scan(
-        _move_player_projectile,
-        (rng, state),
-        jnp.arange(static_params.max_player_projectiles),
-    )
+    state = move_player_projectiles(state, env_params, static_params)
 
     return state
 
@@ -2585,41 +2593,9 @@ def update_plants(state, static_params):
     growing_plants_age = state.growing_plants_age + 1
     growing_plants_age *= state.growing_plants_mask
 
-    finished_growing_plants = growing_plants_age >= 500
-
-    new_plant_blocks = jnp.where(
-        finished_growing_plants,
-        BlockType.RIPE_PLANT.value,
-        BlockType.PLANT.value,
-    )
-
-    def _set_plant_block(map, plant_index):
-        new_block = jax.lax.select(
-            finished_growing_plants[plant_index],
-            new_plant_blocks[plant_index],
-            map[
-                state.growing_plants_positions[plant_index][0],
-                state.growing_plants_positions[plant_index][1],
-            ],
-        )
-        map = map.at[
-            state.growing_plants_positions[plant_index][0],
-            state.growing_plants_positions[plant_index][1],
-        ].set(new_block)
-        return map, None
-
-    new_map, _ = jax.lax.scan(
-        _set_plant_block,
-        state.map[0],
-        jnp.arange(static_params.max_growing_plants),
-    )
-
-    new_whole_map = state.map.at[0].set(new_map)
-
-    state = state.replace(
-        map=new_whole_map,
-        growing_plants_age=growing_plants_age,
-    )
+    # Finished plants used to ripen on the overworld map (level 0) rather than on the played level,
+    # and the overworld is not stored, so only the ages change.
+    state = state.replace(growing_plants_age=growing_plants_age)
 
     return state
 
@@ -2655,17 +2631,17 @@ def spawn_mobs(state, rng, params, static_params):
         state.player_position, state.player_alive, static_params
     )
     grave_map = jnp.logical_or(
-        state.map[state.player_level] == BlockType.GRAVE.value,
+        state.map[state.level_index] == BlockType.GRAVE.value,
         jnp.logical_or(
-            state.map[state.player_level] == BlockType.GRAVE2.value,
-            state.map[state.player_level] == BlockType.GRAVE3.value,
+            state.map[state.level_index] == BlockType.GRAVE2.value,
+            state.map[state.level_index] == BlockType.GRAVE3.value,
         ),
     )
 
     floor_mob_spawn_chance = FLOOR_MOB_SPAWN_CHANCE
     monster_spawn_coeff = (
         1
-        + (state.monsters_killed[state.player_level] < MONSTERS_KILLED_TO_CLEAR_LEVEL)
+        + (state.monsters_killed[state.level_index] < MONSTERS_KILLED_TO_CLEAR_LEVEL)
         * 2
     )  # Triple spawn rate if we are on an uncleared level
 
@@ -2677,7 +2653,7 @@ def spawn_mobs(state, rng, params, static_params):
 
     # Passive mobs
     can_spawn_passive_mob = (
-        state.passive_mobs.mask[state.player_level].sum()
+        state.passive_mobs.mask[state.level_index].sum()
         < static_params.max_passive_mobs
     )
 
@@ -2692,14 +2668,14 @@ def spawn_mobs(state, rng, params, static_params):
     )
 
     all_valid_blocks_map = jnp.logical_or(
-        state.map[state.player_level] == BlockType.GRASS.value,
+        state.map[state.level_index] == BlockType.GRASS.value,
         jnp.logical_or(
-            state.map[state.player_level] == BlockType.PATH.value,
+            state.map[state.level_index] == BlockType.PATH.value,
             jnp.logical_or(
-                state.map[state.player_level] == BlockType.FIRE_GRASS.value,
+                state.map[state.level_index] == BlockType.FIRE_GRASS.value,
                 jnp.logical_or(
-                    state.map[state.player_level] == BlockType.ICE_GRASS.value,
-                    state.map[state.player_level] == BlockType.SNAIL_SPAWN.value,
+                    state.map[state.level_index] == BlockType.ICE_GRASS.value,
+                    state.map[state.level_index] == BlockType.SNAIL_SPAWN.value,
                 ),
             ),
         ),
@@ -2708,7 +2684,7 @@ def spawn_mobs(state, rng, params, static_params):
 
     # In dungeons (floors with SNAIL_SPAWN tiles), passives only spawn on those tiles.
     # On overworld/other floors, they spawn on any valid block.
-    snail_spawn_map = state.map[state.player_level] == BlockType.SNAIL_SPAWN.value
+    snail_spawn_map = state.map[state.level_index] == BlockType.SNAIL_SPAWN.value
     has_snail_tiles = snail_spawn_map.sum() > 0
     passive_mobs_can_spawn_map = jnp.where(
         has_snail_tiles,
@@ -2723,7 +2699,7 @@ def spawn_mobs(state, rng, params, static_params):
         passive_mobs_can_spawn_map, player_distance_map < params.mob_despawn_distance
     )
     passive_mobs_can_spawn_map = jnp.logical_and(
-        passive_mobs_can_spawn_map, jnp.logical_not(state.mob_map[state.player_level])
+        passive_mobs_can_spawn_map, jnp.logical_not(state.mob_map[state.level_index])
     )
 
     # Prevent spawning inside any agent's field of view
@@ -2757,7 +2733,7 @@ def spawn_mobs(state, rng, params, static_params):
     )
 
     rng, _rng = jax.random.split(rng)
-    passive_mob_position = jax.random.choice(
+    passive_mob_position = random_choice(
         _rng,
         jnp.arange(static_params.map_size[0] * static_params.map_size[1]),
         shape=(1,),
@@ -2772,51 +2748,51 @@ def spawn_mobs(state, rng, params, static_params):
     ).T.astype(jnp.int32)[0]
 
     new_passive_mob_index = jnp.argmax(
-        jnp.logical_not(state.passive_mobs.mask[state.player_level])
+        jnp.logical_not(state.passive_mobs.mask[state.level_index])
     )
 
     new_passive_mob_position = jax.lax.select(
         can_spawn_passive_mob,
         passive_mob_position,
-        state.passive_mobs.position[state.player_level, new_passive_mob_index],
+        state.passive_mobs.position[state.level_index, new_passive_mob_index],
     )
 
     new_passive_mob_health = jax.lax.select(
         can_spawn_passive_mob,
         MOB_TYPE_HEALTH_MAPPING[new_passive_mob_type, MobType.PASSIVE.value],
-        state.passive_mobs.health[state.player_level, new_passive_mob_index],
+        state.passive_mobs.health[state.level_index, new_passive_mob_index],
     )
 
     new_passive_mob_mask = jax.lax.select(
         can_spawn_passive_mob,
         True,
-        state.passive_mobs.mask[state.player_level, new_passive_mob_index],
+        state.passive_mobs.mask[state.level_index, new_passive_mob_index],
     )
 
     passive_mobs = Mobs(
         position=state.passive_mobs.position.at[
-            state.player_level, new_passive_mob_index
+            state.level_index, new_passive_mob_index
         ].set(new_passive_mob_position),
         health=state.passive_mobs.health.at[
-            state.player_level, new_passive_mob_index
+            state.level_index, new_passive_mob_index
         ].set(new_passive_mob_health),
-        mask=state.passive_mobs.mask.at[state.player_level, new_passive_mob_index].set(
+        mask=state.passive_mobs.mask.at[state.level_index, new_passive_mob_index].set(
             new_passive_mob_mask
         ),
         attack_cooldown=state.passive_mobs.attack_cooldown,
         type_id=state.passive_mobs.type_id.at[
-            state.player_level, new_passive_mob_index
+            state.level_index, new_passive_mob_index
         ].set(new_passive_mob_type),
     )
 
     state = state.replace(
         passive_mobs=passive_mobs,
         mob_map=state.mob_map.at[
-            state.player_level, new_passive_mob_position[0], new_passive_mob_position[1]
+            state.level_index, new_passive_mob_position[0], new_passive_mob_position[1]
         ].set(
             jnp.logical_or(
                 state.mob_map[
-                    state.player_level,
+                    state.level_index,
                     new_passive_mob_position[0],
                     new_passive_mob_position[1],
                 ],
@@ -2840,7 +2816,7 @@ def spawn_mobs(state, rng, params, static_params):
 
     # Melee mobs
     can_spawn_melee_mob = (
-        state.melee_mobs.mask[state.player_level].sum()
+        state.melee_mobs.mask[state.level_index].sum()
         < static_params.max_melee_mobs
     )
 
@@ -2874,7 +2850,7 @@ def spawn_mobs(state, rng, params, static_params):
         melee_mobs_can_spawn_map, monsters_can_spawn_player_range_map
     )
     melee_mobs_can_spawn_map = jnp.logical_and(
-        melee_mobs_can_spawn_map, jnp.logical_not(state.mob_map[state.player_level])
+        melee_mobs_can_spawn_map, jnp.logical_not(state.mob_map[state.level_index])
     )
     melee_mobs_can_spawn_map = melee_mobs_can_spawn_map.at[
         state.player_position[:, 0], state.player_position[:, 1]
@@ -2885,7 +2861,7 @@ def spawn_mobs(state, rng, params, static_params):
     )
 
     rng, _rng = jax.random.split(rng)
-    melee_mob_position = jax.random.choice(
+    melee_mob_position = random_choice(
         _rng,
         jnp.arange(static_params.map_size[0] * static_params.map_size[1]),
         shape=(1,),
@@ -2899,51 +2875,51 @@ def spawn_mobs(state, rng, params, static_params):
     ).T.astype(jnp.int32)[0]
 
     new_melee_mob_index = jnp.argmax(
-        jnp.logical_not(state.melee_mobs.mask[state.player_level])
+        jnp.logical_not(state.melee_mobs.mask[state.level_index])
     )
 
     new_melee_mob_position = jax.lax.select(
         can_spawn_melee_mob,
         melee_mob_position,
-        state.melee_mobs.position[state.player_level, new_melee_mob_index],
+        state.melee_mobs.position[state.level_index, new_melee_mob_index],
     )
 
     new_melee_mob_health = jax.lax.select(
         can_spawn_melee_mob,
         MOB_TYPE_HEALTH_MAPPING[new_melee_mob_type, MobType.MELEE.value],
-        state.melee_mobs.health[state.player_level, new_melee_mob_index],
+        state.melee_mobs.health[state.level_index, new_melee_mob_index],
     )
 
     new_melee_mob_mask = jax.lax.select(
         can_spawn_melee_mob,
         True,
-        state.melee_mobs.mask[state.player_level, new_melee_mob_index],
+        state.melee_mobs.mask[state.level_index, new_melee_mob_index],
     )
 
     melee_mobs = Mobs(
         position=state.melee_mobs.position.at[
-            state.player_level, new_melee_mob_index
+            state.level_index, new_melee_mob_index
         ].set(new_melee_mob_position),
-        health=state.melee_mobs.health.at[state.player_level, new_melee_mob_index].set(
+        health=state.melee_mobs.health.at[state.level_index, new_melee_mob_index].set(
             new_melee_mob_health
         ),
-        mask=state.melee_mobs.mask.at[state.player_level, new_melee_mob_index].set(
+        mask=state.melee_mobs.mask.at[state.level_index, new_melee_mob_index].set(
             new_melee_mob_mask
         ),
         attack_cooldown=state.melee_mobs.attack_cooldown,
         type_id=state.melee_mobs.type_id.at[
-            state.player_level, new_melee_mob_index
+            state.level_index, new_melee_mob_index
         ].set(new_melee_mob_type),
     )
 
     state = state.replace(
         melee_mobs=melee_mobs,
         mob_map=state.mob_map.at[
-            state.player_level, new_melee_mob_position[0], new_melee_mob_position[1]
+            state.level_index, new_melee_mob_position[0], new_melee_mob_position[1]
         ].set(
             jnp.logical_or(
                 state.mob_map[
-                    state.player_level,
+                    state.level_index,
                     new_melee_mob_position[0],
                     new_melee_mob_position[1],
                 ],
@@ -2955,7 +2931,7 @@ def spawn_mobs(state, rng, params, static_params):
     # Ranged mobs (guard against zero slot configuration)
     if static_params.max_ranged_mobs > 0:
         can_spawn_ranged_mob = (
-            state.ranged_mobs.mask[state.player_level].sum()
+            state.ranged_mobs.mask[state.level_index].sum()
             < static_params.max_ranged_mobs
         )
 
@@ -2980,7 +2956,7 @@ def spawn_mobs(state, rng, params, static_params):
         # Hack for deep thing
         ranged_mobs_can_spawn_map = jax.lax.select(
             new_ranged_mob_type == 5,
-            state.map[state.player_level] == BlockType.WATER.value,
+            state.map[state.level_index] == BlockType.WATER.value,
             all_valid_blocks_map,
         )
         ranged_mobs_can_spawn_map = jax.lax.select(
@@ -2991,7 +2967,7 @@ def spawn_mobs(state, rng, params, static_params):
             ranged_mobs_can_spawn_map, monsters_can_spawn_player_range_map
         )
         ranged_mobs_can_spawn_map = jnp.logical_and(
-            ranged_mobs_can_spawn_map, jnp.logical_not(state.mob_map[state.player_level])
+            ranged_mobs_can_spawn_map, jnp.logical_not(state.mob_map[state.level_index])
         )
         ranged_mobs_can_spawn_map = ranged_mobs_can_spawn_map.at[
             state.player_position[:, 0], state.player_position[:, 1]
@@ -3002,7 +2978,7 @@ def spawn_mobs(state, rng, params, static_params):
         )
 
         rng, _rng = jax.random.split(rng)
-        ranged_mob_position = jax.random.choice(
+        ranged_mob_position = random_choice(
             _rng,
             jnp.arange(static_params.map_size[0] * static_params.map_size[1]),
             shape=(1,),
@@ -3017,51 +2993,51 @@ def spawn_mobs(state, rng, params, static_params):
         ).T.astype(jnp.int32)[0]
 
         new_ranged_mob_index = jnp.argmax(
-            jnp.logical_not(state.ranged_mobs.mask[state.player_level])
+            jnp.logical_not(state.ranged_mobs.mask[state.level_index])
         )
 
         new_ranged_mob_position = jax.lax.select(
             can_spawn_ranged_mob,
             ranged_mob_position,
-            state.ranged_mobs.position[state.player_level, new_ranged_mob_index],
+            state.ranged_mobs.position[state.level_index, new_ranged_mob_index],
         )
 
         new_ranged_mob_health = jax.lax.select(
             can_spawn_ranged_mob,
             MOB_TYPE_HEALTH_MAPPING[new_ranged_mob_type, MobType.RANGED.value],
-            state.ranged_mobs.health[state.player_level, new_ranged_mob_index],
+            state.ranged_mobs.health[state.level_index, new_ranged_mob_index],
         )
 
         new_ranged_mob_mask = jax.lax.select(
             can_spawn_ranged_mob,
             True,
-            state.ranged_mobs.mask[state.player_level, new_ranged_mob_index],
+            state.ranged_mobs.mask[state.level_index, new_ranged_mob_index],
         )
 
         ranged_mobs = Mobs(
             position=state.ranged_mobs.position.at[
-                state.player_level, new_ranged_mob_index
+                state.level_index, new_ranged_mob_index
             ].set(new_ranged_mob_position),
             health=state.ranged_mobs.health.at[
-                state.player_level, new_ranged_mob_index
+                state.level_index, new_ranged_mob_index
             ].set(new_ranged_mob_health),
-            mask=state.ranged_mobs.mask.at[state.player_level, new_ranged_mob_index].set(
+            mask=state.ranged_mobs.mask.at[state.level_index, new_ranged_mob_index].set(
                 new_ranged_mob_mask
             ),
             attack_cooldown=state.ranged_mobs.attack_cooldown,
             type_id=state.ranged_mobs.type_id.at[
-                state.player_level, new_ranged_mob_index
+                state.level_index, new_ranged_mob_index
             ].set(new_ranged_mob_type),
         )
 
         state = state.replace(
             ranged_mobs=ranged_mobs,
             mob_map=state.mob_map.at[
-                state.player_level, new_ranged_mob_position[0], new_ranged_mob_position[1]
+                state.level_index, new_ranged_mob_position[0], new_ranged_mob_position[1]
             ].set(
                 jnp.logical_or(
                     state.mob_map[
-                        state.player_level,
+                        state.level_index,
                         new_ranged_mob_position[0],
                         new_ranged_mob_position[1],
                     ],
@@ -3091,7 +3067,7 @@ def shoot_projectile(state: EnvState, action: int, static_params: StaticEnvParam
                 state.inventory.bow[player_index] >= 1,
                 jnp.logical_and(
                     state.inventory.arrows[player_index] >= 1,
-                    player_projectiles.mask[state.player_level].sum()
+                    player_projectiles.mask[state.level_index].sum()
                     < static_params.max_player_projectiles,
                 ),
             ),
@@ -3158,7 +3134,7 @@ def cast_spell(state, action, static_params):
             is_casting_fireball,
             jnp.logical_and(
                 jnp.logical_or(jnp.logical_or(is_miner[player_index], is_warrior[player_index]), is_forager[player_index]),
-                player_projectiles.mask[state.player_level].sum()
+                player_projectiles.mask[state.level_index].sum()
                 < static_params.max_player_projectiles,
             )
         )
@@ -3344,7 +3320,7 @@ def read_book(state, action):
 def enchant(rng, state: EnvState, action, static_params: StaticEnvParams):
     target_block_position = state.player_position + DIRECTIONS[state.player_direction]
     target_block = state.map[
-        state.player_level, target_block_position[:, 0], target_block_position[:, 1]
+        state.level_index, target_block_position[:, 0], target_block_position[:, 1]
     ]
     target_block_is_enchantment_table = jnp.logical_or(
         target_block == BlockType.ENCHANTMENT_TABLE_FIRE.value,
@@ -3403,8 +3379,8 @@ def enchant(rng, state: EnvState, action, static_params: StaticEnvParams):
 
     _rngs = jax.random.split(rng, static_params.player_count+1)
     rng, _rng = _rngs[0], _rngs[1:]
-    armour_target = jax.vmap(jax.random.choice, in_axes=(0, None, None, None, 0))(
-        _rng, jnp.arange(4), (), True, armour_targets
+    armour_target = jax.vmap(random_choice, in_axes=(0, None, 0))(
+        _rng, jnp.arange(4), armour_targets
     )
 
     is_enchanting = jnp.logical_or(

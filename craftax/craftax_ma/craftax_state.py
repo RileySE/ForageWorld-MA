@@ -124,6 +124,11 @@ class EnvState:
 
     fractal_noise_angles: tuple[int, int, int, int] = (None, None, None, None)
 
+    @property
+    def level_index(self):
+        """Index of the current level in the per-level arrays (this env stores every level)."""
+        return self.player_level
+
 
 @struct.dataclass
 class EnvParams:
