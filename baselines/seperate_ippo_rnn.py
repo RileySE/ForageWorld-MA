@@ -213,6 +213,41 @@ class LossAux(NamedTuple):
     loss_actor_per_agent: jnp.ndarray
     entropy_per_agent: jnp.ndarray
     aux_loss_per_agent: jnp.ndarray
+    aux_self_error: jnp.ndarray
+    aux_teammate_error: jnp.ndarray
+    aux_self_error_per_agent: jnp.ndarray
+    aux_teammate_error_per_agent: jnp.ndarray
+
+def build_aux_loss_masks(num_agents, agents_per_team, use_self_aux, use_teammate_aux,
+                         self_weight, teammate_weight):
+    """Per-agent masks over the auxiliary-prediction outputs.
+
+    Aux outputs per agent: 2 (self dx, dy) when teammate prediction is off, or
+    agents_per_team * 2 when it is on. In the latter case the agent's own team slot
+    (agent % agents_per_team) holds the self target and the other slots hold the
+    teammates' positions relative to the agent.
+
+    Returns (weight_mask, self_dims, teammate_dims, num_teammates); the first three
+    have shape (num_agents, aux_output_dim):
+      weight_mask   - loss weight per output: self_weight on the self outputs and
+                      teammate_weight on the teammate outputs, 0 for a term that is off
+      self_dims     - 1 on the agent's own (dx, dy) outputs
+      teammate_dims - 1 on the teammate outputs
+    """
+    aux_output_dim = agents_per_team * 2 if use_teammate_aux else 2
+    self_dims = np.zeros((num_agents, aux_output_dim))
+    teammate_dims = np.zeros((num_agents, aux_output_dim))
+    for i in range(num_agents):
+        self_slot = i % agents_per_team if use_teammate_aux else 0
+        for slot in range(aux_output_dim // 2):
+            dims = self_dims if slot == self_slot else teammate_dims
+            dims[i, 2 * slot] = 1.0
+            dims[i, 2 * slot + 1] = 1.0
+    w_self = self_weight if use_self_aux else 0.0
+    w_team = teammate_weight if use_teammate_aux else 0.0
+    weight_mask = w_self * self_dims + w_team * teammate_dims
+    num_teammates = agents_per_team - 1 if use_teammate_aux else 0
+    return weight_mask, self_dims, teammate_dims, num_teammates
 
 def batchify(x: dict, agent_list):
     """Stack agent observations, preserving agent dimension.
@@ -335,31 +370,28 @@ def make_train(config, env, wandb_start_step=-1):
     # Auxiliary loss configuration
     _n = env.num_agents
     _agents_per_team = len(config.get("TEAM_COMPOSITION", [1, 1, 2]))
-    _aux_self_w = config.get("AUX_SELF_WEIGHT", 1.0)
+    # Self and teammate prediction are separate terms with their own on/off toggle and
+    # weight. The terms are summed (see the aux loss in _loss_fn), so a weight of 0 is the
+    # same objective as turning that term off. By default self is weighted 2x teammates.
+    _use_self_aux = config.get("USE_SELF_AUXILIARY_LOSS", True)
     _use_teammate_aux = config.get("USE_TEAMMATE_AUXILIARY_LOSS", True)
-    _aux_team_w = config.get("AUX_TEAMMATE_WEIGHT", 1/3) if _use_teammate_aux else 0.0
+    _aux_self_w = float(config.get("AUX_SELF_WEIGHT", 1.0))
+    _aux_team_w = float(config.get("AUX_TEAMMATE_WEIGHT", 0.5))
+    if _aux_self_w < 0 or _aux_team_w < 0:
+        raise ValueError(
+            f"AUX_SELF_WEIGHT and AUX_TEAMMATE_WEIGHT must be >= 0, got {_aux_self_w} and {_aux_team_w}."
+        )
 
     # AUX_OUTPUT_DIM: number of aux output values per agent
     # Self-only: 2 (dx, dy). With teammates: agents_per_team * 2.
-    if _use_teammate_aux:
-        config["AUX_OUTPUT_DIM"] = _agents_per_team * 2
-    else:
-        config["AUX_OUTPUT_DIM"] = 2
+    _aux_wm, _aux_self_dims, _aux_team_dims, _n_teammates = build_aux_loss_masks(
+        _n, _agents_per_team, _use_self_aux, _use_teammate_aux, _aux_self_w, _aux_team_w
+    )
+    config["AUX_OUTPUT_DIM"] = _aux_wm.shape[1]
     _aux_output_dim = config["AUX_OUTPUT_DIM"]
-
-    # Build auxiliary loss weight mask: (num_agents, AUX_OUTPUT_DIM)
-    _aux_wm = np.zeros((_n, _aux_output_dim))
-    if _use_teammate_aux:
-        for _i in range(_n):
-            _self_team_idx = _i % _agents_per_team
-            for _j in range(_agents_per_team):
-                w = _aux_self_w if _j == _self_team_idx else _aux_team_w
-                _aux_wm[_i, _j * 2] = w
-                _aux_wm[_i, _j * 2 + 1] = w
-    else:
-        _aux_wm[:, 0] = _aux_self_w
-        _aux_wm[:, 1] = _aux_self_w
-    aux_weight_mask = jnp.array(_aux_wm)  # (num_agents, AUX_OUTPUT_DIM)
+    aux_weight_mask = jnp.array(_aux_wm)            # (num_agents, AUX_OUTPUT_DIM) loss weights
+    aux_self_dims = jnp.array(_aux_self_dims)       # (num_agents, AUX_OUTPUT_DIM) 1 on self outputs
+    aux_teammate_dims = jnp.array(_aux_team_dims)   # (num_agents, AUX_OUTPUT_DIM) 1 on teammate outputs
 
     # Precompute team structure arrays for aux target computation
     if _use_teammate_aux:
@@ -853,12 +885,25 @@ def make_train(config, env, wandb_start_step=-1):
                         entropy_per_agent = entropy_per_elem.mean(axis=(1, 2))  # (num_agents,)
                         entropy = entropy_per_agent.mean()  # scalar for gradient
 
-                        # Calculate auxiliary loss (predict self-displacement + optionally teammate positions)
+                        # Auxiliary loss (predict self-displacement + optionally teammate positions).
                         # aux, train_batch.deltas_to_start: (num_steps, num_agents, num_envs_minibatch, AUX_OUTPUT_DIM)
-                        # aux_weight_mask: (num_agents, AUX_OUTPUT_DIM) -> broadcast (1, num_agents, 1, AUX_OUTPUT_DIM)
-                        aux_loss_per_elem = jnp.square(aux - train_batch.deltas_to_start) * aux_weight_mask[None, :, None, :]
-                        aux_loss_per_agent = aux_loss_per_elem.mean(axis=(0, 2, 3))  # (num_agents,)
+                        # For each datapoint (step, env) the weighted squared errors are SUMMED over the
+                        # outputs, then averaged over datapoints. Summing keeps each term's weight
+                        # independent of how many outputs exist.
+                        aux_sq_err = jnp.square(aux - train_batch.deltas_to_start)
+                        aux_loss_per_agent = (
+                            (aux_sq_err * aux_weight_mask[None, :, None, :]).sum(axis=3).mean(axis=(0, 2))
+                        )  # (num_agents,)
                         aux_loss = aux_loss_per_agent.mean()  # scalar for gradient
+                        # Unweighted errors, for logging only: squared distance error of the self
+                        # prediction, and of the teammate predictions per teammate (0 if teammates off).
+                        aux_self_error_per_agent = (
+                            (aux_sq_err * aux_self_dims[None, :, None, :]).sum(axis=3).mean(axis=(0, 2))
+                        )
+                        aux_teammate_error_per_agent = (
+                            (aux_sq_err * aux_teammate_dims[None, :, None, :]).sum(axis=3).mean(axis=(0, 2))
+                            / max(_n_teammates, 1)
+                        )
 
                         # debug - per agent
                         approx_kl_per_agent = ((ratio - 1) - logratio).mean(axis=(0, 2))  # (num_agents,)
@@ -888,6 +933,10 @@ def make_train(config, env, wandb_start_step=-1):
                             loss_actor_per_agent=loss_actor_per_agent,
                             entropy_per_agent=entropy_per_agent,
                             aux_loss_per_agent=aux_loss_per_agent,
+                            aux_self_error=aux_self_error_per_agent.mean(),
+                            aux_teammate_error=aux_teammate_error_per_agent.mean(),
+                            aux_self_error_per_agent=aux_self_error_per_agent,
+                            aux_teammate_error_per_agent=aux_teammate_error_per_agent,
                         )
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
@@ -971,6 +1020,8 @@ def make_train(config, env, wandb_start_step=-1):
             actor_loss_per_agent = loss_aux.loss_actor_per_agent.mean(axis=(0, 1))
             entropy_per_agent = loss_aux.entropy_per_agent.mean(axis=(0, 1))
             aux_loss_per_agent = loss_aux.aux_loss_per_agent.mean(axis=(0, 1))
+            aux_self_error_per_agent = loss_aux.aux_self_error_per_agent.mean(axis=(0, 1))
+            aux_teammate_error_per_agent = loss_aux.aux_teammate_error_per_agent.mean(axis=(0, 1))
 
             # Global mean for backward compatibility
             loss_info_mean = jax.tree.map(lambda x: x.mean(), loss_info)
@@ -997,6 +1048,8 @@ def make_train(config, env, wandb_start_step=-1):
                     "approx_kl": loss_aux_mean.approx_kl,
                     "clip_frac": loss_aux_mean.clip_frac,
                     "aux_loss": loss_aux_mean.aux_loss,
+                    "aux_self_error": loss_aux_mean.aux_self_error,
+                    "aux_teammate_error": loss_aux_mean.aux_teammate_error,
                 },
                 "loss_per_agent": {
                     "total_loss": total_loss_per_agent,      # (num_agents,)
@@ -1004,6 +1057,8 @@ def make_train(config, env, wandb_start_step=-1):
                     "actor_loss": actor_loss_per_agent,      # (num_agents,)
                     "entropy": entropy_per_agent,            # (num_agents,)
                     "aux_loss": aux_loss_per_agent,          # (num_agents,)
+                    "aux_self_error": aux_self_error_per_agent,          # (num_agents,)
+                    "aux_teammate_error": aux_teammate_error_per_agent,  # (num_agents,)
                 },
                 "finished_episodes": finished_count,  # (num_agents,)
                 "episode_means": jax.tree.map(  # every leaf: (num_agents,)
@@ -1070,12 +1125,14 @@ def make_train(config, env, wandb_start_step=-1):
                 to_log["overview/env_step"] = env_step
                 # ML global metrics
                 for k in ["total_loss", "value_loss", "actor_loss", "entropy",
-                           "ratio", "ratio_0", "approx_kl", "clip_frac", "aux_loss"]:
+                           "ratio", "ratio_0", "approx_kl", "clip_frac", "aux_loss",
+                           "aux_self_error", "aux_teammate_error"]:
                     to_log[f"overview/{k}"] = metrics["loss"][k]
 
                 # ── agent_{i}/ ML losses ──
                 for i in range(num_agents):
-                    for k in ["total_loss", "value_loss", "actor_loss", "entropy", "aux_loss"]:
+                    for k in ["total_loss", "value_loss", "actor_loss", "entropy", "aux_loss",
+                              "aux_self_error", "aux_teammate_error"]:
                         to_log[f"agent_{i}/{k}"] = np.asarray(metrics["loss_per_agent"][k][i]).item()
 
                 # ── Pruning: fraction of each agent's prunable weights that are pruned ──
