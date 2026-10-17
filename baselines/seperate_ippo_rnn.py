@@ -229,8 +229,10 @@ def build_aux_loss_masks(num_agents, agents_per_team, use_self_aux, use_teammate
 
     Returns (weight_mask, self_dims, teammate_dims, num_teammates); the first three
     have shape (num_agents, aux_output_dim):
-      weight_mask   - loss weight per output: self_weight on the self outputs and
-                      teammate_weight on the teammate outputs, 0 for a term that is off
+      weight_mask   - loss weight per output: self_weight on the self outputs; on the
+                      teammate outputs, teammate_weight split evenly across the
+                      teammates (so the teammate weights sum to teammate_weight);
+                      0 for a term that is off
       self_dims     - 1 on the agent's own (dx, dy) outputs
       teammate_dims - 1 on the teammate outputs
     """
@@ -244,9 +246,10 @@ def build_aux_loss_masks(num_agents, agents_per_team, use_self_aux, use_teammate
             dims[i, 2 * slot] = 1.0
             dims[i, 2 * slot + 1] = 1.0
     w_self = self_weight if use_self_aux else 0.0
-    w_team = teammate_weight if use_teammate_aux else 0.0
-    weight_mask = w_self * self_dims + w_team * teammate_dims
     num_teammates = agents_per_team - 1 if use_teammate_aux else 0
+    # teammate_weight is the total weight on teammate prediction, shared equally by the teammates.
+    w_team = teammate_weight / max(num_teammates, 1) if use_teammate_aux else 0.0
+    weight_mask = w_self * self_dims + w_team * teammate_dims
     return weight_mask, self_dims, teammate_dims, num_teammates
 
 def batchify(x: dict, agent_list):
@@ -372,7 +375,9 @@ def make_train(config, env, wandb_start_step=-1):
     _agents_per_team = len(config.get("TEAM_COMPOSITION", [1, 1, 2]))
     # Self and teammate prediction are separate terms with their own on/off toggle and
     # weight. The terms are summed (see the aux loss in _loss_fn), so a weight of 0 is the
-    # same objective as turning that term off. By default self is weighted 2x teammates.
+    # same objective as turning that term off. AUX_TEAMMATE_WEIGHT is the total weight on
+    # teammate prediction, split evenly across teammates, so by default (1.0 vs 0.5) the
+    # self weight is twice the sum of the teammate weights.
     _use_self_aux = config.get("USE_SELF_AUXILIARY_LOSS", True)
     _use_teammate_aux = config.get("USE_TEAMMATE_AUXILIARY_LOSS", True)
     _aux_self_w = float(config.get("AUX_SELF_WEIGHT", 1.0))
