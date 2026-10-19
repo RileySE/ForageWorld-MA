@@ -222,10 +222,11 @@ def build_aux_loss_masks(num_agents, agents_per_team, use_self_aux, use_teammate
                          self_weight, teammate_weight):
     """Per-agent masks over the auxiliary-prediction outputs.
 
-    Aux outputs per agent: 2 (self dx, dy) when teammate prediction is off, or
-    agents_per_team * 2 when it is on. In the latter case the agent's own team slot
-    (agent % agents_per_team) holds the self target and the other slots hold the
-    teammates' positions relative to the agent.
+    Aux outputs per agent: always agents_per_team * 2, whatever the toggles, so the
+    network, the targets and the CSV columns are the same in every run. The agent's
+    own team slot (agent % agents_per_team) holds the self target and the other slots
+    hold the teammates' positions relative to the agent. The toggles only set the
+    corresponding loss weights to 0.
 
     Returns (weight_mask, self_dims, teammate_dims, num_teammates); the first three
     have shape (num_agents, aux_output_dim):
@@ -236,17 +237,17 @@ def build_aux_loss_masks(num_agents, agents_per_team, use_self_aux, use_teammate
       self_dims     - 1 on the agent's own (dx, dy) outputs
       teammate_dims - 1 on the teammate outputs
     """
-    aux_output_dim = agents_per_team * 2 if use_teammate_aux else 2
+    aux_output_dim = agents_per_team * 2
     self_dims = np.zeros((num_agents, aux_output_dim))
     teammate_dims = np.zeros((num_agents, aux_output_dim))
     for i in range(num_agents):
-        self_slot = i % agents_per_team if use_teammate_aux else 0
+        self_slot = i % agents_per_team
         for slot in range(aux_output_dim // 2):
             dims = self_dims if slot == self_slot else teammate_dims
             dims[i, 2 * slot] = 1.0
             dims[i, 2 * slot + 1] = 1.0
     w_self = self_weight if use_self_aux else 0.0
-    num_teammates = agents_per_team - 1 if use_teammate_aux else 0
+    num_teammates = agents_per_team - 1
     # teammate_weight is the total weight on teammate prediction, shared equally by the teammates.
     w_team = teammate_weight / max(num_teammates, 1) if use_teammate_aux else 0.0
     weight_mask = w_self * self_dims + w_team * teammate_dims
@@ -398,15 +399,15 @@ def make_train(config, env, wandb_start_step=-1):
     aux_self_dims = jnp.array(_aux_self_dims)       # (num_agents, AUX_OUTPUT_DIM) 1 on self outputs
     aux_teammate_dims = jnp.array(_aux_team_dims)   # (num_agents, AUX_OUTPUT_DIM) 1 on teammate outputs
 
-    # Precompute team structure arrays for aux target computation
-    if _use_teammate_aux:
-        # _team_indices[i] = global indices of agent i's team members
-        _team_indices = np.array([
-            [(i // _agents_per_team) * _agents_per_team + j for j in range(_agents_per_team)]
-            for i in range(_n)
-        ])  # (N, agents_per_team)
-        _self_team_idx_arr = np.arange(_n) % _agents_per_team  # (N,)
-        _eye_team_4d = (np.arange(_agents_per_team)[None, :] == _self_team_idx_arr[:, None])[None, :, :, None]  # (1, N, apt, 1)
+    # Precompute team structure arrays for aux target computation (always: the aux outputs,
+    # targets and CSV columns cover every team slot regardless of the aux toggles).
+    # _team_indices[i] = global indices of agent i's team members
+    _team_indices = np.array([
+        [(i // _agents_per_team) * _agents_per_team + j for j in range(_agents_per_team)]
+        for i in range(_n)
+    ])  # (N, agents_per_team)
+    _self_team_idx_arr = np.arange(_n) % _agents_per_team  # (N,)
+    _eye_team_4d = (np.arange(_agents_per_team)[None, :] == _self_team_idx_arr[:, None])[None, :, :, None]  # (1, N, apt, 1)
 
     _lr_anneal_updates = config.get("LR_ANNEAL_UPDATES", config["NUM_UPDATES"])
     def linear_schedule(count):
@@ -621,22 +622,18 @@ def make_train(config, env, wandb_start_step=-1):
             all_spawn = env_state.env_state.player_spawn_position
             self_delta = all_pos - all_spawn  # (num_envs, N, 2)
 
-            if _use_teammate_aux:
-                # For each agent i, predict team-local positions at t+1:
-                #   slot k (k == self_team_idx): self displacement from spawn
-                #   slot k (k != self_team_idx): teammate k's position relative to self
-                team_pos = all_pos[:, _team_indices, :]  # (num_envs, N, agents_per_team, 2)
-                rel_pos = team_pos - all_pos[:, :, None, :]  # (num_envs, N, agents_per_team, 2)
-                aux_targets = jnp.where(_eye_team_4d, jnp.expand_dims(self_delta, 2), rel_pos)
-                # (num_envs, N, apt, 2) -> (num_envs, N, apt*2) -> (N, num_envs, apt*2)
-                deltas_to_start = jnp.transpose(
-                    aux_targets.reshape(aux_targets.shape[0], _n, _agents_per_team * 2),
-                    (1, 0, 2)
-                )
-            else:
-                # Self-only: predict own displacement from spawn at t+1
-                # (num_envs, N, 2) -> (N, num_envs, 2)
-                deltas_to_start = jnp.transpose(self_delta, (1, 0, 2))
+            # For each agent i, predict team-local positions at t+1 (always all slots; the
+            # aux toggles only zero the loss weights):
+            #   slot k (k == self_team_idx): self displacement from spawn
+            #   slot k (k != self_team_idx): teammate k's position relative to self
+            team_pos = all_pos[:, _team_indices, :]  # (num_envs, N, agents_per_team, 2)
+            rel_pos = team_pos - all_pos[:, :, None, :]  # (num_envs, N, agents_per_team, 2)
+            aux_targets = jnp.where(_eye_team_4d, jnp.expand_dims(self_delta, 2), rel_pos)
+            # (num_envs, N, apt, 2) -> (num_envs, N, apt*2) -> (N, num_envs, apt*2)
+            deltas_to_start = jnp.transpose(
+                aux_targets.reshape(aux_targets.shape[0], _n, _agents_per_team * 2),
+                (1, 0, 2)
+            )
 
             transition = Transition(
                 jnp.tile(done["__all__"][np.newaxis, :], (env.num_agents, 1)),  # (num_agents, num_envs)
@@ -663,27 +660,20 @@ def make_train(config, env, wandb_start_step=-1):
                 # Auxiliary predictions and ground truth for CSV logging
                 # aux_pred: (num_agents, 1, num_envs, AUX_OUTPUT_DIM) -> squeeze
                 aux_pred_squeezed = aux_pred.squeeze(axis=1)  # (num_agents, num_envs, AUX_OUTPUT_DIM)
-                if _use_teammate_aux:
-                    # deltas_to_start: (num_agents, num_envs, agents_per_team*2)
-                    # Self-delta is at team-local slot _self_team_idx_arr[i]
-                    _aidx = jnp.arange(env.num_agents)
-                    _stidx = jnp.array(_self_team_idx_arr)
-                    info['delta_x'] = deltas_to_start[_aidx, :, _stidx * 2]            # (num_agents, num_envs)
-                    info['delta_y'] = deltas_to_start[_aidx, :, _stidx * 2 + 1]        # (num_agents, num_envs)
-                    info['pred_delta_x'] = aux_pred_squeezed[_aidx, :, _stidx * 2]     # (num_agents, num_envs)
-                    info['pred_delta_y'] = aux_pred_squeezed[_aidx, :, _stidx * 2 + 1] # (num_agents, num_envs)
-                    # Per team-local slot logging
-                    for _j in range(_agents_per_team):
-                        info[f'delta_x_{_j}'] = deltas_to_start[:, :, _j * 2]              # (num_agents, num_envs)
-                        info[f'delta_y_{_j}'] = deltas_to_start[:, :, _j * 2 + 1]          # (num_agents, num_envs)
-                        info[f'pred_delta_x_{_j}'] = aux_pred_squeezed[:, :, _j * 2]       # (num_agents, num_envs)
-                        info[f'pred_delta_y_{_j}'] = aux_pred_squeezed[:, :, _j * 2 + 1]   # (num_agents, num_envs)
-                else:
-                    # deltas_to_start: (num_agents, num_envs, 2) — self-only
-                    info['delta_x'] = deltas_to_start[:, :, 0]        # (num_agents, num_envs)
-                    info['delta_y'] = deltas_to_start[:, :, 1]        # (num_agents, num_envs)
-                    info['pred_delta_x'] = aux_pred_squeezed[:, :, 0] # (num_agents, num_envs)
-                    info['pred_delta_y'] = aux_pred_squeezed[:, :, 1] # (num_agents, num_envs)
+                # deltas_to_start: (num_agents, num_envs, agents_per_team*2)
+                # Self-delta is at team-local slot _self_team_idx_arr[i]
+                _aidx = jnp.arange(env.num_agents)
+                _stidx = jnp.array(_self_team_idx_arr)
+                info['delta_x'] = deltas_to_start[_aidx, :, _stidx * 2]            # (num_agents, num_envs)
+                info['delta_y'] = deltas_to_start[_aidx, :, _stidx * 2 + 1]        # (num_agents, num_envs)
+                info['pred_delta_x'] = aux_pred_squeezed[_aidx, :, _stidx * 2]     # (num_agents, num_envs)
+                info['pred_delta_y'] = aux_pred_squeezed[_aidx, :, _stidx * 2 + 1] # (num_agents, num_envs)
+                # Per team-local slot logging (always, so every run's CSVs have the same columns)
+                for _j in range(_agents_per_team):
+                    info[f'delta_x_{_j}'] = deltas_to_start[:, :, _j * 2]              # (num_agents, num_envs)
+                    info[f'delta_y_{_j}'] = deltas_to_start[:, :, _j * 2 + 1]          # (num_agents, num_envs)
+                    info[f'pred_delta_x_{_j}'] = aux_pred_squeezed[:, :, _j * 2]       # (num_agents, num_envs)
+                    info[f'pred_delta_y_{_j}'] = aux_pred_squeezed[:, :, _j * 2 + 1]   # (num_agents, num_envs)
 
             # Keep done as dict for next iteration (env returns dict)
             runner_state = (train_state, env_state, obsv, done, hstate, rng, reset_pool)
@@ -1417,8 +1407,7 @@ def make_train(config, env, wandb_start_step=-1):
                              'revive_as_reviver', 'revive_as_revived', 'revive_partner_id', 'auto_respawned',
                              'delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y',
                              ] + ([f'{k}_{j}' for j in range(_agents_per_team)
-                                   for k in ('delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y')]
-                                  if _use_teammate_aux else []) + [
+                                   for k in ('delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y')]) + [
                              'num_monsters_killed',
                              'has_sword', 'has_pick', 'bow', 'arrows', 'held_iron', 'value',
                              'entropy', 'log_prob', 'episode_id', 'ep_time',
@@ -1439,8 +1428,7 @@ def make_train(config, env, wandb_start_step=-1):
                                       'revive_as_reviver', 'revive_as_revived', 'revive_partner_id', 'auto_respawned',
                                       'delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y',
                                       ] + ([f'{k}_{j}' for j in range(_agents_per_team)
-                                            for k in ('delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y')]
-                                           if _use_teammate_aux else []) + [
+                                            for k in ('delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y')]) + [
                                       'num_monsters_killed',
                                       'has_sword',
                                       'has_pick', 'bow', 'arrows', 'held_iron', 'value', 'entropy', 'log_prob', 'episode_id', 'ep_time',
@@ -1473,8 +1461,7 @@ def make_train(config, env, wandb_start_step=-1):
             network_output_fields = {'value', 'entropy', 'log_prob', 'done', 'action', 'episode_id', 'ep_time',
                                      'delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y'} | (
                                      {f'{k}_{j}' for j in range(_agents_per_team)
-                                      for k in ('delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y')}
-                                     if _use_teammate_aux else set())
+                                      for k in ('delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y')})
             
             def add_field_to_log_array(info_dict, log_array, field_key, agent_to_log):
                 field_value = info_dict[field_key]
