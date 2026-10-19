@@ -335,6 +335,18 @@ def make_train(config, env, wandb_start_step=-1):
     # Auxiliary loss configuration
     _n = env.num_agents
     _agents_per_team = len(config.get("TEAM_COMPOSITION", [1, 1, 2]))
+
+    # CSV columns: running episode-average distance to spawn, averaged over each team's foragers / warriors.
+    # Roles are TEAM_COMPOSITION tiled per team (1 = forager, 2 = warrior); agent i is on team i // agents_per_team.
+    _agent_roles = np.tile(np.array(config.get("TEAM_COMPOSITION", [1, 1, 2])), _n // _agents_per_team)
+    _agent_teams = np.arange(_n) // _agents_per_team
+    _role_dist_masks = {}  # column name -> (num_agents,) bool mask of the agents it averages over
+    for _t in range(_n // _agents_per_team):
+        for _role_id, _role_name in ((1, "foragers"), (2, "warriors")):
+            _mask = (_agent_teams == _t) & (_agent_roles == _role_id)
+            if _mask.any():
+                _role_dist_masks[f"{_role_name}_team{_t}_distance_to_origin"] = _mask
+    _role_dist_fields = list(_role_dist_masks)
     _aux_self_w = config.get("AUX_SELF_WEIGHT", 1.0)
     _use_teammate_aux = config.get("USE_TEAMMATE_AUXILIARY_LOSS", True)
     _aux_team_w = config.get("AUX_TEAMMATE_WEIGHT", 1/3) if _use_teammate_aux else 0.0
@@ -569,6 +581,12 @@ def make_train(config, env, wandb_start_step=-1):
             # CSV fields (health, food, mob distances, etc.) are only needed during logging.
             if detailed_logging:
                 info = jax.vmap(add_logging_fields)(info, env_state.env_state)
+                # Running mean over the current episode of each agent's Manhattan distance to its spawn
+                _ep_steps = jnp.maximum(env_state.env_state.timestep.astype(jnp.float32), 1.0)  # (num_envs,)
+                _run_dist = env_state.env_state.sum_distance_to_spawn / _ep_steps[:, None]  # (num_envs, num_agents)
+                for _key, _mask in _role_dist_masks.items():
+                    _v = _run_dist[:, _mask].mean(axis=1)  # (num_envs,)
+                    info[_key] = jnp.broadcast_to(_v[:, None], _run_dist.shape)
 
             # Re-apply the episode cap: env.step may have reset an episode and
             # restored effective_max_timesteps to the default.
@@ -1371,7 +1389,7 @@ def make_train(config, env, wandb_start_step=-1):
                                   if _use_teammate_aux else []) + [
                              'num_monsters_killed',
                              'has_sword', 'has_pick', 'bow', 'arrows', 'held_iron', 'value',
-                             'entropy', 'log_prob', 'episode_id', 'ep_time',
+                             'entropy', 'log_prob', 'episode_id', 'ep_time', *_role_dist_fields,
                             ]
 
             # Callback function for logging hidden states
@@ -1393,7 +1411,7 @@ def make_train(config, env, wandb_start_step=-1):
                                            if _use_teammate_aux else []) + [
                                       'num_monsters_killed',
                                       'has_sword',
-                                      'has_pick', 'bow', 'arrows', 'held_iron', 'value', 'entropy', 'log_prob', 'episode_id', 'ep_time',
+                                      'has_pick', 'bow', 'arrows', 'held_iron', 'value', 'entropy', 'log_prob', 'episode_id', 'ep_time', *_role_dist_fields,
                                         ]
 
                 run_out_path = get_run_output_dir()
