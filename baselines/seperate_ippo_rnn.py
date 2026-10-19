@@ -1176,6 +1176,18 @@ def make_train(config, env, wandb_start_step=-1):
                     if all_spawn_dists:
                         to_log["overview/distance_to_spawn"] = np.mean(all_spawn_dists)
 
+                    # Distance to spawn averaged over all foragers / all warriors (roles from TEAM_COMPOSITION, tiled per team)
+                    for role_id, role_name in ((1, "foragers"), (2, "warriors")):
+                        role_dists = []
+                        for ai in range(num_agents):
+                            if configured_comp[ai % len(configured_comp)] != role_id:
+                                continue
+                            v = _agent_mean("Movement/distance_to_spawn", ai)
+                            if v is not None:
+                                role_dists.append(v)
+                        if role_dists:
+                            to_log[f"overview/distance_to_spawn_{role_name}"] = np.mean(role_dists)
+
                     combat_damage_keys = [
                         "damage_taken_melee",
                         "damage_taken_health_food",
