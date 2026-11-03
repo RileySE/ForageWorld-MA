@@ -340,16 +340,19 @@ def make_train(config, env, wandb_start_step=-1):
     # Roles are TEAM_COMPOSITION tiled per team (1 = forager, 2 = warrior); agent i is on team i // agents_per_team.
     _agent_roles = np.tile(np.array(config.get("TEAM_COMPOSITION", [1, 1, 2])), _n // _agents_per_team)
     _agent_teams = np.arange(_n) // _agents_per_team
+    # Every team gets both columns, so the CSV layout never depends on TEAM_COMPOSITION; a team with
+    # no agents of a role writes -1 in that column.
     _role_dist_masks = {}  # column name -> (num_agents,) bool mask of the agents it averages over
     for _t in range(_n // _agents_per_team):
         for _role_id, _role_name in ((1, "foragers"), (2, "warriors")):
             _mask = (_agent_teams == _t) & (_agent_roles == _role_id)
-            if _mask.any():
-                _role_dist_masks[f"{_role_name}_team{_t}_distance_to_origin"] = _mask
+            _role_dist_masks[f"{_role_name}_team{_t}_distance_to_origin"] = _mask
     _role_dist_fields = list(_role_dist_masks)
     _aux_self_w = config.get("AUX_SELF_WEIGHT", 1.0)
     _use_teammate_aux = config.get("USE_TEAMMATE_AUXILIARY_LOSS", True)
-    _aux_team_w = config.get("AUX_TEAMMATE_WEIGHT", 1/3) if _use_teammate_aux else 0.0
+    # AUX_TEAMMATE_WEIGHT is the weight of each teammate's prediction; by default (1.0 vs 0.5)
+    # each teammate gets 0.5x the self weight, the same as in the decoupled loss.
+    _aux_team_w = config.get("AUX_TEAMMATE_WEIGHT", 0.5) if _use_teammate_aux else 0.0
 
     # AUX_OUTPUT_DIM: number of aux output values per agent = agents_per_team * 2 (dx, dy per team slot).
     # The head, targets and CSV logging always cover every team slot, so CSV columns are the same in
@@ -581,7 +584,10 @@ def make_train(config, env, wandb_start_step=-1):
                 _ep_steps = jnp.maximum(env_state.env_state.timestep.astype(jnp.float32), 1.0)  # (num_envs,)
                 _run_dist = env_state.env_state.sum_distance_to_spawn / _ep_steps[:, None]  # (num_envs, num_agents)
                 for _key, _mask in _role_dist_masks.items():
-                    _v = _run_dist[:, _mask].mean(axis=1)  # (num_envs,)
+                    if _mask.any():
+                        _v = _run_dist[:, _mask].mean(axis=1)  # (num_envs,)
+                    else:
+                        _v = jnp.full(_run_dist.shape[:1], -1.0)  # no agents of this role on this team
                     info[_key] = jnp.broadcast_to(_v[:, None], _run_dist.shape)
 
             # Re-apply the episode cap: env.step may have reset an episode and
@@ -1755,6 +1761,7 @@ def build_env(config):
     warrior_passive_food_gain = int(config.get("WARRIOR_PASSIVE_FOOD_GAIN", 1))
     forager_passive_food_gain = int(config.get("FORAGER_PASSIVE_FOOD_GAIN", 3))
     forager_food_capacity = int(config.get("FORAGER_FOOD_CAPACITY", 27))
+    warrior_food_capacity = int(config.get("WARRIOR_FOOD_CAPACITY", 0))  # 0 = default 7 + 2 * dexterity (= 9)
     forager_predator_damage_multiplier = float(config.get("FORAGER_PREDATOR_DAMAGE_MULTIPLIER", 1.0))
     melee_mob_health_override = float(config.get("MELEE_MOB_HEALTH", 0.0))  # 0 = per-mob-type default
     melee_mob_damage_override = float(config.get("MELEE_MOB_DAMAGE", 0.0))  # 0 = per-mob-type default
@@ -1809,6 +1816,10 @@ def build_env(config):
         raise ValueError(
             f"FORAGER_FOOD_CAPACITY must be >= 1, got {forager_food_capacity}."
         )
+    if warrior_food_capacity < 0:
+        raise ValueError(
+            f"WARRIOR_FOOD_CAPACITY must be >= 0 (0 = default), got {warrior_food_capacity}."
+        )
     if forager_predator_damage_multiplier < 0:
         raise ValueError(
             "FORAGER_PREDATOR_DAMAGE_MULTIPLIER must be >= 0, "
@@ -1850,6 +1861,7 @@ def build_env(config):
         "warrior_passive_food_gain": warrior_passive_food_gain,
         "forager_passive_food_gain": forager_passive_food_gain,
         "forager_food_capacity": forager_food_capacity,
+        "warrior_food_capacity": warrior_food_capacity,
         "forager_predator_damage_multiplier": forager_predator_damage_multiplier,
         "melee_mob_health_override": melee_mob_health_override,
         "melee_mob_damage_override": melee_mob_damage_override,
