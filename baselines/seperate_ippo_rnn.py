@@ -1319,12 +1319,52 @@ def make_train(config, env, wandb_start_step=-1):
         def _logging_step(carry, unused, logging_threads, update_step, effective_cap=None):
             runner_state, episode_count, ep_time_last, episode_id_last = carry
             runner_state = _apply_episode_cap_to_runner_state(runner_state, effective_cap)
+
+            def save_arena_frame(frame, increment, env_index, episode_id):
+                arena_dir = os.path.join(get_run_output_dir(), 'arenas')
+                os.makedirs(arena_dir, exist_ok=True)
+                path = os.path.join(
+                    arena_dir, f'arena_{int(increment)}_{int(env_index)}_{int(episode_id)}.png'
+                )
+                # An episode can span multiple logging chunks; keep its first frame.
+                if not os.path.exists(path):
+                    imageio.imwrite(path, np.asarray(frame))
+
+            def logging_env_step(carry, step_index):
+                state, frame_episode_ids = carry
+                state, transition = _env_step(
+                    state, None, detailed_logging=True, effective_cap=effective_cap
+                )
+                # Names the arena frames only; the CSV episode_id is computed below. The env
+                # resets inside the step, so the done row's state is already the next episode,
+                # whose CSV rows (from the row after done) carry this advanced id.
+                frame_episode_ids = frame_episode_ids + transition.info['done'].astype(frame_episode_ids.dtype)
+                if config.get("SAVE_ARENA_FRAMES", True):
+                    for env_index in range(logging_threads):
+                        def capture_frame(_):
+                            arena_state = jax.tree_util.tree_map(
+                                lambda x: x[env_index], state[1].env_state
+                            )
+                            frame = render_full_map(
+                                arena_state, _video_static_params,
+                                _video_textures[_video_pixel_size], _video_player_textures,
+                                _video_pixel_size, env_name=_video_env_name, terrain_only=True,
+                            )
+                            jax.experimental.io_callback(
+                                save_arena_frame, None, frame.astype(jnp.uint8),
+                                update_step, env_index, frame_episode_ids[0, env_index], ordered=True,
+                            )
+
+                        jax.lax.cond(
+                            (step_index == 0) | transition.global_done[0, env_index],
+                            capture_frame, lambda _: None, operand=None,
+                        )
+                return (state, frame_episode_ids), transition
+
             # Visualization rollouts (with detailed logging for CSV)
-            runner_state, traj_batch = jax.lax.scan(
-                functools.partial(_env_step, detailed_logging=True, effective_cap=effective_cap),
-                runner_state,
-                None,
-                config["LOGGING_STEPS_PER_CALL"],
+            (runner_state, _), traj_batch = jax.lax.scan(
+                logging_env_step, (runner_state, episode_count),
+                jnp.arange(config["LOGGING_STEPS_PER_CALL"]),
             )
 
             # Finally, log data associated with the visualization runs
