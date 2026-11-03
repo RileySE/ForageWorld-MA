@@ -504,10 +504,23 @@ def get_max_food(state, params=None):
         if params is None
         else jnp.asarray(params.forager_food_capacity, dtype=base_food.dtype)
     )
+    warrior_food_capacity = (
+        base_food
+        if params is None
+        else jnp.where(
+            params.warrior_food_capacity > 0,
+            jnp.asarray(params.warrior_food_capacity, dtype=base_food.dtype),
+            base_food,
+        )
+    )
     return jnp.where(
         state.player_specialization == Specialization.FORAGER.value,
         forager_food_capacity,
-        base_food,
+        jnp.where(
+            state.player_specialization == Specialization.WARRIOR.value,
+            warrior_food_capacity,
+            base_food,
+        ),
     )
 
 
