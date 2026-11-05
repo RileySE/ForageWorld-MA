@@ -569,6 +569,11 @@ def make_train(config, env, wandb_start_step=-1):
             env_action = policy_action_to_env_action(action)
             env_act = unbatchify(env_action, env.agents)  # {agent: (num_envs,)}
 
+            if detailed_logging:
+                # Read before the step, which may reset into the next episode, so the logged
+                # origin is the same on every row of an episode_id, its done row included.
+                spawn_before_step = env_state.env_state.player_spawn_position  # (num_envs, num_agents, 2)
+
             # STEP ENV
             rng, _rng = jax.random.split(rng)
             rng_step = jax.random.split(_rng, hstate.shape[1])
@@ -581,6 +586,8 @@ def make_train(config, env, wandb_start_step=-1):
             # CSV fields (health, food, mob distances, etc.) are only needed during logging.
             if detailed_logging:
                 info = jax.vmap(add_logging_fields)(info, env_state.env_state)
+                info['spawn_position_x'] = spawn_before_step[..., 0]  # (num_envs, num_agents)
+                info['spawn_position_y'] = spawn_before_step[..., 1]
                 # Running mean over the current episode of each agent's Manhattan distance to its spawn
                 _ep_steps = jnp.maximum(env_state.env_state.timestep.astype(jnp.float32), 1.0)  # (num_envs,)
                 _run_dist = env_state.env_state.sum_distance_to_spawn / _ep_steps[:, None]  # (num_envs, num_agents)
@@ -1430,36 +1437,16 @@ def make_train(config, env, wandb_start_step=-1):
                              'num_monsters_killed',
                              'has_sword', 'has_pick', 'bow', 'arrows', 'held_iron', 'value',
                              'entropy', 'log_prob', 'episode_id', 'ep_time', *_role_dist_fields,
+                             'spawn_position_x', 'spawn_position_y',
                             ]
 
             # Callback function for logging hidden states
             def write_rnn_hstate(hstate, scalars, increment=0, agent_n=0):
 
-                header_field_names = ['health', 'food', 'drink', 'energy', 'done', 'is_sleeping', 'is_resting',
-                                      'player_position_x',
-                                      'player_position_y', 'recover', 'hunger', 'thirst', 'fatigue', 'light_level',
-                                      'dist_to_melee_l1',
-                                      'melee_on_screen', 'dist_to_passive_l1', 'passive_on_screen', 'dist_to_ranged_l1',
-                                      'ranged_on_screen', 'num_melee_nearby', 'num_passives_nearby',
-                                      'num_ranged_nearby',
-                                      'trade_give', 'trade_receive', 'trade_give_material_id', 'trade_receive_material_id',
-                                      'trade_give_partner_id', 'trade_receive_partner_id',
-                                      'revive_as_reviver', 'revive_as_revived', 'revive_partner_id', 'auto_respawned',
-                                      'delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y',
-                                      ] + ([f'{k}_{j}' for j in range(_agents_per_team)
-                                            for k in ('delta_x', 'delta_y', 'pred_delta_x', 'pred_delta_y')]
-                                           if _use_teammate_aux else []) + [
-                                      'num_monsters_killed',
-                                      'has_sword',
-                                      'has_pick', 'bow', 'arrows', 'held_iron', 'value', 'entropy', 'log_prob', 'episode_id', 'ep_time', *_role_dist_fields,
-                                        ]
-
                 run_out_path = get_run_output_dir()
                 os.makedirs(run_out_path, exist_ok=True)
-                # Assemble header for the scalar file(s)
-                scalar_file_header = 'action'
-                for key in header_field_names:
-                    scalar_file_header += ',' + key
+                # Columns are action, then fields_to_log in the order they are added below
+                scalar_file_header = ','.join(['action', *fields_to_log])
 
                 for i in range(logging_threads):
                     # Only save hidden states if enabled (they are very large)

@@ -91,8 +91,8 @@ NUM_SEEDS: 1 #careful with this > 1 - might break something in the logging code
 SEED: 0
 
 # Logging configuration
-LOGGING_UPDATES_INTERVAL: 4000  # Number of updates between logging phases
-LOGGING_NUM_CALLS: 20          # Number of logging_step calls per phase
+LOGGING_UPDATES_INTERVAL: 10000  # Number of updates between logging phases
+LOGGING_NUM_CALLS: 64          # Number of logging_step calls per phase (64 x 1024 = 64k CSV rows)
 LOGGING_STEPS_PER_CALL: 1024  # Number of env steps per logging_step call
 LOGGING_THREADS: 1            # Number of env threads to log
 
