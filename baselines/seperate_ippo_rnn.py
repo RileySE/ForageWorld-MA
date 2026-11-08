@@ -230,9 +230,11 @@ def build_aux_loss_masks(num_agents, agents_per_team, use_self_aux, use_teammate
 
     Returns (weight_mask, self_dims, teammate_dims, num_teammates); the first three
     have shape (num_agents, aux_output_dim):
-      weight_mask   - loss weight per output: self_weight on the self outputs and
-                      teammate_weight on each teammate's outputs (per teammate, as in
-                      the original averaged loss); 0 for a term that is off
+      weight_mask   - loss weight per output: self_weight/2 on each of the self (dx, dy)
+                      outputs and teammate_weight/2 on each of a teammate's (dx, dy)
+                      outputs, so a prediction's loss is self_weight (or teammate_weight)
+                      times the MEAN of its x and y squared errors, the same scale as the
+                      original loss with a self-only head; 0 for a term that is off
       self_dims     - 1 on the agent's own (dx, dy) outputs
       teammate_dims - 1 on the teammate outputs
     """
@@ -249,7 +251,9 @@ def build_aux_loss_masks(num_agents, agents_per_team, use_self_aux, use_teammate
     num_teammates = agents_per_team - 1
     # teammate_weight is the weight of EACH teammate's prediction (not split across teammates).
     w_team = teammate_weight if use_teammate_aux else 0.0
-    weight_mask = w_self * self_dims + w_team * teammate_dims
+    # Each prediction has 2 outputs (dx, dy); halving the per-output weight makes its loss the mean
+    # of the two squared errors, so AUX_SELF_WEIGHT means the same thing as in the original loss.
+    weight_mask = (w_self * self_dims + w_team * teammate_dims) / 2.0
     return weight_mask, self_dims, teammate_dims, num_teammates
 
 def batchify(x: dict, agent_list):
@@ -387,9 +391,10 @@ def make_train(config, env, wandb_start_step=-1):
     _role_dist_fields = list(_role_dist_masks)
     # Self and teammate prediction are separate terms with their own on/off toggle and
     # weight. The terms are summed (see the aux loss in _loss_fn), so a weight of 0 is the
-    # same objective as turning that term off. AUX_TEAMMATE_WEIGHT is the weight of each
-    # teammate's prediction (same meaning as in the original averaged loss); by default
-    # (1.0 vs 0.5) each teammate gets 0.5x the self weight.
+    # same objective as turning that term off. Each prediction's term is its weight times the
+    # mean of its x and y squared errors, so AUX_SELF_WEIGHT has the same meaning (and strength) as
+    # in the original loss with a self-only head. AUX_TEAMMATE_WEIGHT is the weight of each
+    # teammate's prediction; by default (1.0 vs 0.5) each teammate gets 0.5x the self weight.
     _use_self_aux = config.get("USE_SELF_AUXILIARY_LOSS", True)
     _use_teammate_aux = config.get("USE_TEAMMATE_AUXILIARY_LOSS", True)
     _aux_self_w = float(config.get("AUX_SELF_WEIGHT", 1.0))
@@ -903,8 +908,9 @@ def make_train(config, env, wandb_start_step=-1):
                         # Auxiliary loss (predict self-displacement + optionally teammate positions).
                         # aux, train_batch.deltas_to_start: (num_steps, num_agents, num_envs_minibatch, AUX_OUTPUT_DIM)
                         # For each datapoint (step, env) the weighted squared errors are SUMMED over the
-                        # outputs, then averaged over datapoints. Summing keeps each term's weight
-                        # independent of how many outputs exist.
+                        # outputs (the mask already halves each weight, so every prediction contributes
+                        # weight x the mean of its x and y errors), then averaged over datapoints. Summing
+                        # over predictions keeps each term's weight independent of how many teammates exist.
                         aux_sq_err = jnp.square(aux - train_batch.deltas_to_start)
                         aux_loss_per_agent = (
                             (aux_sq_err * aux_weight_mask[None, :, None, :]).sum(axis=3).mean(axis=(0, 2))
