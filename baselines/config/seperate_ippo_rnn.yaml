@@ -73,8 +73,12 @@ SCALE_CLIP_EPS: false
 ENT_COEF: 0.01
 VF_COEF: 0.5
 AUX_COEF: 0.1
+# Decoupled aux loss: each prediction = its weight x the mean of its x and y squared errors, terms summed.
+# At AUX_COEF 0.1: self 0.05 per squared error, each teammate 0.025 (0.5x self); the self weight does not depend on the teammate toggle.
+USE_SELF_AUXILIARY_LOSS: true
+AUX_SELF_WEIGHT: 1.0
 USE_TEAMMATE_AUXILIARY_LOSS: false
-AUX_TEAMMATE_WEIGHT: 0.3333
+AUX_TEAMMATE_WEIGHT: 0.5  # weight of EACH teammate prediction (0.5x the self weight)
 ANNEAL_LR: true
 LR: 0.0002
 MAX_GRAD_NORM: 1.0
@@ -91,12 +95,13 @@ NUM_SEEDS: 1 #careful with this > 1 - might break something in the logging code
 SEED: 0
 
 # Logging configuration
-LOGGING_UPDATES_INTERVAL: 4000  # Number of updates between logging phases
-LOGGING_NUM_CALLS: 20          # Number of logging_step calls per phase
+LOGGING_UPDATES_INTERVAL: 10000  # Number of updates between logging phases
+LOGGING_NUM_CALLS: 64          # Number of logging_step calls per phase (64 x 1024 = 64k CSV rows)
 LOGGING_STEPS_PER_CALL: 1024  # Number of env steps per logging_step call
 LOGGING_THREADS: 1            # Number of env threads to log
 
 # Video recording parameters
+SAVE_ARENA_FRAMES: true       # Static terrain PNG per logged episode, independent of SAVE_VIDEO
 SAVE_VIDEO: true             # Whether to record and save videos during logging
 VIDEO_LENGTH: 1000  # Number of env steps per video (rollout continues from current state)
 VIDEO_PIXEL_SIZE: 16  # Pixel size for rendering (7=agent, 16=medium, 64=large)
