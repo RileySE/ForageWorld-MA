@@ -9,7 +9,17 @@ single-agent MDP over the joint observation and the joint action:
     fixed agent order into one global vector of size num_agents * obs_dim.
     Both the actor and the critic consume this same global vector.
   * RECURRENCE   — ONE sequence model with ONE carry.  There is no per-agent
-    hidden state: one GRU, carry (num_envs, GRU_HIDDEN_DIM).
+    hidden state.  POLICY_ARCH selects the model:
+      - "gru" (default): one GRU, carry (num_envs, GRU_HIDDEN_DIM).
+      - "transformer": one causal, fixed-window transformer, carry
+        (num_envs, TF_MAX_HISTORY, TF_D_MODEL + 1) — a ring buffer of the last
+        TF_MAX_HISTORY token embeddings plus a per-slot validity flag.  It
+        attends over the last TF_MAX_HISTORY env steps and nothing older, and
+        never across an episode boundary.  Both models emit a width-
+        GRU_HIDDEN_DIM vector, so the actor / critic / aux heads are identical
+        and the total parameter count stays within a few percent (with the
+        defaults: 1.03x the GRU core).  See baselines/transformer_policy.py for
+        the full hyperparameter table and the parameter-budget helpers.
   * ACTION       — the actor head emits num_agents * action_dim logits, viewed
     as (num_agents, action_dim).  The joint action is the concatenation of the
     per-agent actions, and the joint log-probability / entropy are the sums over
@@ -98,6 +108,7 @@ from craftax.custom_rendering.full_map_rendering import render_full_map
 
 import checkpoint_utils as ckpt
 import pruning_utils as pruning
+import transformer_policy as tfp
 
 # ===========================
 # Model Definitions
@@ -181,10 +192,15 @@ class CentralizedActorCriticRNN(nn.Module):
     """Single policy + single critic over the joint observation.
 
     Input  : global obs (T, B, num_agents * obs_dim), resets (T, B)
-    Outputs: hidden      (B, hidden_dim)          -- GRU carry
+    Outputs: hidden      (B, hidden_dim)          -- GRU carry, or
+                         (B, TF_MAX_HISTORY, TF_D_MODEL + 1) for the transformer
              pi          Categorical over logits (T, B, num_agents, action_dim)
              value       (T, B)                      -- ONE critic head
              aux         (T, B, num_agents * 2)
+
+    The sequence model is selected by POLICY_ARCH ("gru" | "transformer").  Both
+    consume (embedding, resets) and emit a width-GRU_HIDDEN_DIM vector, so the
+    actor / critic / aux heads below are identical either way.
     """
     action_dim: int
     num_agents: int
@@ -199,7 +215,12 @@ class CentralizedActorCriticRNN(nn.Module):
         embedding = nn.relu(embedding)
 
         rnn_in = (embedding, dones)
-        hidden, embedding = ScannedRNN()(hidden, rnn_in)
+        if self.config.get("POLICY_ARCH", "gru") == "transformer":
+            hidden, embedding = tfp.ScannedTransformer(
+                **tfp.hparams_from_config(self.config)
+            )(hidden, rnn_in)
+        else:
+            hidden, embedding = ScannedRNN()(hidden, rnn_in)
 
         # ── Joint policy: one trunk, num_agents * action_dim logits ──
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
@@ -469,8 +490,31 @@ def make_train(config, env, wandb_start_step=-1):
         dead_only_noop_logits = dead_only_noop_logits.at[..., noop_policy_action_idx].set(0.0)
         return jnp.where(alive_mask[..., None], logits, dead_only_noop_logits)
 
+    # ── Sequence-model selection: GRU carry vs transformer window ──
+    policy_arch = str(config.get("POLICY_ARCH", "gru")).lower()
+    if policy_arch not in ("gru", "transformer"):
+        raise ValueError(f'POLICY_ARCH must be "gru" or "transformer", got {policy_arch!r}')
+    if policy_arch == "transformer":
+        _tf_hp = tfp.hparams_from_config(config)
+        # Write the resolved values back so the printed report, the checkpoint
+        # sidecar and wandb all record what actually ran (matters for
+        # TF_D_MODEL: "auto").
+        config["TF_D_MODEL"] = _tf_hp["d_model"]
+        config["TF_OUT_DIM"] = _tf_hp["out_dim"]
+        print(tfp.describe(_tf_hp, int(config["FC_DIM_SIZE"]), int(config["GRU_HIDDEN_DIM"])))
+    else:
+        _tf_hp = None
+
     def zero_hstate(batch_size):
-        """Zero GRU carry: (batch_size, GRU_HIDDEN_DIM)."""
+        """Zero carry for the active sequence model.
+
+        gru         -> (batch_size, GRU_HIDDEN_DIM)
+        transformer -> (batch_size, TF_MAX_HISTORY, TF_D_MODEL + 1)
+        """
+        if policy_arch == "transformer":
+            return tfp.ScannedTransformer.initialize_carry(
+                batch_size, _tf_hp["max_history"], _tf_hp["d_model"]
+            )
         return ScannedRNN.initialize_carry(batch_size, config["GRU_HIDDEN_DIM"])
 
     def train(rng):
@@ -512,7 +556,8 @@ def make_train(config, env, wandb_start_step=-1):
             if reset_pool_size > 0
             else None
         )
-        # ONE hidden state: (num_envs, hidden_dim)
+        # ONE hidden state: (num_envs, hidden_dim) for the GRU, or one attention
+        # window (num_envs, TF_MAX_HISTORY, TF_D_MODEL + 1) for the transformer
         init_hstate = zero_hstate(config["NUM_ENVS"])
         # ONE done flag per env (the environment terminates globally)
         init_done = jnp.zeros((config["NUM_ENVS"],), dtype=bool)
@@ -883,7 +928,7 @@ def make_train(config, env, wandb_start_step=-1):
                 rng, _rng = jax.random.split(rng)
 
                 # Every array is (num_steps, num_envs, ...) except init_hstate, which is
-                # (num_envs, hidden_dim). Permute over envs; minibatch m uses envs
+                # (num_envs, *carry_dims). Permute over envs; minibatch m uses envs
                 # permutation[m * MINIBATCH_SIZE:(m + 1) * MINIBATCH_SIZE]. Each minibatch is
                 # gathered when it is used rather than copying the whole shuffled batch first.
                 permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
@@ -1381,9 +1426,15 @@ def make_train(config, env, wandb_start_step=-1):
                 """The recurrent state is shared by the whole team, so it is written
                 once per logged env rather than once per agent.
 
-                GRU carry is (T, num_envs, hidden_dim) -> one row per step.
+                GRU carry is (T, num_envs, hidden_dim) -> one row per step.  The
+                transformer carry is (T, num_envs, max_history, d_model + 1), so
+                the window is flattened row-major into a single wide row per step:
+                slot-major, oldest slot first, each slot's last column being its
+                validity flag.
                 """
                 hstate = np.asarray(hstate)
+                if hstate.ndim > 3:
+                    hstate = hstate.reshape(hstate.shape[0], hstate.shape[1], -1)
                 run_out_path = get_run_output_dir()
                 os.makedirs(run_out_path, exist_ok=True)
                 for i in range(logging_threads):

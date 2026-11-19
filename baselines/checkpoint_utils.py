@@ -129,6 +129,31 @@ def check_compatibility(meta, fingerprint, config):
         )
 
 
+def plan_segments(update_steps, target_updates, updates_per_block):
+    """Split the training still to do, update_steps -> target_updates, into segments.
+
+    Returns ("block", updates_per_block) and ("updates", n) pairs in order. A
+    "block" is one logging phase followed by updates_per_block updates and
+    always starts on a multiple of updates_per_block; "updates" is n updates
+    with no logging phase. A run that stopped mid-block (STOP_AT_UPDATE) first
+    finishes that block's updates, and a target that is not a block multiple
+    ends on an "updates" tail.
+    """
+    segments = []
+    step = update_steps
+    offset = step % updates_per_block
+    if offset and step < target_updates:
+        n = min(updates_per_block - offset, target_updates - step)
+        segments.append(("updates", n))
+        step += n
+    while step + updates_per_block <= target_updates:
+        segments.append(("block", updates_per_block))
+        step += updates_per_block
+    if step < target_updates:
+        segments.append(("updates", target_updates - step))
+    return segments
+
+
 def _nonzero_leaves(tree):
     """Return the pytree leaves that hold at least one element."""
     return [leaf for leaf in jax.tree_util.tree_leaves(tree) if getattr(leaf, "size", 1) != 0]

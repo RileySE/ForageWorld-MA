@@ -5,6 +5,29 @@ Credit goes to the original authors: Rutherford et al.
 Modified to use SEPARATE network parameters per agent (no parameter sharing).
 Each agent has its own ActorCriticRNN with independent parameters.
 Gradient clipping is done PER-AGENT to avoid coupling through global norm computation.
+
+SEQUENCE MODEL — POLICY_ARCH selects what carries information across time:
+  * "gru" (default): one GRU per agent, carry (num_agents, num_envs, GRU_HIDDEN_DIM).
+  * "agalite": one AGaLiTe gated-linear-recurrent-attention stack per agent
+    (Pramanik et al., TMLR 2024), carry (num_agents, num_envs, AG carry width).
+    It has NO context window: the carry is a fixed-size
+    summary of the agent's WHOLE episode, so nothing is forgotten at a horizon
+    cut-off, and per-step cost is constant in episode length.  Cost of that:
+    with the paper's Craftax architecture the carry is ~52x the GRU's and the
+    core has ~1.8x the GRU's parameters.  See baselines/agalite_policy.py.
+  * "gtrxl": one GTrXL-M (gated Transformer-XL) per agent, carry
+    (num_agents, num_envs, (L+1)*M*d + M) — a per-layer cache of the last M
+    hidden states plus a slot mask.  Relative positions, GRU-gated residuals,
+    segment-level recurrence.  NOTE: unlike the other two, its rollout and
+    its PPO recompute are not the same computation (attention span depends on
+    where the segment boundary falls), so the epoch-0 ratio is not ~1.  See
+    "Recompute semantics" in baselines/gtrxl_policy.py.
+  * "mlp": memoryless control.  The core is one Dense(GRU_HIDDEN_DIM) + ReLU
+    applied to each step on its own; the carry is a (num_agents, num_envs, 1)
+    placeholder that is never read, so the policy sees only the current
+    observation.
+Each agent's sequence model sees only its OWN egocentric observation history,
+so nothing crosses agents and the setup stays decentralized.
 """
 
 # ===========================
@@ -50,6 +73,8 @@ from craftax.custom_rendering.full_map_rendering import render_full_map
 
 import checkpoint_utils as ckpt
 import pruning_utils as pruning
+import agalite_policy as agp
+import gtrxl_policy as gxp
 
 # ===========================
 # Model Definitions
@@ -129,7 +154,43 @@ class ScannedRNN(nn.Module):
         return jnp.zeros((batch_size, hidden_size), dtype=jnp.float32)
 
 
+class MLPCore(nn.Module):
+    """Memoryless drop-in for the sequence model: Dense(features) + ReLU on
+    each step independently.  The carry passes through untouched, so nothing
+    from earlier steps reaches the heads."""
+    features: int
+
+    @nn.compact
+    def __call__(self, carry, x):
+        ins, _ = x
+        y = nn.Dense(self.features, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(ins)
+        return carry, nn.relu(y)
+
+    @staticmethod
+    def initialize_carry(batch_size):
+        return jnp.zeros((batch_size, 1))
+
+
 class ActorCriticRNN(nn.Module):
+    """Per-agent actor-critic.  One copy of these params exists per agent; the
+    runner vmaps this module over the leading agent axis.
+
+    The sequence model is selected by POLICY_ARCH ("gru" | "agalite" |
+    "gtrxl" | "mlp").  All four consume (embedding, resets) and emit one
+    vector per step, so the actor / critic / aux heads below are identical
+    either way.  Per-agent carry:
+        gru         (num_envs, GRU_HIDDEN_DIM)
+        agalite     (num_envs, agp.carry_size(hp))
+        gtrxl       (num_envs, gxp.carry_size(hp))
+        mlp         (num_envs, 1) placeholder, never read
+    Output width is GRU_HIDDEN_DIM for gru and mlp, AG_D_MODEL for agalite
+    and GX_EMBEDDING_DIM for gtrxl (AG_OUT_DIM / GX_OUT_DIM: 512 make those
+    GRU_HIDDEN_DIM too).
+    Each agent's sequence model sees only that agent's OWN egocentric
+    observation history -- a per-layer M-step memory for "gtrxl", the whole
+    episode for "gru" and "agalite", the current step only for "mlp".
+    Nothing is shared across agents, so this stays decentralized either way.
+    """
     action_dim: Sequence[int]
     config: Dict
 
@@ -142,7 +203,19 @@ class ActorCriticRNN(nn.Module):
         embedding = nn.relu(embedding)
 
         rnn_in = (embedding, dones)
-        hidden, embedding = ScannedRNN()(hidden, rnn_in)
+        arch = str(self.config.get("POLICY_ARCH", "gru")).lower()
+        if arch == "agalite":
+            hidden, embedding = agp.ScannedAGaLiTe(
+                **agp.hparams_from_config(self.config)
+            )(hidden, rnn_in)
+        elif arch == "gtrxl":
+            hidden, embedding = gxp.ScannedGTrXL(
+                **gxp.hparams_from_config(self.config)
+            )(hidden, rnn_in)
+        elif arch == "mlp":
+            hidden, embedding = MLPCore(features=self.config["GRU_HIDDEN_DIM"])(hidden, rnn_in)
+        else:
+            hidden, embedding = ScannedRNN()(hidden, rnn_in)
 
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             embedding
@@ -487,6 +560,49 @@ def make_train(config, env, wandb_start_step=-1):
         dead_only_noop_logits = dead_only_noop_logits.at[..., noop_policy_action_idx].set(0.0)
         return jnp.where(alive_mask[..., None], logits, dead_only_noop_logits)
 
+    # -- Sequence-model selection: GRU / AGaLiTe state / GTrXL memory / none --
+    policy_arch = str(config.get("POLICY_ARCH", "gru")).lower()
+    if policy_arch not in ("gru", "agalite", "gtrxl", "mlp"):
+        raise ValueError(
+            'POLICY_ARCH must be "gru", "agalite", "gtrxl" or "mlp", '
+            f"got {policy_arch!r}"
+        )
+    _ag_hp = _gx_hp = None
+    if policy_arch == "agalite":
+        _ag_hp = agp.hparams_from_config(config)
+        print(agp.describe(_ag_hp, int(config["FC_DIM_SIZE"]), int(config["GRU_HIDDEN_DIM"])))
+    if policy_arch == "gtrxl":
+        _gx_hp = gxp.hparams_from_config(config)
+        print(gxp.describe(_gx_hp, int(config["FC_DIM_SIZE"]), int(config["GRU_HIDDEN_DIM"])))
+    if policy_arch == "mlp":
+        print(
+            f"MLP policy (memoryless): Dense({config['GRU_HIDDEN_DIM']}) + ReLU on the "
+            f"{config['FC_DIM_SIZE']}-d embedding in place of the sequence model; no carry"
+        )
+
+    def zero_hstate(batch_size):
+        """Zero carry for ONE agent under the active sequence model.
+
+        gru         -> (batch_size, GRU_HIDDEN_DIM)
+        agalite     -> (batch_size, agp.carry_size(_ag_hp))
+        gtrxl       -> (batch_size, gxp.carry_size(_gx_hp))
+        mlp         -> (batch_size, 1) placeholder
+        """
+        if policy_arch == "agalite":
+            return agp.ScannedAGaLiTe.initialize_carry(batch_size, agp.carry_size(_ag_hp))
+        if policy_arch == "gtrxl":
+            return gxp.ScannedGTrXL.initialize_carry(
+                batch_size, gxp.carry_size(_gx_hp), _gx_hp["memory_len"]
+            )
+        if policy_arch == "mlp":
+            return MLPCore.initialize_carry(batch_size)
+        return ScannedRNN.initialize_carry(batch_size, config["GRU_HIDDEN_DIM"])
+
+    def zero_hstate_all_agents(batch_size):
+        """Per-agent carry stacked on a leading agent axis: (num_agents, batch, ...)."""
+        carry = zero_hstate(batch_size)
+        return jnp.tile(carry[np.newaxis], (env.num_agents,) + (1,) * carry.ndim)
+
     def train(rng):
         # INIT NETWORK - separate params per agent
         network = ActorCriticRNN(action_dim, config=config)
@@ -496,7 +612,7 @@ def make_train(config, env, wandb_start_step=-1):
             jnp.zeros((1, config["NUM_ENVS"], env.observation_space(env.agents[0]).shape[0])),
             jnp.zeros((1, config["NUM_ENVS"])),
         )
-        init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
+        init_hstate = zero_hstate(config["NUM_ENVS"])
         
         # Initialize separate params for each agent using vmap
         agent_rngs = jax.random.split(_rng, env.num_agents)
@@ -539,9 +655,9 @@ def make_train(config, env, wandb_start_step=-1):
             if reset_pool_size > 0
             else None
         )
-        # Hidden state shape: (num_agents, num_envs, hidden_dim)
-        init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
-        init_hstate = jnp.tile(init_hstate[np.newaxis, :, :], (env.num_agents, 1, 1))
+        # Hidden state shape: (num_agents, num_envs, carry_width), where carry_width
+        # is GRU_HIDDEN_DIM for the GRU, the flat AGaLiTe / GTrXL carry size, or 1 for mlp
+        init_hstate = zero_hstate_all_agents(config["NUM_ENVS"])
         # Initial done flags as dict (will be converted to array in _env_step)
         # Must include "__all__" key to match structure returned by env.step
         init_done = {a: jnp.zeros((config["NUM_ENVS"],), dtype=bool) for a in env.agents}
@@ -1000,7 +1116,7 @@ def make_train(config, env, wandb_start_step=-1):
                 minibatch_envs = permutation.reshape(config["NUM_MINIBATCHES"], config["MINIBATCH_SIZE"])
 
                 def _gather_and_update_minbatch(train_state, envs):
-                    # init_hstate: (num_agents, num_envs, hidden_dim) -> axis 1
+                    # init_hstate: (num_agents, num_envs, *carry_dims) -> axis 1
                     # train_batch, advantages, targets: (num_steps, num_agents, num_envs, ...) -> axis 2
                     batch_info = (
                         jnp.take(init_hstate, envs, axis=1),
@@ -1558,7 +1674,7 @@ def make_train(config, env, wandb_start_step=-1):
 
                 # Extract hidden states only for this agent if saving is enabled
                 if save_hstates:
-                    agent_hidden_states = hidden_states[:, agent_n, :, :]
+                    agent_hidden_states = hidden_states[:, agent_n]
                 else:
                     agent_hidden_states = None
                 jax.experimental.io_callback(
@@ -1717,7 +1833,7 @@ def make_train(config, env, wandb_start_step=-1):
                     video_env_state = _patch_episode_cap(video_env_state, effective_cap)
 
                 # Fresh hidden state (1 env) and done flags
-                video_hstate = jnp.zeros((env.num_agents, 1, config["GRU_HIDDEN_DIM"]))
+                video_hstate = zero_hstate_all_agents(1)
                 video_done = {a: jnp.zeros((1,), dtype=bool) for a in env.agents}
                 video_done["__all__"] = jnp.zeros((1,), dtype=bool)
 
@@ -2043,7 +2159,16 @@ def single_run(config):
         mode=config["WANDB_MODE"],
     )
     wandb_run_id = getattr(wandb.run, "id", None) if wandb.run is not None else None
-    wandb_start_step = wandb.run.step if (resuming and wandb.run is not None) else -1
+    wandb_start_step = -1
+    if resuming and wandb.run is not None:
+        # Skip updates the run logged past its last checkpoint before it was cut
+        # off. wandb.run.step comes back 0 on resume (seen with wandb 0.28 after a
+        # SLURM timeout), so ask the server for the last logged step instead.
+        try:
+            wandb_start_step = int(wandb.Api(timeout=60).run(wandb.run.path).lastHistoryStep)
+        except Exception as e:
+            print(f"[wandb] could not read the last logged step from the server ({e!r}); using run.step")
+            wandb_start_step = wandb.run.step
     print(f"[wandb] resume floor step = {wandb_start_step}")
 
     rng = jax.random.PRNGKey(config["SEED"])
@@ -2064,7 +2189,6 @@ def single_run(config):
         print(f"[resume] update_steps={int(carry[1])} start_block={start_block}")
     else:
         carry = init_carry
-        start_block = 0
         if checkpointing:
             ckpt.write_sidecar(
                 ckpt_dir,
@@ -2085,19 +2209,50 @@ def single_run(config):
     # the restore template is no longer needed once carry is restored).
     del init_carry
 
-    num_logging_iters = config["NUM_LOGGING_ITERS"]
+    updates_per_block = config["LOGGING_UPDATES_INTERVAL"]
+    # STOP_AT_UPDATE > 0 ends training at that cumulative update instead of
+    # NUM_UPDATES. The LR schedule still anneals over NUM_UPDATES, so up to that
+    # point the run is the same as one trained to the end.
+    stop_at = int(config.get("STOP_AT_UPDATE", 0))
+    target_updates = min(stop_at, config["NUM_UPDATES"]) if stop_at > 0 else config["NUM_UPDATES"]
+    segments = ckpt.plan_segments(int(carry[1]), target_updates, updates_per_block)
+    print(
+        f"[plan] update {int(carry[1])} -> {target_updates}: "
+        f"{sum(kind == 'block' for kind, _ in segments)} block(s) + "
+        f"{sum(n for kind, n in segments if kind == 'updates')} update(s) outside blocks"
+    )
     interval = max(1, int(config.get("CHECKPOINT_INTERVAL_BLOCKS", 1)))
     max_blocks = int(config.get("MAX_BLOCKS_THIS_RUN", 0))
     ckpt.install_signal_handler()
 
+    def run_updates(carry, n):
+        # Drop the per-update metric inside the jit so XLA can dead-code-eliminate
+        # the stacked (n, ...) metric buffers instead of materializing them as
+        # live outputs. Wandb logging is unaffected: it runs via the io_callback
+        # inside update_step_fn.
+        scan_updates = jax.jit(
+            lambda c: jax.lax.scan(
+                lambda inner_c, unused: (update_step_fn(inner_c, unused)[0], None),
+                c,
+                None,
+                n,
+            ),
+            donate_argnums=0,
+        )
+        carry, _ = scan_updates(carry)
+        return jax.block_until_ready(carry)
+
     blocks_this_run = 0
-    for block in range(start_block, num_logging_iters):
+    for kind, n in segments:
+        if kind == "updates":
+            carry = run_updates(carry, n)
+            continue
         carry, _ = jit_plot(carry, None)
         carry = jax.block_until_ready(carry)
         blocks_this_run += 1
-        done_blocks = block + 1
+        done_blocks = int(carry[1]) // updates_per_block
         stop = ckpt.stop_requested() or (max_blocks and blocks_this_run >= max_blocks)
-        periodic = done_blocks % interval == 0 or done_blocks == num_logging_iters
+        periodic = done_blocks % interval == 0 or done_blocks == target_updates // updates_per_block
         if checkpointing and (periodic or stop):
             ckpt.save_checkpoint(mngr, carry, done_blocks, ckpt_dir, wandb_run_id, fingerprint, config)
         if stop:
@@ -2107,39 +2262,72 @@ def single_run(config):
             wandb.finish()
             return
 
-    if config["REMAINING_UPDATES"] > 0 and int(carry[1]) < config["NUM_UPDATES"]:
-        # Drop the per-update metric inside the jit so XLA can dead-code-eliminate
-        # the stacked (REMAINING_UPDATES, ...) metric buffers instead of
-        # materializing them as live outputs. Wandb logging is unaffected: it runs
-        # via the io_callback inside update_step_fn.
-        scan_tail = jax.jit(
-            lambda c: jax.lax.scan(
-                lambda inner_c, unused: (update_step_fn(inner_c, unused)[0], None),
-                c,
-                None,
-                config["REMAINING_UPDATES"],
-            ),
-            donate_argnums=0,
-        )
-        carry, _ = scan_tail(carry)
-        carry = jax.block_until_ready(carry)
-
     if checkpointing:
         ckpt.save_checkpoint(
-            mngr, carry, num_logging_iters, ckpt_dir, wandb_run_id, fingerprint, config, final=True
+            mngr, carry, int(carry[1]) // updates_per_block, ckpt_dir, wandb_run_id, fingerprint,
+            config, final=int(carry[1]) >= config["NUM_UPDATES"],
         )
         mngr.wait_until_finished()
     wandb.finish()
 
 
+def apply_overrides(config, overrides):
+    """Apply command-line `KEY=VALUE` overrides to a loaded config.
+
+    Values are parsed as YAML, so `GX_MEMORY_LEN=32`, `LR=1e-4`,
+    `PASSIVE_MOBS_STATIC=true`, `TEAM_COMPOSITION=[1, 1, 2]` and
+    `AG_OUT_DIM=null` all give the type the YAML file would give.
+    A key must already exist in the config; prefix it with `+` to add a new one
+    (`+MY_NEW_KEY=1`), so that a typo is an error rather than a silently
+    ignored sweep parameter.
+    """
+    for override in overrides:
+        if "=" not in override:
+            raise ValueError(
+                f"Malformed override {override!r}: expected KEY=VALUE"
+            )
+        key, _, raw_value = override.partition("=")
+        key = key.strip()
+        allow_new = key.startswith("+")
+        if allow_new:
+            key = key[1:].strip()
+        if not key:
+            raise ValueError(f"Malformed override {override!r}: empty key")
+        if key not in config and not allow_new:
+            raise ValueError(
+                f"Unknown config key {key!r}. Use +{key}={raw_value} to add it."
+            )
+        try:
+            value = yaml.safe_load(raw_value)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Could not parse value of override {override!r}: {e}")
+        if isinstance(value, str):
+            # YAML 1.1 only reads exponents written as 1.0e-4, so `LR=1e-4`
+            # would otherwise stay a string and reach optax as one.
+            try:
+                value = float(value)
+            except ValueError:
+                pass
+        print(f"Config override: {key} = {config.get(key)!r} -> {value!r}")
+        config[key] = value
+    return config
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_file", help="Name of the config YAML file (in baselines/config/)")
-    args = parser.parse_args()
+    parser.add_argument(
+        "overrides",
+        nargs="*",
+        metavar="KEY=VALUE",
+        help="Config overrides, e.g. GX_MEMORY_LEN=32 LR=1e-4 (prefix with + to add a new key)",
+    )
+    args = parser.parse_intermixed_args()
 
     config_path = os.path.join(os.path.dirname(__file__), "config", args.config_file)
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
+    config = apply_overrides(config, args.overrides)
     single_run(config)
 
 

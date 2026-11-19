@@ -233,3 +233,29 @@ def test_stop_requested_toggle():
     ckpt._STOP["requested"] = True
     assert ckpt.stop_requested() is True
     ckpt._STOP["requested"] = False
+
+
+def test_plan_segments_full_run_matches_blocks_plus_remainder():
+    # 2e9 steps / (64 * 512) = 61035 updates: 15 blocks, then the 1035 remainder.
+    assert ckpt.plan_segments(0, 61035, 4000) == [("block", 4000)] * 15 + [("updates", 1035)]
+    assert ckpt.plan_segments(28000, 61035, 4000) == [("block", 4000)] * 8 + [("updates", 1035)]
+
+
+def test_plan_segments_stop_mid_block():
+    assert ckpt.plan_segments(0, 30000, 4000) == [("block", 4000)] * 7 + [("updates", 2000)]
+    assert ckpt.plan_segments(24000, 30000, 4000) == [("block", 4000), ("updates", 2000)]
+    assert ckpt.plan_segments(28000, 30000, 4000) == [("updates", 2000)]
+    assert ckpt.plan_segments(28000, 32000, 4000) == [("block", 4000)]
+
+
+def test_plan_segments_mid_block_resume_realigns_to_block_grid():
+    plan = ckpt.plan_segments(30000, 61035, 4000)
+    assert plan == [("updates", 2000)] + [("block", 4000)] * 7 + [("updates", 1035)]
+    assert sum(n for _, n in plan) == 61035 - 30000
+    assert ckpt.plan_segments(29000, 30000, 4000) == [("updates", 1000)]
+
+
+def test_plan_segments_nothing_left():
+    assert ckpt.plan_segments(32000, 30000, 4000) == []
+    assert ckpt.plan_segments(30000, 30000, 4000) == []
+    assert ckpt.plan_segments(61035, 61035, 4000) == []

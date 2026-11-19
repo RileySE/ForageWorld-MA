@@ -1,0 +1,133 @@
+# Tiny smoke-test config for baselines/central_ippo_rnn.py.
+# Mirrors test_seperate_ippo_rnn.yaml so the two runners can be smoke-tested
+# side by side. Exercises the update path, CSV logging, hidden-state saving and
+# video recording in a few seconds.
+
+# Weights & Biases configuration
+WANDB_MODE: "disabled" # Change to "online" for logging and include appropriate ENTITY and PROJECT arguments
+ENTITY: ""
+PROJECT: ""
+RUN_NAME: "Test-Central-IPPO-Transformer"  # Optional run name. Run files go to <OUTPUT_DIR or .>/<RUN_NAME>/<timestamp>_<wandb_run_id>/
+OUTPUT_DIR: ""  # Optional artifact root. Run files go to <OUTPUT_DIR or .>/<RUN_NAME>/<timestamp>_<wandb_run_id>/
+
+# Environment configuration
+ENV_NAME: "Craftax-Coop-Symbolic" # Can be changed to "Craftax-Coop-Symbolic", "Craftax-Coop-Pixels", "Craftax-MA-Symbolic", "Craftax-MA-Pixels"
+MAX_PASSIVE_MOBS: 105  # Maximum number of passive mobs allocated/spawnable
+MAX_MELEE_MOBS: 40  # Maximum number of melee predator mobs allocated/spawnable
+MAX_RANGED_MOBS: 0  # Maximum number of ranged predator mobs allocated/spawnable
+
+DISABLE_REVIVE: false
+REVIVING_COOLDOWN_STEPS: 50
+ACTION_MASK_WHILE_DEAD: true
+
+SHARED_REWARD: true
+
+TEAMMATE_ALIVE_BONUS: 0.05
+ALL_TEAM_ALIVE_BONUS: 0.2
+DEAD_SELF_PENALTY_WEIGHT: 0.2
+ONE_TIME_DEATH_PENALTY_SHARED: 50
+ONE_TIME_DEATH_PENALTY_INDIVIDUAL: 15
+WARRIOR_MELEE_KILL_REWARD: 5
+WARRIOR_PASSIVE_FOOD_GAIN: 1  # Food gained by a warrior when eating a killed passive mob
+FORAGER_PASSIVE_FOOD_GAIN: 3  # Food gained by a forager when eating a killed passive mob
+FORAGER_FOOD_CAPACITY: 27  # Maximum food capacity for foragers
+FORAGER_TO_WARRIOR_FOOD_TRADE_REWARD: 1.0
+FORAGER_TO_WARRIOR_DRINK_TRADE_REWARD: 1.0
+
+ENABLE_AUTO_RESPAWNING: true
+AUTO_RESPAWN_STEPS: 50
+RESTRICT_AUTO_RESPAWNING_TO_SPAWN_ROOM: false
+
+TRADE_RADIUS: 20
+TRADE_RADIUS_SHAPE: "circle"  # "square" or "circle"
+
+EARLY_EPISODE_CAP: 2000          # Max episode length during early training (0 = disabled)
+EARLY_EPISODE_CAP_UNTIL: 20   # Training update step until which the cap applies
+GENERAL_EPISODE_CAP: 9000        # Max episode length after early cap ends (0 = use env default)
+TERMINATE_ON_ANY_DEATH: true
+TERMINATE_ON_ANY_DEATH_OFFSET: 200
+
+NUM_TEAMS: 1
+TEAM_COMPOSITION: [1, 1, 2]  # [FORAGER, FORAGER, WARRIOR] # Specialization values: FORAGER=1, WARRIOR=2, MINER=3
+USE_REDUCED_ACTION_SPACE: true  # If true, use actions 0-24 plus team-local GIVE target actions
+
+# Centralization
+CENTRAL_REWARD_AGGREGATION: "mean"  # "mean" or "sum"
+
+# Model parameters
+ALG_NAME: "central-ippo-rnn"
+GRU_HIDDEN_DIM: 16
+FC_DIM_SIZE: 8
+ACTIVATION: "tanh"
+
+# ── Sequence model ──
+# POLICY_ARCH: "gru" (default) or "transformer".
+POLICY_ARCH: "transformer"
+
+# Transformer policy hyperparameters (used only when POLICY_ARCH: "transformer").
+# Parameter-matched to the GRU core: with FC_DIM_SIZE=128 / GRU_HIDDEN_DIM=512 the
+# GRU core is 985,088 params and these defaults give 1,016,768 (1.032x).
+TF_MAX_HISTORY: 16        # attention window, in env steps. The carry holds this
+                          #   many past token embeddings; older steps are dropped.
+TF_D_MODEL: 192           # residual stream width. "auto" solves for the width
+                          #   that best matches the GRU parameter count.
+TF_N_LAYERS: 2            # transformer blocks
+TF_N_HEADS: 4             # attention heads; must divide TF_D_MODEL (192/4 = 48)
+TF_MLP_RATIO: 4.0         # FFN hidden width = ratio * TF_D_MODEL (= 768)
+TF_OUT_DIM: null          # output width; null -> GRU_HIDDEN_DIM, so the actor /
+                          #   critic / aux heads are unchanged vs the GRU
+TF_ACTIVATION: "gelu"     # "gelu" | "relu" | "swish"
+TF_NORM_PLACEMENT: "pre"  # "pre" (pre-LN, stable) | "post"
+TF_POS_ENCODING: "learned"  # "learned" | "sinusoidal" | "none"; relative by
+                          #   construction, since the window shifts every step
+TF_QKV_BIAS: true         # bias on the q/k/v/out projections
+TF_ATTN_DROPOUT: 0.0      # must stay 0.0 (no rng plumbing; PPO ratio exactness)
+TF_RESID_DROPOUT: 0.0     # must stay 0.0 (same reason)
+TF_INIT_SCALE: 1.0        # orthogonal gain on the in/out projections
+
+
+# Training parameters
+TOTAL_TIMESTEPS: 1000
+NUM_ENVS: 2
+NUM_STEPS: 8
+NUM_MINIBATCHES: 2
+UPDATE_EPOCHS: 2
+GAE_LAMBDA: 0.8
+GAMMA: 0.99
+CLIP_EPS: 0.2
+SCALE_CLIP_EPS: false
+ENT_COEF: 0.00333  # joint entropy (sum over action heads) -> scaled down vs per-agent runners
+VF_COEF: 0.5
+AUX_COEF: 0.1
+AUX_SELF_WEIGHT: 1.0
+ANNEAL_LR: true
+LR: 0.0002
+MAX_GRAD_NORM: 1.0
+LR_WARMUP: 0.0
+REW_SHAPING_HORIZON: 1000000
+
+# Logging parameters
+LOGGING_UPDATES_INTERVAL: 6  # Number of updates between logging phases
+LOGGING_NUM_CALLS: 2  # Number of logging_step calls per phase
+LOGGING_STEPS_PER_CALL: 20  # Number of env steps per logging_step call
+LOGGING_THREADS: 1  # Number of env threads to log (must be <= NUM_ENVS) -> set to 1 for less computing time
+
+# Video recording parameters
+SAVE_VIDEO: false             # Whether to record and save videos during logging
+VIDEO_LENGTH: 20  # Number of env steps per video (rollout continues from current state)
+VIDEO_PIXEL_SIZE: 16  # Pixel size for rendering (7=agent, 16=medium, 64=large)
+SAVE_HIDDEN_STATES: true      # Exercise the hidden-state CSV path in the smoke test
+
+# Seed configuration
+NUM_SEEDS: 1
+SEED: 0
+
+# Checkpointing configuration
+# Off by default so repeated smoke tests don't resume each other. Flip to true
+# (or copy config/test_checkpointing.yaml) to exercise the checkpoint path.
+CHECKPOINTING: false
+CHECKPOINT_DIR: ""
+CHECKPOINT_INTERVAL_BLOCKS: 1
+CHECKPOINT_MAX_TO_KEEP: 3
+RESUME: "auto"
+MAX_BLOCKS_THIS_RUN: 0
